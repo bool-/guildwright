@@ -4,6 +4,8 @@
 .env
 .env.*
 !.env.example
+secrets/
+*.pem
 
 # Runtime state. The database is a volume, not part of the image.
 data/

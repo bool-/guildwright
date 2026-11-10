@@ -53,7 +53,7 @@ import { Err, Ok, type Result } from '#core/result';
 import { errors, type AppError } from '#core/errors';
 import { redactSecrets } from '#core/text';
 import type { GitRef, LoggerPort, WorkflowFile } from '#core/ports';
-import { readGithubFailure, type GithubRepo } from '#adapters/github/client';
+import { GithubAuthFailure, readGithubFailure, type GithubRepo } from '#adapters/github/client';
 
 // ---------------------------------------------------------------------------------------
 // Token expiry
@@ -206,6 +206,9 @@ export function classifyPreflightFailure(input: {
    */
   readonly notFoundIsFatal: boolean;
 }): { readonly fatal: AppError } | { readonly warning: string } {
+  // An App uninstalled between the auth check and this probe: already a finished sentence, and
+  // fatal for the same reason an installation 404 at boot is (RFC-001 6.5).
+  if (input.cause instanceof GithubAuthFailure) return { fatal: input.cause.appError };
   const failure = readGithubFailure(input.cause, input.nowMs);
   const internal = redactSecrets(
     `${input.operation}: ${failure.name} status=${failure.status}${failure.codes.length > 0 ? ` codes=${failure.codes.join(',')}` : ''}`,

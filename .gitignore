@@ -2,6 +2,8 @@
 .env
 .env.*
 !.env.example
+secrets/
+*.pem
 
 # Runtime state
 data/

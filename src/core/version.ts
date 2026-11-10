@@ -99,6 +99,54 @@ export function describeBuild(info: BuildInfo): string {
 }
 
 /**
+ * HOW this process authenticates to GitHub, as data, for the `/status` auth line (RFC-001 6.4
+ * step 5). The second question of every triage after "which build?" is "running as what?" - a
+ * PAT that expires on a date somebody has to remember, or an App installation that can be
+ * uninstalled from the repository's settings by anyone with admin.
+ *
+ * Nothing here is a credential: an App slug and installation id are visible to every admin of
+ * the repository, and a PAT's expiry date is the header GitHub sends back on every response.
+ * `unknown` is what a fake reports and what a process reports before its preflight ran, said
+ * out loud for the same reason `describeBuild` says "no git sha".
+ */
+export type GithubAuthSummary =
+  | {
+      readonly kind: 'app';
+      /** The App's slug from `GET /app`, or `null` when that read failed transiently at boot. */
+      readonly slug: string | null;
+      readonly appId: number;
+      /** `owner/repo`. */
+      readonly repo: string;
+      readonly installationId: number;
+    }
+  | {
+      readonly kind: 'pat';
+      /** From the fine-grained-PAT expiry header; `null` for a token that does not send one. */
+      readonly expiresAtMs: number | null;
+    }
+  | { readonly kind: 'unknown' };
+
+/** What a fake returns, and what is reported before anything was learned. */
+export const UNKNOWN_GITHUB_AUTH: GithubAuthSummary = { kind: 'unknown' };
+
+/**
+ * `GitHub: app my-builder on octo/demo, installation 42` or `GitHub: PAT, expires 2027-01-31`.
+ * A PAT without an expiry header says so instead of leaving the date out.
+ */
+export function describeGithubAuth(auth: GithubAuthSummary): string {
+  switch (auth.kind) {
+    case 'app':
+      return `GitHub: app ${auth.slug ?? `id ${auth.appId}`} on ${auth.repo}, installation ${auth.installationId}`;
+    case 'pat':
+      return auth.expiresAtMs === null
+        ? 'GitHub: PAT, no expiry reported'
+        : `GitHub: PAT, expires ${new Date(auth.expiresAtMs).toISOString().slice(0, 10)}`;
+    case 'unknown':
+      return 'GitHub: auth not checked yet';
+  }
+}
+
+/**
  * What `.git/HEAD` says.
  *
  * Two forms, both real: a detached head is the sha itself, and an attached one is

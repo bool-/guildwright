@@ -38,6 +38,18 @@ export { secret } from '#core/secret';
 const snowflake = z.string().regex(/^\d{17,20}$/u, 'must be a Discord snowflake');
 
 /**
+ * Whether a string is shaped like a PEM private key (PKCS#1 `RSA PRIVATE KEY`, which is what
+ * GitHub's App settings page downloads, or PKCS#8 `PRIVATE KEY`). Shape only: whether the key
+ * belongs to the App is answered by GitHub at boot.
+ *
+ * Exported because the composition root applies the same check to a key read from
+ * `GITHUB_APP_PRIVATE_KEY_FILE`, which `loadConfig` deliberately never opens.
+ */
+export function isPemPrivateKey(value: string): boolean {
+  return /-----BEGIN (?:RSA )?PRIVATE KEY-----/u.test(value) && /-----END (?:RSA )?PRIVATE KEY-----/u.test(value);
+}
+
+/**
  * The environment contract.
  * WHY zod: `z.prettifyError` gives an operator every missing variable at once, instead of one
  * restart per typo.
@@ -62,7 +74,25 @@ export const EnvSchema = z.object({
    */
   DISCORD_MESSAGE_CONTENT: z.stringbool().default(false),
 
-  GITHUB_TOKEN: z.string().min(20),
+  /**
+   * GitHub auth is EXACTLY ONE of two modes (RFC-001 section 6). The rule is enforced by
+   * `githubAuthModeIssues` below rather than by this schema, so that a missing or doubled mode is
+   * reported alongside every other bad variable instead of one restart later:
+   *
+   *   - GitHub App (the documented setup): `GITHUB_APP_ID` plus exactly one of
+   *     `GITHUB_APP_PRIVATE_KEY` (the PEM itself, `\n` escapes allowed) or
+   *     `GITHUB_APP_PRIVATE_KEY_FILE` (a path to the .pem); optionally
+   *     `GITHUB_APP_INSTALLATION_ID`, which skips the installation lookup but not its checks.
+   *   - Personal access token (the fallback): `GITHUB_TOKEN` alone.
+   */
+  GITHUB_TOKEN: z.string().min(20).optional(),
+  GITHUB_APP_ID: z.string().regex(/^[1-9]\d{0,11}$/u, 'must be the numeric App ID from the App settings page').optional(),
+  GITHUB_APP_PRIVATE_KEY: z
+    .string()
+    .refine(isPemPrivateKey, 'must be the PEM private key generated on the App settings page, with \\n for each newline')
+    .optional(),
+  GITHUB_APP_PRIVATE_KEY_FILE: z.string().min(1).optional(),
+  GITHUB_APP_INSTALLATION_ID: z.string().regex(/^[1-9]\d{0,15}$/u, 'must be a numeric installation id').optional(),
   GITHUB_OWNER: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/u),
   GITHUB_REPO: z.string().regex(/^[A-Za-z0-9._-]{1,100}$/u),
   GITHUB_WORKFLOW_FILE: z.string().default('agent-implement-request.yml'),
@@ -85,6 +115,68 @@ export const EnvSchema = z.object({
   MODULES_BUILTIN: z.stringbool().default(true),
 });
 
+/** The App-mode variables, for the exactly-one-mode rule. */
+const APP_VARIABLES = ['GITHUB_APP_ID', 'GITHUB_APP_PRIVATE_KEY', 'GITHUB_APP_PRIVATE_KEY_FILE', 'GITHUB_APP_INSTALLATION_ID'] as const;
+
+/**
+ * The exactly-one-mode rule, as finished sentences (empty when the env is consistent).
+ *
+ * WHY it reads the RAW env and not the parsed one: it has to run even when `EnvSchema` failed on
+ * some unrelated variable, so the operator is told about every problem in one go. WHY "set"
+ * means "present", empty string included: `.env.example` already says a blanked line and a
+ * deleted one are different things, and a leftover `GITHUB_TOKEN=` next to App variables is
+ * exactly the ambiguity this rule exists to refuse.
+ */
+export function githubAuthModeIssues(env: Readonly<Record<string, string | undefined>>): readonly string[] {
+  const has = (name: string): boolean => env[name] !== undefined;
+  const pat = has('GITHUB_TOKEN');
+  const appSet = APP_VARIABLES.filter(has);
+  if (pat && appSet.length > 0) {
+    return [
+      `both GitHub auth modes are configured (GITHUB_TOKEN and ${appSet.join(', ')}); pick ONE: a GitHub App (GITHUB_APP_ID plus GITHUB_APP_PRIVATE_KEY or GITHUB_APP_PRIVATE_KEY_FILE) or a personal access token (GITHUB_TOKEN alone). An empty GITHUB_TOKEN= line still counts as set; delete it.`,
+    ];
+  }
+  if (!pat && appSet.length === 0) {
+    return [
+      'no GitHub credential is configured: set GITHUB_APP_ID plus GITHUB_APP_PRIVATE_KEY or GITHUB_APP_PRIVATE_KEY_FILE (a GitHub App, the documented setup), or GITHUB_TOKEN (a personal access token).',
+    ];
+  }
+  if (pat) return [];
+  const issues: string[] = [];
+  if (!has('GITHUB_APP_ID')) {
+    issues.push(`${appSet.join(', ')} is set but GITHUB_APP_ID is not; App mode needs the App ID from the App settings page.`);
+  }
+  const inline = has('GITHUB_APP_PRIVATE_KEY');
+  const file = has('GITHUB_APP_PRIVATE_KEY_FILE');
+  if (inline && file) {
+    issues.push('GITHUB_APP_PRIVATE_KEY and GITHUB_APP_PRIVATE_KEY_FILE are both set; set exactly one of them.');
+  } else if (!inline && !file) {
+    issues.push(
+      'App mode needs the private key: set GITHUB_APP_PRIVATE_KEY (the PEM, \\n for newlines) or GITHUB_APP_PRIVATE_KEY_FILE (a path to the .pem).',
+    );
+  }
+  return issues;
+}
+
+/**
+ * Where the App's private key comes from. A FILE is read by the composition root, not here:
+ * `loadConfig` stays a pure function of the env, which is what makes it testable.
+ */
+export type GithubAppPrivateKeySource =
+  | { readonly kind: 'inline'; readonly pem: Secret }
+  | { readonly kind: 'file'; readonly path: string };
+
+/** How this process authenticates to GitHub. Exactly one mode, by construction. */
+export type GithubAuthConfig =
+  | { readonly kind: 'pat'; readonly token: Secret }
+  | {
+      readonly kind: 'app';
+      readonly appId: number;
+      readonly privateKey: GithubAppPrivateKeySource;
+      /** `GITHUB_APP_INSTALLATION_ID`, or `null` to look it up from the repository. */
+      readonly installationId: number | null;
+    };
+
 /** Raw per-module slices. Each module's own schema validates its own slice. */
 export type ModuleConfigMap = Readonly<Record<string, unknown>>;
 
@@ -101,7 +193,8 @@ export interface AppConfig {
     readonly messageContent: boolean;
   };
   readonly github: {
-    readonly token: Secret;
+    /** PAT or GitHub App; see `GithubAuthConfig`. */
+    readonly auth: GithubAuthConfig;
     readonly owner: string;
     readonly repo: string;
     /** Branded at boot, so a module can never hand `dispatch` a free-text workflow name. */
@@ -127,10 +220,15 @@ export interface AppConfig {
  */
 export function loadConfig(env: Readonly<Record<string, string | undefined>>): Result<AppConfig, AppError> {
   const parsed = EnvSchema.safeParse(env);
-  if (!parsed.success) {
-    return Err(
-      errors.config('env', z.prettifyError(parsed.error), 'Set the missing environment variables and restart. See .env.example.'),
-    );
+  const modeIssues = githubAuthModeIssues(env);
+  if (!parsed.success || modeIssues.length > 0) {
+    // ONE error naming everything, in zod's own `✖ ... → at X` shape, so the GitHub auth rule
+    // reads like every other line of the report rather than like a second, later failure.
+    const lines = [
+      ...(parsed.success ? [] : [z.prettifyError(parsed.error)]),
+      ...modeIssues.map((issue) => `✖ ${issue}\n  → at GitHub auth mode`),
+    ];
+    return Err(errors.config('env', lines.join('\n'), 'Set the missing environment variables and restart. See .env.example.'));
   }
   const e = parsed.data;
 
@@ -164,7 +262,7 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): R
       messageContent: e.DISCORD_MESSAGE_CONTENT,
     },
     github: {
-      token: secret(e.GITHUB_TOKEN),
+      auth: githubAuthFrom(e),
       owner: e.GITHUB_OWNER,
       repo: e.GITHUB_REPO,
       workflowFile: workflowFile.value,
@@ -178,6 +276,27 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): R
     moduleDirsExplicit: env['MODULE_DIRS'] !== undefined,
     builtinModules: e.MODULES_BUILTIN,
   });
+}
+
+/**
+ * Build the auth union from an env that already passed `githubAuthModeIssues`.
+ *
+ * The fallbacks below exist only because the compiler cannot see that rule; every `undefined`
+ * they cover was already refused with a sentence before this runs.
+ */
+function githubAuthFrom(e: z.infer<typeof EnvSchema>): GithubAuthConfig {
+  if (e.GITHUB_TOKEN !== undefined) return { kind: 'pat', token: secret(e.GITHUB_TOKEN) };
+  const privateKey: GithubAppPrivateKeySource =
+    e.GITHUB_APP_PRIVATE_KEY !== undefined
+      ? { kind: 'inline', pem: secret(e.GITHUB_APP_PRIVATE_KEY) }
+      : { kind: 'file', path: e.GITHUB_APP_PRIVATE_KEY_FILE ?? '' };
+  return {
+    kind: 'app',
+    appId: Number.parseInt(e.GITHUB_APP_ID ?? '0', 10),
+    privateKey,
+    installationId:
+      e.GITHUB_APP_INSTALLATION_ID === undefined ? null : Number.parseInt(e.GITHUB_APP_INSTALLATION_ID, 10),
+  };
 }
 
 /**

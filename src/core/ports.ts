@@ -47,8 +47,8 @@ export type { Admin, AdminPort, JobStats, RunningJob } from '#core/ports/admin';
 export { oldestRunningJob } from '#core/ports/admin';
 export type { CatalogCommand, CatalogHealth, CatalogModule, CatalogPermission, CatalogPort } from '#core/ports/catalog';
 export type { Version, VersionPort } from '#core/ports/version';
-export type { BuildInfo, PackageIdentity, RepoIdentity } from '#core/version';
-export { UNKNOWN_BUILD, describeBuild, shortSha } from '#core/version';
+export type { BuildInfo, GithubAuthSummary, PackageIdentity, RepoIdentity } from '#core/version';
+export { UNKNOWN_BUILD, UNKNOWN_GITHUB_AUTH, describeBuild, describeGithubAuth, shortSha } from '#core/version';
 export type { AccessPort, AccessSubjectSnapshot, Grant, GrantSubject } from '#core/ports/access';
 export type { EnvironmentListing, EnvironmentName, SecretName, Secrets, SecretsPort } from '#core/ports/secrets';
 export {

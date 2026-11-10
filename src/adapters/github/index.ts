@@ -12,15 +12,32 @@
 
 import type { Secret } from '#core/config';
 import type { AppError } from '#core/errors';
-import type { Result } from '#core/result';
-import type { BuildsPort, ClockPort, GitRef, LoggerPort, SecretsPort, WorkflowFile } from '#core/ports';
+import { Ok, type Result } from '#core/result';
+import type { Octokit } from 'octokit';
+import type { BuildsPort, ClockPort, GithubAuthSummary, GitRef, LoggerPort, SecretsPort, WorkflowFile } from '#core/ports';
 import { createGithubClient, type GithubRepo } from '#adapters/github/client';
+import { startGithubAppSession, type GithubAdapterAuth } from '#adapters/github/app-auth';
 import { createGithubIssues, type GithubIssuesPort } from '#adapters/github/issues';
 import { createGithubBuilds } from '#adapters/github/runs';
 import { createGithubSecrets } from '#adapters/github/secrets';
 import { preflightGithub, type GithubPreflightReport } from '#adapters/github/preflight';
 
-export { GITHUB_API_VERSION, createGithubClient, mapGithubError, type GithubRepo } from '#adapters/github/client';
+export {
+  GITHUB_API_VERSION,
+  GithubAuthFailure,
+  createGithubClient,
+  githubOctokitClass,
+  mapGithubError,
+  type GithubRepo,
+} from '#adapters/github/client';
+export {
+  REQUIRED_APP_PERMISSIONS,
+  missingAppPermissions,
+  resolveGithubAuth,
+  startGithubAppSession,
+  type GithubAdapterAuth,
+  type GithubAppSession,
+} from '#adapters/github/app-auth';
 export { createGithubIssues, issueMarker, type GithubIssuesPort } from '#adapters/github/issues';
 export { createGithubBuilds, toRunStatus } from '#adapters/github/runs';
 export { dispatchWorkflow } from '#adapters/github/dispatch';
@@ -65,10 +82,23 @@ export interface GithubAdapter {
    * deliberately absent from `health()` for the same reason - see the header of `preflight.ts`.
    */
   preflight(): Promise<Result<GithubPreflightReport, AppError>>;
+  /**
+   * How the adapter authenticates, for `/status` (via `VersionPort.githubAuth`). Plain data:
+   * an App slug and installation id, or a PAT's expiry once the preflight has read it.
+   */
+  authSummary(): GithubAuthSummary;
 }
 
-export function createGithubAdapter(input: {
-  readonly token: Secret;
+/**
+ * The boot warning PAT mode logs (RFC-001 6.6). A PAT still works and stays supported; this is
+ * the one line that says it is not the documented long-term setup.
+ */
+export const PAT_MODE_WARNING =
+  'running on a personal access token bound to one GitHub account; the template documents a GitHub App as the long-term setup';
+
+export interface GithubAdapterInput {
+  /** PAT, or a GitHub App with its key already resolved by `resolveGithubAuth`. */
+  readonly auth: GithubAdapterAuth;
   readonly repo: GithubRepo;
   readonly clock: ClockPort;
   readonly logger: LoggerPort;
@@ -82,15 +112,52 @@ export function createGithubAdapter(input: {
   readonly workflowFile: WorkflowFile;
   /** The ref every dispatch is sent against. Branded at config load, likewise. */
   readonly ref: GitRef;
-}): GithubAdapter {
-  const octokit = createGithubClient({ token: input.token, logger: input.logger });
+  /** Transport override, for tests; see `githubOctokitClass`. */
+  readonly fetch?: typeof globalThis.fetch;
+}
+
+/**
+ * Build the adapter. ASYNC, and a `Result`, because App mode has to ask GitHub who it is before
+ * it has a client to hand the ports: `GET /app` and the installation checks of `app-auth.ts`
+ * run here, and each of their fatal answers comes back as the `Err` the root exits 1 on.
+ *
+ * PAT mode makes no request here; it builds the same client it always did and logs
+ * `PAT_MODE_WARNING`.
+ */
+export async function createGithubAdapter(input: GithubAdapterInput): Promise<Result<GithubAdapter, AppError>> {
+  const transport = input.fetch === undefined ? {} : { fetch: input.fetch };
+  let octokit: Octokit;
+  /** WHY a box: the PAT's expiry is learned by the preflight, after construction. */
+  const summary: { value: GithubAuthSummary } = { value: { kind: 'unknown' } };
+  const bootWarnings: string[] = [];
+
+  if (input.auth.kind === 'pat') {
+    octokit = createGithubClient({ token: input.auth.token, logger: input.logger, ...transport });
+    input.logger.warn(PAT_MODE_WARNING, {});
+    summary.value = { kind: 'pat', expiresAtMs: null };
+  } else {
+    const session = await startGithubAppSession({
+      appId: input.auth.appId,
+      privateKey: input.auth.privateKey,
+      installationId: input.auth.installationId,
+      repo: input.repo,
+      clock: input.clock,
+      logger: input.logger,
+      ...transport,
+    });
+    if (!session.ok) return session;
+    octokit = session.value.octokit;
+    summary.value = session.value.summary;
+    bootWarnings.push(...session.value.warnings);
+  }
+
   const shared = { octokit, repo: input.repo, clock: input.clock, logger: input.logger };
   // THE REPOSITORY'S NAME AS GITHUB SPELLS IT. It is part of the approval token's signed tuple,
   // and the verifier on the runner reads `$GITHUB_REPOSITORY`, which carries GitHub's stored
   // case. `.env` admits any case and the REST paths do not care, so the configured pair is
   // only a default: the preflight's `full_name` overwrites it before any build is signed.
   const identity = { fullName: `${input.repo.owner}/${input.repo.repo}` };
-  return {
+  return Ok({
     issues: createGithubIssues(shared),
     builds: createGithubBuilds({
       ...shared,
@@ -98,6 +165,7 @@ export function createGithubAdapter(input: {
       repositoryName: () => identity.fullName,
     }),
     secrets: createGithubSecrets(shared),
+    authSummary: () => summary.value,
     preflight: async () => {
       const report = await preflightGithub({
         octokit,
@@ -108,8 +176,12 @@ export function createGithubAdapter(input: {
         // expiry warning computed against a stale instant is wrong by exactly that much.
         nowMs: input.clock.now(),
       });
-      if (report.ok) identity.fullName = report.value.fullName;
-      return report;
+      if (!report.ok) return report;
+      identity.fullName = report.value.fullName;
+      if (summary.value.kind === 'pat') summary.value = { kind: 'pat', expiresAtMs: report.value.tokenExpiresAtMs };
+      // The App checks' non-fatal findings ride in the same report, so they reach the same two
+      // channels (log and stderr) as every other boot warning.
+      return Ok({ ...report.value, warnings: [...bootWarnings, ...report.value.warnings] });
     },
-  };
+  });
 }
