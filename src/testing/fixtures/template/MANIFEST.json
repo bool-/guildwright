@@ -1,0 +1,10 @@
+{
+  "engineVersion": "0.0.0-fixture",
+  "files": {
+    ".github/claude/agent-settings.json": "3fb7c813a2a82ffeaa38df7f956af24f0f65bc2d8c7230756edfe096c02fdc2a",
+    ".github/scripts/verify_approval.py": "5c55de4235e301d0848b6863a9bedef126009ed8523bf3ab6d57035db3c0b11d",
+    ".github/workflows/agent-implement-request.yml": "2a8d8cb9da6ef5487845fdc8cf7c4bd8a61012733f111e269989ad4be6767265",
+    ".github/workflows/ci.yml": "3200b334c8d917c890d4b0bff97b2b8c44263af3b794b38cfa835decc1965964",
+    "AGENTS.md": "b0e7b445cc29cf07ca2654b65038c42b1115b5846211fddf7ef6a3ce93070b0e"
+  }
+}

@@ -7,6 +7,9 @@
   "engines": {
     "node": ">=24.12.0"
   },
+  "bin": {
+    "discord-ai-feature-builder": "./dist/cli.js"
+  },
   "files": [
     "dist",
     "src/core",
@@ -49,7 +52,8 @@
     "check": "npm run typecheck && npm run lint && npm test",
     "build": "node --conditions=source scripts/build.ts",
     "prepack": "npm run check && npm run build",
-    "scaffold": "node --conditions=source scripts/scaffold-module.ts"
+    "scaffold": "node --conditions=source src/cli.ts scaffold",
+    "doctor": "node --conditions=source src/cli.ts doctor"
   },
   "dependencies": {
     "discord.js": "14.27.0",

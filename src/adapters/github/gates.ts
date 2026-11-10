@@ -43,6 +43,7 @@ import { z } from 'zod';
 import { Err, Ok, type Result } from '#core/result';
 import { errors, type AppError } from '#core/errors';
 import { redactSecrets } from '#core/text';
+import { CLI_BIN } from '#core/version';
 import type { GitRef, LoggerPort, WorkflowFile } from '#core/ports';
 import { GithubAuthFailure, readGithubFailure, type GithubRepo } from '#adapters/github/client';
 
@@ -82,13 +83,11 @@ export const VERIFIER_PATH = '.github/scripts/verify_approval.py';
 export const AGENT_SETTINGS_PATH = '.github/claude/agent-settings.json';
 
 /**
- * The command the drift sentence tells the operator to run.
- *
- * PR 1.4 builds the CLI that answers it (`template apply` copies the installed engine's template
- * files into the module repo). Until then the operator copies the three files by hand from the
- * engine; the sentence names the command the RFC fixes so the text does not change again.
+ * The command the drift sentence tells the operator to run: the CLI's `template apply`
+ * (`src/cli/template.ts`), which copies the installed engine's template gate files into the
+ * module repo. Built from `CLI_BIN`, so the binary rename of PR 1.8 changes this sentence too.
  */
-export const TEMPLATE_APPLY_COMMAND = 'npx discord-ai-feature-builder template apply';
+export const TEMPLATE_APPLY_COMMAND = `npx ${CLI_BIN} template apply`;
 
 /** One gate file: where it lives in the TARGET repository, and the sha256 it must have. */
 export interface GateFile {

@@ -18,6 +18,16 @@
  * thing worse than not knowing which build is running is being confidently told the wrong one.
  */
 
+/**
+ * The engine's CLI binary name: the `bin` key in `package.json`, and what every operator-facing
+ * sentence tells them to run (`npx <CLI_BIN> template apply`, `npx <CLI_BIN> doctor`).
+ *
+ * ONE constant, so the product rename (RFC-001 PR 1.8) is one edit: `package.json` `bin` and this
+ * string must agree, and `src/cli.test.ts` asserts that they do. Until the rename it is the
+ * current package name, which is also what makes `npx <name>` resolve to this binary.
+ */
+export const CLI_BIN = 'discord-ai-feature-builder';
+
 /** How many hex characters of a sha a human actually reads. Git's own default. */
 export const SHORT_SHA_LENGTH = 7;
 

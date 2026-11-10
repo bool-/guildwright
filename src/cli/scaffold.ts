@@ -12,15 +12,29 @@
  * decisions are visible in review rather than defaulted in silence.
  *
  *   npm run scaffold -- <module-id> [--summary "..."] [--db] [--force]
+ *   npx <bin> scaffold <module-id> [--summary "..."] [--db] [--force]
+ *
+ * MOVED from `scripts/scaffold-module.ts` into the CLI (RFC-001 9.2) with byte-identical output,
+ * so a module repo, which has no `scripts/`, gets the same generator from the installed engine.
+ * It writes into `<cwd>/src/modules/<id>/`: the working directory is the repository being
+ * extended, never the engine's own tree.
  */
 
 import { mkdirSync, readdirSync, writeFileSync, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
-const MODULES_DIR = resolve(process.cwd(), 'src', 'modules');
+import { MODULE_ID_RE } from '#core/module';
 
-/** Matches the boot assertion in the registry: lowercase, starts with a letter, 2..31 chars. */
-const ID_RE = /^[a-z][a-z0-9-]{1,30}$/u;
+import { EXIT_OK, EXIT_PROBLEM, EXIT_USAGE, type CliIo } from './io.ts';
+
+/**
+ * THE registry's own boot assertion, imported rather than restated: lowercase, starts with a
+ * letter, 2..31 chars. A scaffolded id the registry would refuse is the one failure this
+ * generator exists to make impossible.
+ */
+const ID_RE = MODULE_ID_RE;
+
+export const SCAFFOLD_USAGE = 'usage: npm run scaffold -- <module-id> [--summary "..."] [--db] [--force]';
 
 interface Options {
   readonly id: string;
@@ -33,7 +47,7 @@ function parseArgs(argv: readonly string[]): Options | string {
   const args = [...argv];
   const id = args.shift();
   if (id === undefined || id.startsWith('-')) {
-    return 'usage: npm run scaffold -- <module-id> [--summary "..."] [--db] [--force]';
+    return SCAFFOLD_USAGE;
   }
   if (!ID_RE.test(id)) {
     return `"${id}" is not a valid module id.\nIt must match ${String(ID_RE)} — it is also the folder name, the SQL table prefix and half of every custom_id.`;
@@ -324,22 +338,23 @@ CREATE TABLE IF NOT EXISTS ${prefix}items (
 `;
 }
 
-function main(): void {
-  const parsed = parseArgs(process.argv.slice(2));
+/** `<bin> scaffold ...`: write `<cwd>/src/modules/<id>/`. Returns the exit code. */
+export function scaffold(argv: readonly string[], io: CliIo): number {
+  const parsed = parseArgs(argv);
   if (typeof parsed === 'string') {
-    process.stderr.write(`${parsed}\n`);
-    process.exit(1);
+    io.err(`${parsed}\n`);
+    return parsed === SCAFFOLD_USAGE || parsed.startsWith('unknown option') || parsed.startsWith('--summary') ? EXIT_USAGE : EXIT_PROBLEM;
   }
 
-  const dir = join(MODULES_DIR, parsed.id);
+  const dir = join(resolve(io.cwd, 'src', 'modules'), parsed.id);
   if (existsSync(dir) && !parsed.force) {
     const contents = readdirSync(dir);
     if (contents.length > 0) {
-      process.stderr.write(
+      io.err(
         `src/modules/${parsed.id}/ already exists and is not empty.\n` +
           `Pass --force to overwrite, or pick another id.\n`,
       );
-      process.exit(1);
+      return EXIT_PROBLEM;
     }
   }
 
@@ -364,14 +379,13 @@ function main(): void {
   }
 
   const written = files.map(([n]) => `  src/modules/${parsed.id}/${n}`).join('\n');
-  process.stdout.write(
+  io.out(
     `\nCreated src/modules/${parsed.id}/\n${written}\n` +
-      (parsed.withDb ? `  src/modules/${parsed.id}/repo.ts\n  src/modules/${parsed.id}/migrations/0001_init.sql\n` : '') +
+      (parsed.withDb ? `  src/modules/${parsed.id}/migrations/0001_init.sql\n` : '') +
       `\nIt already compiles and its test passes. Verify, then make it do something:\n` +
       `  npm run check\n\n` +
       `Nothing else needs editing — the loader finds the folder on the next boot.\n` +
-      `Read AGENTS.md before changing the manifest.\n\n`,
+      `Read AGENTS.md in this repository before changing the manifest.\n\n`,
   );
+  return EXIT_OK;
 }
-
-main();

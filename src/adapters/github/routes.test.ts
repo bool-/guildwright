@@ -36,6 +36,11 @@ const ALLOWED: Readonly<Record<string, string>> = {
   'GET /repos/{owner}/{repo}/installation': 'App JWT',
   'GET /repos/{owner}/{repo}/commits/{ref}': 'Contents (read)',
   'GET /repos/{owner}/{repo}/contents/{path}': 'Contents (read)',
+  // `<bin> gc-approvals` only (approvals-gc.ts), never the running bot. The DELETE needs Contents
+  // WRITE, which the bot's App deliberately does not hold (RFC-001 6.1): with the App it answers
+  // 403 and the CLI prints the `git push --delete` command instead.
+  'GET /repos/{owner}/{repo}/git/matching-refs/{ref}': 'Contents (read) - gc-approvals',
+  'DELETE /repos/{owner}/{repo}/git/refs/{ref}': 'Contents (WRITE) - gc-approvals, operator-run; 403 on the App by design',
   'GET /repos/{owner}/{repo}/issues': 'Issues (read)',
   'POST /repos/{owner}/{repo}/issues': 'Issues (write)',
   'GET /repos/{owner}/{repo}/issues/{issue_number}': 'Issues (read)',

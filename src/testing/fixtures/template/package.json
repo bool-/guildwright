@@ -1,0 +1,11 @@
+{
+  "name": "my-bot-modules",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node --version"
+  },
+  "dependencies": {
+    "local-dep": "file:vendor/local-dep"
+  }
+}
