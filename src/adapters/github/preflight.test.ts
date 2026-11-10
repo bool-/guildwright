@@ -376,6 +376,7 @@ test('warnings reach BOTH channels, because one buried in JSON is one nobody rea
     workflowState: 'active',
     tokenExpiresAtMs: null,
     warnings: ['the sky is falling'],
+    visibility: null,
   };
   logPreflightWarnings(report, logger, (line) => said.push(line));
 

@@ -99,6 +99,11 @@ export const EnvSchema = z.object({
   GITHUB_REF: z.string().default('main'),
   /** Shared with the repo's Actions secrets and nowhere else (SC-6). */
   APPROVAL_HMAC_KEY: z.string().min(32, 'must be at least 32 chars of entropy'),
+  /**
+   * The bot REFUSES TO START when the target repository is public (RFC-001 5.4), because every
+   * `/request` it files there is then public too. `true` is the operator saying so on purpose.
+   */
+  ALLOW_PUBLIC_TARGET_REPO: z.stringbool().default(false),
 
   DATABASE_PATH: z.string().min(1).default('./data/bot.sqlite'),
   /** Per-module config as JSON, namespaced by module id. */
@@ -201,6 +206,8 @@ export interface AppConfig {
     readonly workflowFile: WorkflowFile;
     readonly ref: GitRef;
     readonly approvalHmacKey: Secret;
+    /** `ALLOW_PUBLIC_TARGET_REPO`. */
+    readonly allowPublicTargetRepo: boolean;
   };
   readonly databasePath: string;
   readonly modules: ModuleConfigMap;
@@ -268,6 +275,7 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): R
       workflowFile: workflowFile.value,
       ref: ref.value,
       approvalHmacKey: secret(e.APPROVAL_HMAC_KEY),
+      allowPublicTargetRepo: e.ALLOW_PUBLIC_TARGET_REPO,
     },
     databasePath: e.DATABASE_PATH,
     modules,
@@ -306,6 +314,46 @@ function githubAuthFrom(e: z.infer<typeof EnvSchema>): GithubAuthConfig {
  */
 export function moduleConfigSlice(cfg: AppConfig, moduleId: string): unknown {
   return cfg.modules[moduleId] ?? {};
+}
+
+/**
+ * `MODULES_JSON.builder` keys that used to mean something and are now IGNORED (RFC-001 5.4).
+ *
+ * `modules.builder.ref` and `modules.builder.workflowFile` named the ref and workflow every
+ * dispatch ran, while the boot preflight checked `GITHUB_REF` and `GITHUB_WORKFLOW_FILE`: two
+ * values for one fact, and the gate-file digest check would have validated files at one ref while
+ * the build ran another. The builder's schema no longer has the keys (zod strips them), the
+ * GitHub adapter dispatches at the env pair, and this is the warning that says so instead of an
+ * operator discovering it by a build running somewhere they did not expect.
+ */
+export const REMOVED_BUILDER_KEYS = [
+  { key: 'ref', replacement: 'GITHUB_REF' },
+  { key: 'workflowFile', replacement: 'GITHUB_WORKFLOW_FILE' },
+] as const;
+
+/** One warning sentence per removed `MODULES_JSON.builder` key still present; empty when none. */
+export function removedBuilderKeyWarnings(modules: ModuleConfigMap): readonly string[] {
+  const slice = modules['builder'];
+  if (typeof slice !== 'object' || slice === null) return [];
+  return REMOVED_BUILDER_KEYS.filter(({ key }) => Object.hasOwn(slice, key)).map(
+    ({ key, replacement }) =>
+      `MODULES_JSON.builder.${key} is ignored: builds now dispatch at ${replacement}, the value the preflight and the gate-file check verify. Set ${replacement} instead and remove builder.${key} from MODULES_JSON.`,
+  );
+}
+
+/**
+ * `modules.builder.requireOwnCredentials` as the BOOT PREFLIGHT needs it, before any module is
+ * installed: it decides whether the bot must be able to list environments (gate on) or must find
+ * a funded `ai-agent` environment (gate off).
+ *
+ * The default (`true`) matches the builder's own schema, and `config.test.ts` asserts the two
+ * agree through the real module install. A value the builder's schema would reject reads as
+ * `true` here: the builder is then quarantined at install anyway, and `true` is the reading
+ * under which the preflight never asks the operator to fund anything.
+ */
+export function builderRequiresOwnCredentials(modules: ModuleConfigMap): boolean {
+  const parsed = z.object({ requireOwnCredentials: z.boolean().default(true) }).safeParse(modules['builder'] ?? {});
+  return parsed.success ? parsed.data.requireOwnCredentials : true;
 }
 
 /**

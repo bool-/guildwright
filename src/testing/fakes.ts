@@ -448,6 +448,14 @@ export interface FakeBuilds extends BuildsPort {
   readonly variables: Map<string, string>;
   /** What `findRunReport` answers. Null by default: a workflow that posted no report. */
   report: RunReport | null;
+  /**
+   * What `verifyGates` answers, read at call time. `Ok` by default: the gate files match.
+   * Assign an `Err` (a non-retryable config error for drift, a retryable one for "could not
+   * check") to model the containment gate refusing; `readiness()` follows the last answer.
+   */
+  gateAnswer: Result<void, AppError>;
+  /** How many times `verifyGates` was asked. */
+  gateChecks: number;
 }
 
 export function fakeBuilds(): FakeBuilds {
@@ -474,6 +482,16 @@ export function fakeBuilds(): FakeBuilds {
     variables,
     runsToday: 0,
     report: null,
+    gateAnswer: Ok(undefined),
+    gateChecks: 0,
+    async verifyGates() {
+      builds.gateChecks += 1;
+      return builds.gateAnswer;
+    },
+    readiness() {
+      const a = builds.gateAnswer;
+      return a.ok ? { status: 'ready' } : { status: 'down', detail: a.error.internal ?? a.error.nextStep };
+    },
     async dispatch(req) {
       dispatched.push({ ...req.inputs });
       const runUrl = parseHttpsUrl('https://github.com/o/r/actions/runs/1');

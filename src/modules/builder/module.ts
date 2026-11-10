@@ -68,18 +68,7 @@ import {
   type RequestId,
 } from '#core/ids';
 import { limit } from '#core/ratelimit';
-import {
-  toGitRef,
-  toWorkflowFile,
-  type AuditPort,
-  type BuildsPort,
-  type ClockPort,
-  type DiscordPort,
-  type GitRef,
-  type LoggerPort,
-  type PrRef,
-  type WorkflowFile,
-} from '#core/ports';
+import { type AuditPort, type BuildsPort, type ClockPort, type DiscordPort, type LoggerPort, type PrRef } from '#core/ports';
 import type { SurfaceRef, View } from '#core/view';
 
 import {
@@ -304,16 +293,16 @@ async function checkDailyCap(
   repo: BuildRepo,
   cfg: { readonly dailyRunCap: number; readonly pollIntervalMs: number },
   input: {
-    readonly workflowFile: WorkflowFile;
     readonly row: BuildRow;
     readonly issueNumber: number;
     readonly surface: SurfaceRef;
   },
 ): Promise<JobOutcome | null> {
   const now = jctx.ports.clock.now();
-  // The SAME window the workflow counts: runs created since UTC midnight, for this one workflow
-  // file. A different boundary would mean the bot and the runner disagree about what day it is.
-  const used = await jctx.ports.builds.runsSince(input.workflowFile, startOfUtcDay(now));
+  // The SAME window the workflow counts: runs created since UTC midnight, for the one workflow
+  // file the adapter dispatches. A different boundary would mean the bot and the runner disagree
+  // about what day it is.
+  const used = await jctx.ports.builds.runsSince(startOfUtcDay(now));
   if (!used.ok) {
     if (used.error.retryable) return retryAfter(used.error, cfg.pollIntervalMs, 'could not read the daily run count');
     jctx.logger.warn('could not read the daily agent run count; dispatching anyway', {
@@ -509,8 +498,10 @@ export default defineModule({
    */
   capabilities: ['db', 'audit', 'clock', 'jobs', 'discord', 'issues', 'builds', 'access'],
   config: z.object({
-    workflowFile: z.string().default('agent-implement-request.yml'),
-    ref: z.string().default('main'),
+    // NO `workflowFile` AND NO `ref` (RFC-001 5.4). They duplicated GITHUB_WORKFLOW_FILE and
+    // GITHUB_REF, so the preflight and the gate-file check could verify one ref while builds ran
+    // another. The adapter dispatches at the env pair; an old key in MODULES_JSON is stripped by
+    // zod and warned about at boot (`removedBuilderKeyWarnings`).
     allowSelfApproval: z.boolean().default(false),
     /**
      * NO FREE BUILDS: every requester must supply their own Anthropic credential.
@@ -777,6 +768,14 @@ export default defineModule({
           async handle(sub): Promise<Outcome> {
             const guildId = sub.space.guildId;
             if (guildId === null) return { kind: 'silent' };
+
+            // BUILDS DISABLED, REFUSED BEFORE ANYTHING IS FILED (RFC-001 5.4). The gate files at
+            // the dispatch ref no longer match the engine's, or a containment check has not
+            // passed: an approved build would be refused at dispatch anyway, so filing an issue
+            // and an approval card for it is litter. Evaluated per submission, not per boot, so
+            // drift merged after boot is caught here without a restart.
+            const gated = await ctx.ports.builds.verifyGates();
+            if (!gated.ok) return { kind: 'fail', error: gated.error };
 
             // NO FREE BUILDS, REFUSED BEFORE ANYTHING IS FILED.
             //
@@ -1171,18 +1170,24 @@ export default defineModule({
                 repo.finish(p.value.id, 'failed', jctx.ports.clock.now());
                 return { kind: 'failed', error: approvalId.error };
               }
-              // WHY re-validated here: `WorkflowFile` is branded, so a free-text config value
-              // cannot reach `dispatch` without passing this.
-              const wf: Result<WorkflowFile, AppError> = toWorkflowFile(cfg.workflowFile);
-              if (!wf.ok) return { kind: 'failed', error: wf.error };
-              const gitRef: Result<GitRef, AppError> = toGitRef(cfg.ref);
-              if (!gitRef.ok) return { kind: 'failed', error: gitRef.error };
+              // ARE THE GATES STILL THE ENGINE'S? (RFC-001 5.4.) The workflow, the approval
+              // verifier and the agent's deny list are read at the commit this dispatch would run
+              // and compared to the engine's copies - per dispatch, because drift merged after the
+              // approval click is exactly as dangerous as drift present at boot. Before the cap,
+              // the payer and `signApproval`: nothing is signed or counted for a build that may
+              // not run. A refusal is terminal (finished `failed`, so the slot is released and
+              // `/request retry` works once the files are fixed); "could not check" retries.
+              const gated = await jctx.ports.builds.verifyGates();
+              if (!gated.ok) {
+                if (gated.error.retryable) return retryAfter(gated.error, cfg.pollIntervalMs, 'could not check the gate files');
+                repo.finish(p.value.id, 'failed', jctx.ports.clock.now());
+                return { kind: 'failed', error: gated.error };
+              }
 
               // IS THERE A RUN LEFT TODAY? Asked BEFORE anything is spent and BEFORE a dispatch
               // attempt is counted, because being over cap is not this request's fault and must
               // not consume its ceiling.
               const capped = await checkDailyCap(jctx, repo, cfg, {
-                workflowFile: wf.value,
                 row,
                 issueNumber: p.value.issueNumber,
                 surface: surface.value,
@@ -1260,8 +1265,6 @@ export default defineModule({
               repo.countDispatchAttempt(p.value.id, issuedAtMs);
 
               const out = await jctx.ports.builds.dispatch({
-                workflowFile: wf.value,
-                ref: gitRef.value,
                 // SC-1: `ActionsInput = number | boolean | ActionsToken`. A string here is
                 // TS2322, so there is nothing for `${{ }}` to interpolate.
                 inputs: {
@@ -1692,6 +1695,13 @@ export default defineModule({
       previews: previewCards(),
 
       async health() {
+        // DOWN FIRST. Builds disabled by the containment gate (drifted gate files, an
+        // unresolvable ref, a check GitHub has not answered yet) are the one state in which
+        // everything below is irrelevant. `readiness()` makes no request: this runs on every
+        // `/status`, and a health check must not spend the API budget of what it reports on.
+        const ready = ctx.ports.builds.readiness();
+        if (ready.status === 'down') return { status: 'down', detail: ready.detail };
+
         // THREE NUMBERS, ALL OTHERWISE INVISIBLE. "Who is paying" is the first thing an operator
         // wants confirmed after flipping `requireOwnCredentials`. The TTL is the setting that
         // silently decides whether `/request new` works at all. And the daily cap is the one

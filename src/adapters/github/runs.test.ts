@@ -225,6 +225,8 @@ function buildsAdapter(responder: (req: RecordedRequest, i: number) => StubRespo
     clock: fakeClock(NOW),
     logger: fakeLogger(),
     approvalHmacKey: secret(APPROVAL_KEY),
+    workflowFile: workflowFile(),
+    ref: gitRef(),
   });
   return { port, stub };
 }
@@ -244,8 +246,6 @@ function gitRef() {
 test('a 200 dispatch is adopted immediately; a 204 forces the blind arm', async () => {
   const runName = actionsToken.bareHandle('build-01J8ZQ');
   const dispatchInput = {
-    workflowFile: workflowFile(),
-    ref: gitRef(),
     inputs: { issue_number: 42, dry_run: false, branch: actionsToken.botBranch(42) },
     runName,
   };
@@ -269,6 +269,10 @@ test('a 200 dispatch is adopted immediately; a 204 forces the blind arm', async 
   // Numbers and booleans go over the wire as strings; GitHub answers 422 to anything else.
   assert.ok((adopted.stub.requests[0]?.body ?? '').includes('"issue_number":"42"'));
   assert.ok((adopted.stub.requests[0]?.body ?? '').includes('"dry_run":"false"'));
+  // The workflow and the ref are the adapter's BOUND pair (GITHUB_WORKFLOW_FILE, GITHUB_REF),
+  // not caller arguments: the files the gate check verified are the files that run.
+  assert.match(adopted.stub.requests[0]?.url ?? '', /\/actions\/workflows\/claude-build\.yml\/dispatches$/u);
+  assert.ok((adopted.stub.requests[0]?.body ?? '').includes('"ref":"main"'));
 
   const blind = buildsAdapter(() => ({ status: 204 }));
   const b = await blind.port.dispatch(dispatchInput);
@@ -280,8 +284,6 @@ test('a 200 dispatch is adopted immediately; a 204 forces the blind arm', async 
 test('a dispatch that throws becomes an AppError rather than an unhandled rejection', async () => {
   const { port } = buildsAdapter(() => ({ status: 404, body: { message: 'Not Found' } }));
   const r = await port.dispatch({
-    workflowFile: workflowFile(),
-    ref: gitRef(),
     inputs: {},
     runName: actionsToken.bareHandle('build-01J8ZQ'),
   });
@@ -496,6 +498,8 @@ test('the token signs the repository as GitHub spells it, read at signing time',
     clock: fakeClock(NOW),
     logger: fakeLogger(),
     approvalHmacKey: secret(APPROVAL_KEY),
+    workflowFile: workflowFile(),
+    ref: gitRef(),
     repositoryName: () => spelling.current,
   });
 
@@ -765,7 +769,7 @@ test('runsSince counts runs of ONE workflow since a time, and counts every trigg
     status: 200,
     body: { total_count: 4, workflow_runs: [{ id: 9 }] },
   }));
-  const r = await port.runsSince(workflowFile(), NOW - 86_400_000);
+  const r = await port.runsSince(NOW - 86_400_000);
   assert.equal(r.ok, true);
   if (!r.ok) return;
   assert.equal(r.value, 4);
@@ -786,7 +790,7 @@ test('runsSince reads total_count, not the page - a page-sized cap would never t
   // report "under the limit" for a repo well over it, which is the one failure a spend cap
   // cannot have.
   const { port } = buildsAdapter(() => ({ status: 200, body: { total_count: 137, workflow_runs: [] } }));
-  const r = await port.runsSince(workflowFile(), NOW);
+  const r = await port.runsSince(NOW);
   assert.equal(r.ok, true);
   if (!r.ok) return;
   assert.equal(r.value, 137);
@@ -794,7 +798,7 @@ test('runsSince reads total_count, not the page - a page-sized cap would never t
 
 test('an unrecognised runsSince payload is an ERROR, never a zero that opens the gate', async () => {
   const { port } = buildsAdapter(() => ({ status: 200, body: { nope: true } }));
-  const r = await port.runsSince(workflowFile(), NOW);
+  const r = await port.runsSince(NOW);
   assert.equal(r.ok, false, 'a zero here would read as "nothing has run today"');
 });
 
@@ -804,7 +808,7 @@ test('an API failure while reading the cap is an AppError, not an unhandled reje
   // What matters here is that a thrown transport failure becomes a `Result`, and an expired PAT
   // proves that in one round trip.
   const { port } = buildsAdapter(() => ({ status: 401, body: { message: 'Bad credentials' } }));
-  const r = await port.runsSince(workflowFile(), NOW);
+  const r = await port.runsSince(NOW);
   assert.equal(r.ok, false);
   if (r.ok) return;
   assert.ok(userMessage(r.error).length > 0);

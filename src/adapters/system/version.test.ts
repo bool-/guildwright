@@ -18,8 +18,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test, type TestContext } from 'node:test';
 
-import { describeBuild, findPackedRef, isCommitSha, parseGitHead, shortSha, UNKNOWN_BUILD } from '#core/version';
-import { enginePackageRoot, readBuildInfo, shaFromEnv, shaFromGitDir, SHA_ENV_VARS } from '#adapters/system/version';
+import { checkEnginePin, describeBuild, findPackedRef, isCommitSha, parseGitHead, shortSha, UNKNOWN_BUILD } from '#core/version';
+import { enginePackageRoot, readBuildInfo, readRepoManifest, shaFromEnv, shaFromGitDir, SHA_ENV_VARS } from '#adapters/system/version';
 
 const SHA = 'a'.repeat(39) + '7';
 const OTHER = 'b'.repeat(40);
@@ -183,3 +183,51 @@ test('an explicit environment sha wins over whatever the working copy says', (t)
   writeFileSync(join(git, 'HEAD'), `${OTHER}\n`);
   assert.equal(readBuildInfo({ GIT_SHA: SHA }, dirname(git)).repo.gitSha, SHA);
 });
+
+// ---------------------------------------------------------------------------------------
+// The engine pin (RFC-001 5.4, PR 1.7)
+// ---------------------------------------------------------------------------------------
+
+const ENGINE = { name: 'discord-ai-feature-builder', version: '1.7.0' };
+
+test('ROW: a module repo pinning a different engine than is installed refuses to start, with the exact sentence', () => {
+  assert.deepEqual(checkEnginePin({ dependencies: { 'discord-ai-feature-builder': '1.6.2' } }, ENGINE), {
+    kind: 'refuse',
+    sentence: 'package.json asks for discord-ai-feature-builder@1.6.2 but 1.7.0 is installed. Run npm ci.',
+  });
+});
+
+test('the matching exact pin, and no pin at all (the engine checkout itself), both start', () => {
+  assert.deepEqual(checkEnginePin({ dependencies: { 'discord-ai-feature-builder': '1.7.0' } }, ENGINE), { kind: 'ok' });
+  assert.deepEqual(checkEnginePin({ name: 'discord-ai-feature-builder', dependencies: { octokit: '5.0.5' } }, ENGINE), { kind: 'ok' });
+  assert.deepEqual(checkEnginePin({ name: 'x' }, ENGINE), { kind: 'ok' });
+  assert.deepEqual(checkEnginePin(null, ENGINE), { kind: 'ok' }, 'an unreadable package.json is not evidence of a wrong pin');
+});
+
+test('a range, tag, file: or git spec is a WARNING (the convention suite insists on exact), never a refusal', () => {
+  for (const spec of ['^1.7.0', '~1.7.0', 'latest', 'file:../engine', 'github:o/engine']) {
+    const verdict = checkEnginePin({ dependencies: { 'discord-ai-feature-builder': spec } }, ENGINE);
+    assert.equal(verdict.kind, 'warn', spec);
+    assert.match(verdict.kind === 'warn' ? verdict.sentence : '', /is not an exact version; pin it to 1\.7\.0/u);
+  }
+});
+
+test("the engine's own checkout passes its own pin check (so `npm start` here keeps working)", () => {
+  const build = readBuildInfo({}, enginePackageRoot());
+  assert.deepEqual(checkEnginePin(readRepoManifest(enginePackageRoot()), build.engine), { kind: 'ok' });
+});
+
+test('readRepoManifest is best-effort: a missing or broken package.json is null', (t) => {
+  const dir = tempDir(t);
+  assert.equal(readRepoManifest(dir), null);
+  writeFileSync(join(dir, 'package.json'), '{not json');
+  assert.equal(readRepoManifest(dir), null);
+  writeFileSync(join(dir, 'package.json'), '{"dependencies":{"discord-ai-feature-builder":"1.0.0"}}');
+  assert.deepEqual(readRepoManifest(dir), { dependencies: { 'discord-ai-feature-builder': '1.0.0' } });
+});
+
+function tempDir(t: TestContext): string {
+  const dir = mkdtempSync(join(tmpdir(), 'bot-pin-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}

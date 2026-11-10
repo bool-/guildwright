@@ -2,7 +2,7 @@
 
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
-import { loadConfig } from '#core/config';
+import { loadConfig, removedBuilderKeyWarnings } from '#core/config';
 
 const BASE = {
   DISCORD_TOKEN: 'a'.repeat(60),
@@ -143,3 +143,41 @@ test('an inline key that is not a PEM is refused without echoing it', () => {
 test('a PAT next to an empty App variable still counts as two modes', () => {
   assert.match(configError({ ...BASE, GITHUB_APP_INSTALLATION_ID: '' }), /both GitHub auth modes are configured/u);
 });
+
+// ---------------------------------------------------------------------------------------
+// RFC-001 PR 1.7: ALLOW_PUBLIC_TARGET_REPO, and the removed builder keys
+// ---------------------------------------------------------------------------------------
+
+test('ALLOW_PUBLIC_TARGET_REPO defaults to false: a public target repository is refused unless asked for', () => {
+  const absent = loadConfig(BASE);
+  assert.ok(absent.ok);
+  assert.equal(absent.ok && absent.value.github.allowPublicTargetRepo, false);
+
+  const on = loadConfig({ ...BASE, ALLOW_PUBLIC_TARGET_REPO: 'true' });
+  assert.ok(on.ok);
+  assert.equal(on.ok && on.value.github.allowPublicTargetRepo, true);
+
+  const off = loadConfig({ ...BASE, ALLOW_PUBLIC_TARGET_REPO: 'false' });
+  assert.equal(off.ok && off.value.github.allowPublicTargetRepo, false);
+});
+
+test('ALLOW_PUBLIC_TARGET_REPO that is not a boolean is a config error naming it', () => {
+  const bad = loadConfig({ ...BASE, ALLOW_PUBLIC_TARGET_REPO: 'sure' });
+  assert.ok(!bad.ok);
+  assert.match(bad.ok ? '' : (bad.error.internal ?? ''), /ALLOW_PUBLIC_TARGET_REPO/u);
+});
+
+test('MODULES_JSON.builder.ref and .workflowFile are IGNORED, with a warning naming the env var that replaced each', () => {
+  const cfg = loadConfig({ ...BASE, MODULES_JSON: '{"builder":{"ref":"release","workflowFile":"other.yml","dailyRunCap":2}}' });
+  assert.ok(cfg.ok, 'still parses: the keys are ignored, not fatal');
+  if (!cfg.ok) return;
+  assert.equal(cfg.value.github.ref, 'main', 'the dispatch ref is GITHUB_REF, whatever MODULES_JSON says');
+  assert.equal(cfg.value.github.workflowFile, 'agent-implement-request.yml');
+  assert.deepEqual(removedBuilderKeyWarnings(cfg.value.modules), [
+    'MODULES_JSON.builder.ref is ignored: builds now dispatch at GITHUB_REF, the value the preflight and the gate-file check verify. Set GITHUB_REF instead and remove builder.ref from MODULES_JSON.',
+    'MODULES_JSON.builder.workflowFile is ignored: builds now dispatch at GITHUB_WORKFLOW_FILE, the value the preflight and the gate-file check verify. Set GITHUB_WORKFLOW_FILE instead and remove builder.workflowFile from MODULES_JSON.',
+  ]);
+  assert.deepEqual(removedBuilderKeyWarnings({ builder: { dailyRunCap: 2 } }), [], 'no warning without the keys');
+  assert.deepEqual(removedBuilderKeyWarnings({}), []);
+});
+

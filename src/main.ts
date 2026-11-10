@@ -25,7 +25,12 @@
  *                        sentence a bad DISCORD_TOKEN gets; anything else is warned about and
  *                        the bot starts. Without it the first person to learn that the PAT
  *                        expired is a user who clicked Approve and then waited hours for a
- *                        timeout, about a build that never started.
+ *                        timeout, about a build that never started. Then the CONTAINMENT
+ *                        probes (RFC-001 5.4, `containment.ts`): a public repo, a missing
+ *                        APPROVAL_HMAC_KEY secret, unreadable secrets on a PAT, refused
+ *                        environments, an unfunded ai-agent each refuse to start; a GitHub blip
+ *                        on any of them warns and starts with builds down. And the gate-file
+ *                        digest check once, for the log (never fatal; it runs per dispatch).
  *   6. router          - attached BEFORE login, so no interaction arrives without a listener.
  *   7. login           - the first thing that can fail for a reason outside this machine.
  *   8. commands        - deployed only when the payload digest changed. A global PUT is rate
@@ -55,9 +60,16 @@ import { resolve } from 'node:path';
 import type { AppError } from '#core/errors';
 import { errors, operatorMessage } from '#core/errors';
 import { createEventBus } from '#core/events';
-import { loadConfig, moduleConfigSlice, type AppConfig } from '#core/config';
+import {
+  builderRequiresOwnCredentials,
+  loadConfig,
+  moduleConfigSlice,
+  removedBuilderKeyWarnings,
+  type AppConfig,
+} from '#core/config';
 import type { AdminPort, CatalogPort, PortRegistry, VersionPort } from '#core/ports';
 import { describeBuild, describeGithubAuth } from '#core/ports';
+import { checkEnginePin } from '#core/version';
 import type { DocStore } from '#core/ports/db';
 import { buildCatalog, formatProblems } from '#core/registry';
 
@@ -72,7 +84,7 @@ import {
   type DeployableCommand,
 } from '#adapters/discord/client';
 import { attachRouter } from '#adapters/discord/router';
-import { createGithubAdapter, logPreflightWarnings, resolveGithubAuth } from '#adapters/github/index';
+import { createGithubAdapter, logPreflightWarnings, readEngineGateFiles, resolveGithubAuth } from '#adapters/github/index';
 import { ensureCoreSchema, openSqlite } from '#adapters/sqlite/db';
 import { readMigrationDir, runCoreMigrations, runMigrations } from '#adapters/sqlite/migrate';
 import { createAccess, fallbacksFromCatalog } from '#adapters/system/access';
@@ -82,7 +94,7 @@ import { createJobSystem } from '#adapters/system/jobs';
 import { createLogger } from '#adapters/system/logger';
 import { createRateGate } from '#adapters/system/ratelimit';
 import { createSettings } from '#adapters/system/settings';
-import { enginePackageRoot, readBuildInfo } from '#adapters/system/version';
+import { enginePackageRoot, readBuildInfo, readRepoManifest } from '#adapters/system/version';
 
 import {
   builtinRoot,
@@ -293,6 +305,14 @@ export async function run(env: Readonly<Record<string, string | undefined>> = pr
     say(`\ndiscord-bot cannot start: ${refusal}\n`);
     return 1;
   }
+  // THE ENGINE PIN (RFC-001 5.4): the module repo's package.json must ask for the engine that is
+  // installed, because the gate files the digest check compares against are that engine's.
+  const pin = checkEnginePin(readRepoManifest(), build.engine);
+  if (pin.kind === 'refuse') {
+    say(`\ndiscord-bot cannot start: ${pin.sentence}\n`);
+    return 1;
+  }
+  if (pin.kind === 'warn') say(`  warning: ${pin.sentence}`);
 
   // --- (0) crash handlers, before anything can crash -------------------------------------
   //
@@ -354,6 +374,12 @@ export async function run(env: Readonly<Record<string, string | undefined>> = pr
   // And on stderr too, because the boot log may be JSON going somewhere an operator watching a
   // console restart is not looking.
   say(`discord-bot: ${describeBuild(build)}`);
+  if (pin.kind === 'warn') logger.warn('engine pin is not exact', { detail: pin.sentence });
+  // Keys that no longer mean anything, said out loud rather than silently ignored.
+  for (const warning of removedBuilderKeyWarnings(cfg.modules)) {
+    logger.warn('ignored MODULES_JSON key', { detail: warning });
+    say(`  warning: ${warning}`);
+  }
 
   // --- (3) database ----------------------------------------------------------------------
   const opened = openSqlite(cfg.databasePath, { now: () => clock.now() });
@@ -510,10 +536,18 @@ export async function run(env: Readonly<Record<string, string | undefined>> = pr
     // FUNCTION on BuildsPort, never the key itself, so a signing secret never enters a
     // module's blast radius or MODULES_JSON.
     approvalHmacKey: cfg.github.approvalHmacKey,
-    // Not used by any port call — these two exist so the preflight below can ask GitHub about
-    // the exact workflow and ref every dispatch will name.
+    // THE ONE workflow and ref: every dispatch runs them, the daily cap counts them, and the
+    // preflight and the gate-file check verify them. There is no second copy in MODULES_JSON.
     workflowFile: cfg.github.workflowFile,
     ref: cfg.github.ref,
+    allowPublicTargetRepo: cfg.github.allowPublicTargetRepo,
+    // The build-path probes (APPROVAL_HMAC_KEY, environments, gate files) only when the builder
+    // will actually load; which environment probe runs depends on who pays.
+    builder: discovery.value.discovered.some((m) => m.descriptor.manifest.id === 'builder')
+      ? { requireOwnCredentials: builderRequiresOwnCredentials(cfg.modules) }
+      : null,
+    engineVersion: build.engine.version,
+    gateReference: readEngineGateFiles(enginePackageRoot(), cfg.github.workflowFile),
   });
   if (!githubAdapter.ok) return failBoot(githubAdapter.error);
   const github = githubAdapter.value;

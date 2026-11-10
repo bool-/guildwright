@@ -72,12 +72,21 @@ function setFormCustomId(): CustomId {
  * `sk-ant-api…`, so it classifies happily, stores successfully, and fails as a 401 half an hour
  * into a build. Being generous costs nothing; being tight costs the exact failure this feature
  * removes.
+ *
+ * THE INTRO IS THE HONESTY LINE (RFC-001 5.2, PR 1.7). It used to say "Nobody can read it back,
+ * including you", which is true of the GitHub API and false of the people who matter: anyone who
+ * administers the repository this bot builds in can add a workflow step that uses or prints an
+ * environment secret. Handing a key to this bot is trusting whoever runs it, exactly like handing
+ * a deploy key to someone's CI, so the modal says that, and says what limits the damage.
  */
+export const CREDENTIAL_TRUST_LINE =
+  "Stored encrypted as a GitHub environment secret in this bot's repository and used for builds you request. Whoever runs this bot, and any admin of that repository, can use it, so prefer a spend-limited key.";
+
 export function credentialForm(): FormSpec {
   return {
     customId: setFormCustomId(),
     title: 'Use your own Claude credentials',
-    intro: 'Stored encrypted as a GitHub environment secret and used only for builds you request. Nobody can read it back, including you.',
+    intro: CREDENTIAL_TRUST_LINE,
     fields: [
       {
         kind: 'text',

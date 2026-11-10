@@ -148,3 +148,19 @@ export function readBuildInfo(
     node: process.version,
   };
 }
+
+/**
+ * The working directory's `package.json`, parsed, or `null` when it cannot be read or parsed.
+ * Input to `checkEnginePin` (`#core/version`); best-effort like everything else in this file,
+ * because a manifest the bot cannot read is not evidence of a wrong pin.
+ */
+export function readRepoManifest(cwd: string = process.cwd()): unknown {
+  const raw = readTextOrNull(join(cwd, 'package.json'));
+  if (raw === null) return null;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return parsed;
+  } catch {
+    return null;
+  }
+}

@@ -529,13 +529,33 @@ export interface EnvironmentCredentials {
   readonly credentials: readonly BuildCredentialName[];
 }
 
+/**
+ * Whether builds may run right now, as last established. See `BuildsPort.readiness`.
+ *
+ * `detail` on the `down` arm is one finished operator sentence (no secrets: it names files,
+ * refs, permissions and the repository, never a value), shown verbatim in `/status`.
+ */
+export type BuildReadiness = { readonly status: 'ready' } | { readonly status: 'down'; readonly detail: string };
+
 /** Actions sub-port. WHY split from `issues`: filing an issue is cheap and reversible;
  *  dispatching a workflow spends money and writes to the repo. One reviewable line in the
  *  manifest has to be able to tell them apart. */
 export interface BuildsPort {
+  /**
+   * Dispatch the build workflow.
+   *
+   * WHICH WORKFLOW AND WHICH REF ARE NOT PARAMETERS (RFC-001 5.4). They used to be, fed from
+   * `modules.builder.workflowFile` / `.ref`, while the boot preflight checked
+   * `GITHUB_WORKFLOW_FILE` / `GITHUB_REF`: two values for one fact, and with
+   * `MODULES_JSON={"builder":{"ref":"x"}}` the gate-file digest check would have validated files
+   * that never execute. The adapter is bound to the one configured pair, so the files
+   * `verifyGates` checked are the files this runs.
+   *
+   * The adapter also REFUSES (a non-retryable config error, no request sent) unless the most
+   * recent `verifyGates` answer was a pass, so a caller that forgot to verify cannot dispatch
+   * past drift.
+   */
   dispatch(input: {
-    readonly workflowFile: WorkflowFile;
-    readonly ref: GitRef;
     readonly inputs: Readonly<Record<string, ActionsInput>>;
     /** Value of the workflow's `run-name`, used to correlate a blind dispatch. */
     readonly runName: ActionsToken;
@@ -569,10 +589,36 @@ export interface BuildsPort {
    * every trigger, including a manual one - so it is the same call with a different filter, and
    * merging them would mean one of the two questions gets the wrong answer.
    *
-   * `workflowFile` is branded, so it is a validated path segment and never free text.
-   * `sinceMs` is absolute epoch milliseconds; pass `clock.now() - windowMs`.
+   * The workflow counted is the adapter's bound `GITHUB_WORKFLOW_FILE`, the same one `dispatch`
+   * runs. `sinceMs` is absolute epoch milliseconds; pass `clock.now() - windowMs`.
    */
-  runsSince(workflowFile: WorkflowFile, sinceMs: number): Promise<Result<number, AppError>>;
+  runsSince(sinceMs: number): Promise<Result<number, AppError>>;
+
+  /**
+   * MAY A BUILD START NOW? The containment check of RFC-001 5.4, evaluated PER CALL, not per boot.
+   *
+   * Reads the dispatch ref's current commit SHA (one request) and, only when that SHA moved since
+   * the last call, the three gate files at that commit - the workflow named by
+   * `GITHUB_WORKFLOW_FILE`, `.github/scripts/verify_approval.py` and
+   * `.github/claude/agent-settings.json` - comparing each file's sha256 to the engine's own copy.
+   * It also re-runs any boot containment probe GitHub could not answer at boot (a 429, a 5xx, no
+   * network), so a blip at startup disables builds until GitHub answers, not until a restart.
+   *
+   * `Err` with a NON-retryable config error: builds are refused (drift, an unresolvable ref, or a
+   * misconfiguration a re-run probe found); its `internal` and `nextStep` are the operator's
+   * sentence. `Err` with a RETRYABLE error: it could not be checked right now; try again later.
+   *
+   * Call it before anything is filed or signed: at the `/request new` submission, and in the
+   * dispatch pass before `signApproval`. Drift merged after boot is caught at the next call.
+   */
+  verifyGates(): Promise<Result<void, AppError>>;
+
+  /**
+   * The last answer `verifyGates` (or the boot preflight) reached, WITHOUT a request. For
+   * `health()`: `/status` is polled, and a health check must never spend the API budget of the
+   * feature it reports on.
+   */
+  readiness(): BuildReadiness;
 
   /** Poll. Called from a durable job, never from an interaction handler. */
   runStatus(runId: number): Promise<Result<RunStatus, AppError>>;

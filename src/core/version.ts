@@ -195,3 +195,52 @@ export function findPackedRef(packed: string, ref: string): string | null {
   }
   return null;
 }
+
+// ---------------------------------------------------------------------------------------
+// The engine pin (RFC-001 5.4, 9.4)
+// ---------------------------------------------------------------------------------------
+
+/** An exact semver, the only pin shape that ties a module repo to ONE engine's gate files. */
+const EXACT_VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u;
+
+/** What the engine pin comparison concluded. `ok` covers "no pin at all" (the engine's own checkout). */
+export type EnginePinVerdict =
+  | { readonly kind: 'ok' }
+  | { readonly kind: 'refuse'; readonly sentence: string }
+  | { readonly kind: 'warn'; readonly sentence: string };
+
+/**
+ * Does the module repository's `package.json` ask for the engine that is actually installed?
+ *
+ * WHY IT IS A BOOT REFUSAL: the template's gate files (`.github/**`) and the engine version move
+ * together, so a module repo that pins `1.2.0` while `1.3.0` sits in `node_modules` is running an
+ * engine whose digest check compares the repo's gates against files the repo never agreed to.
+ * `npm ci` is the fix every time: it installs exactly what the lockfile, and so the pin, says.
+ *
+ * Only an EXACT pin is compared. A range (`^1.2.0`), a tag, a `file:` or git spec cannot be
+ * "equal" to an installed version, and refusing on one would refuse the engine's own local
+ * development installs; the convention suite's `engineContract` group is what insists on an
+ * exact pin, so here a non-exact spec is a warning, not a refusal. No dependency on the engine
+ * at all (the engine's own checkout, where both identities are the same package) is `ok`.
+ *
+ * `repoManifest` is the parsed `package.json` of the working directory, or `null` when it could
+ * not be read. Pure, so every arm is testable without a filesystem.
+ */
+export function checkEnginePin(repoManifest: unknown, engine: PackageIdentity): EnginePinVerdict {
+  if (typeof repoManifest !== 'object' || repoManifest === null) return { kind: 'ok' };
+  const deps: unknown = Reflect.get(repoManifest, 'dependencies');
+  if (typeof deps !== 'object' || deps === null) return { kind: 'ok' };
+  const spec: unknown = Reflect.get(deps, engine.name);
+  if (typeof spec !== 'string') return { kind: 'ok' };
+  if (!EXACT_VERSION.test(spec)) {
+    return {
+      kind: 'warn',
+      sentence: `package.json asks for ${engine.name}@${spec}, which is not an exact version; pin it to ${engine.version} so the engine and the template gate files move together.`,
+    };
+  }
+  if (spec === engine.version) return { kind: 'ok' };
+  return {
+    kind: 'refuse',
+    sentence: `package.json asks for ${engine.name}@${spec} but ${engine.version} is installed. Run npm ci.`,
+  };
+}

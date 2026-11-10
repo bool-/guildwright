@@ -12,7 +12,10 @@
     "src/core",
     "tsconfig.module-repo.json",
     "AGENTS.md",
-    "README.md"
+    "README.md",
+    ".github/workflows/agent-implement-request.yml",
+    ".github/scripts/verify_approval.py",
+    ".github/claude/agent-settings.json"
   ],
   "exports": {
     "./core/*": {
