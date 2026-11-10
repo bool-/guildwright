@@ -52,6 +52,7 @@ import type {
   RunRef,
   RunReport,
   RunStatus,
+  GitRef,
   WorkflowFile,
 } from '#core/ports';
 // The variable name rule and the "is this a number the workflow would accept?" reading both
@@ -430,6 +431,13 @@ function toPullSummary(raw: z.infer<typeof PullPayload>): PullSummary {
 // The port
 // ---------------------------------------------------------------------------------------
 
+/**
+ * Everything on `BuildsPort` except the containment gate, which `index.ts` composes on top
+ * (`verifyGates`, `readiness`, and the refusal wrapped around `dispatch`), because the gate needs
+ * the boot preflight's state and this file is built before the preflight runs.
+ */
+export type GithubBuildsCore = Omit<BuildsPort, 'verifyGates' | 'readiness'>;
+
 export function createGithubBuilds(input: {
   readonly octokit: Octokit;
   readonly repo: GithubRepo;
@@ -451,7 +459,14 @@ export function createGithubBuilds(input: {
    * carries GitHub's stored case. Defaults to the configured pair until the preflight answers.
    */
   readonly repositoryName?: () => string;
-}): BuildsPort {
+  /**
+   * `GITHUB_WORKFLOW_FILE` and `GITHUB_REF`, bound here rather than passed per call (RFC-001
+   * 5.4): the dispatch runs, and the daily cap counts, exactly the workflow at exactly the ref the
+   * preflight and the gate-file check verify. Branded at config load, so never free text.
+   */
+  readonly workflowFile: WorkflowFile;
+  readonly ref: GitRef;
+}): GithubBuildsCore {
   const { octokit, clock } = input;
   const { owner, repo } = input.repo;
   const repositoryName = input.repositoryName ?? ((): string => `${owner}/${repo}`);
@@ -617,7 +632,7 @@ export function createGithubBuilds(input: {
       // Turning a throw into an `AppError` is this file's job, and it uses the same mapper as
       // every other call so a 404 reads the same way whichever endpoint produced it.
       try {
-        return await dispatchWorkflow(octokit, owner, repo, request);
+        return await dispatchWorkflow(octokit, owner, repo, { ...request, workflowFile: input.workflowFile, ref: input.ref });
       } catch (cause: unknown) {
         return Err(fail(cause, 'builds.dispatch'));
       }
@@ -669,12 +684,12 @@ export function createGithubBuilds(input: {
      * `per_page: 1` because only `total_count` is read; there is no reason to move a hundred
      * run objects across the wire to count them.
      */
-    async runsSince(workflowFile: WorkflowFile, sinceMs: number): Promise<Result<number, AppError>> {
+    async runsSince(sinceMs: number): Promise<Result<number, AppError>> {
       try {
         const res = await octokit.request('GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs', {
           owner,
           repo,
-          workflow_id: workflowFile,
+          workflow_id: input.workflowFile,
           created: createdSinceFilter(sinceMs),
           per_page: 1,
           exclude_pull_requests: true,

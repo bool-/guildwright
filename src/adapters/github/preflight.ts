@@ -127,6 +127,8 @@ const RepoPayload = z.object({
   /** `false` when Issues are switched off, which makes `/request` impossible. */
   has_issues: z.boolean().optional(),
   archived: z.boolean().optional(),
+  /** RFC-001 5.4: a public target repository refuses to start unless ALLOW_PUBLIC_TARGET_REPO. */
+  private: z.boolean().optional(),
 });
 
 const WorkflowPayload = z.object({
@@ -152,6 +154,12 @@ export interface GithubPreflightReport {
    * addressed to the operator; the caller decides how loudly to print them.
    */
   readonly warnings: readonly string[];
+  /**
+   * The repository's `private` field, for the containment preflight's visibility check, or
+   * `null` when the repository probe itself could not be answered (a transient failure).
+   * `isPrivate: null` means GitHub answered without the field.
+   */
+  readonly visibility: { readonly isPrivate: boolean | null } | null;
 }
 
 /** Everything the preflight needs. It borrows the SHARED client, never builds its own. */
@@ -280,12 +288,14 @@ export async function preflightGithub(
 
   // --- 1. the repository ------------------------------------------------------------------
   let fullName = `${owner}/${repo}`;
+  let visibility: { readonly isPrivate: boolean | null } = { isPrivate: null };
   try {
     const res = await octokit.request('GET /repos/{owner}/{repo}', { owner, repo });
     noteExpiry(res.headers);
     const parsed = RepoPayload.safeParse(res.data);
     if (parsed.success) {
       fullName = parsed.data.full_name;
+      visibility = { isPrivate: parsed.data.private ?? null };
       // A NOTICE, NOT A FAULT. GitHub's REST paths are case-insensitive, so a mis-cased `.env`
       // has always worked - but the approval token now signs the repository name, and the
       // verifier reads `$GITHUB_REPOSITORY` in GitHub's own case. The adapter signs with THIS
@@ -319,7 +329,7 @@ export async function preflightGithub(
     warnings.push(verdict.warning);
     // The repository probe is the one every later probe depends on. If it could not be
     // answered for a transient reason, the other two would only repeat the same story.
-    return Ok({ fullName, workflowState: 'unknown', tokenExpiresAtMs: expiry.value, warnings: [...warnings] });
+    return Ok({ fullName, workflowState: 'unknown', tokenExpiresAtMs: expiry.value, warnings: [...warnings], visibility: null });
   }
 
   // --- 2. the workflow file ---------------------------------------------------------------
@@ -366,7 +376,7 @@ export async function preflightGithub(
       nowMs,
       location: 'GITHUB_REF',
       operation: 'preflight.ref',
-      notFoundNextStep: `GitHub could not resolve "${input.ref}" in ${owner}/${repo}. Either GITHUB_REF names a branch or tag that no longer exists - every workflow dispatch is sent against it, so no build can start - or GITHUB_TOKEN lacks the repository Contents permission, which is the only thing in this bot that needs it. Check both.`,
+      notFoundNextStep: `GitHub could not resolve "${input.ref}" in ${owner}/${repo}. Either GITHUB_REF names a branch or tag that no longer exists - every workflow dispatch is sent against it, so no build can start - or GITHUB_TOKEN lacks the repository Contents permission, which the gate-file check needs too (builds stay disabled until both resolve). Check both.`,
       // NOT FATAL, and the asymmetry is deliberate. This probe cannot tell a wrong ref from a
       // token without Contents read, and nothing ELSE in the bot needs Contents: a dispatch
       // needs Actions write. Refusing to boot on an ambiguous answer would stop a bot that has
@@ -380,7 +390,7 @@ export async function preflightGithub(
   const expiryWarning = tokenExpiryWarning(expiry.value, nowMs);
   if (expiryWarning !== null) warnings.push(expiryWarning);
 
-  return Ok({ fullName, workflowState, tokenExpiresAtMs: expiry.value, warnings: [...warnings] });
+  return Ok({ fullName, workflowState, tokenExpiresAtMs: expiry.value, warnings: [...warnings], visibility });
 }
 
 /**

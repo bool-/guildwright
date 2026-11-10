@@ -223,20 +223,22 @@ test('a RATE-LIMITED count honours the wait GitHub asked for, instead of hammeri
 // The two halves of the cap have to agree
 // ---------------------------------------------------------------------------------------
 
-test('the count is scoped to the agent workflow, and asked for the same day the runner asks about', async () => {
-  const asked: { file: string; since: number }[] = [];
+test('the count is asked for the same day the runner asks about (the workflow is the adapter-bound one)', async () => {
+  // Which workflow is counted is no longer the module's to say: the adapter is bound to
+  // GITHUB_WORKFLOW_FILE (RFC-001 5.4), and `runs.test.ts` asserts the route it counts on.
+  const asked: { since: number }[] = [];
   const h = harness(
-    { dailyRunCap: 4, workflowFile: 'agent-implement-request.yml' },
+    { dailyRunCap: 4 },
     {
-      runsSince: async (file, since) => {
-        asked.push({ file, since });
+      runsSince: async (since) => {
+        asked.push({ since });
         return Ok(0);
       },
     },
   );
   try {
     await h.build.run(payloadFor(seedDispatching(h.repo, 42), 42), runtime());
-    assert.deepEqual(asked, [{ file: 'agent-implement-request.yml', since: startOfUtcDay(NOW) }]);
+    assert.deepEqual(asked, [{ since: startOfUtcDay(NOW) }]);
   } finally {
     h.close();
   }

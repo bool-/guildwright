@@ -21,6 +21,7 @@ import { test } from 'node:test';
 
 import { isRetryable, operatorMessage, type AppError } from '#core/errors';
 import { secret } from '#core/config';
+import { Ok } from '#core/result';
 import type { JsonObject } from '#core/json';
 import { toGitRef, toWorkflowFile, type LoggerPort } from '#core/ports';
 import { describeGithubAuth } from '#core/version';
@@ -153,6 +154,10 @@ function adapterInput(fetchImpl: typeof globalThis.fetch, auth: GithubAdapterInp
     approvalHmacKey: secret('k'.repeat(48)),
     workflowFile: workflowFile.value,
     ref: ref.value,
+    allowPublicTargetRepo: false,
+    builder: null,
+    engineVersion: '0.0.0-test',
+    gateReference: Ok([]),
     fetch: fetchImpl,
   };
 }

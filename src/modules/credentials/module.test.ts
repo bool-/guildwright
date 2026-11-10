@@ -681,3 +681,14 @@ test('the audit distinguishes "nothing to supersede" from "the removal failed"',
     'a first-time store had nothing of the other kind to remove',
   );
 });
+
+test('THE HONESTY LINE: the /credentials set modal says who can use the credential, and no longer claims nobody can', () => {
+  // RFC-001 5.2: a requester who stores a key is trusting whoever runs this bot and administers
+  // its repository - any repo admin can write a workflow step that uses an environment secret.
+  // The old intro ("Nobody can read it back, including you") was true of the API and false of
+  // the people, which is the one place a reassurance must not be wrong.
+  const intro = credentialForm().intro ?? '';
+  assert.match(intro, /Whoever runs this bot, and any admin of that repository, can use it/u);
+  assert.match(intro, /spend-limited key/u, 'and what limits the damage');
+  assert.doesNotMatch(intro, /Nobody can read it back/u);
+});

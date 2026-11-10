@@ -71,6 +71,12 @@ export interface BuildsOverrides {
   cancelRun?: BuildsPort['cancelRun'];
   /** Only needed to force a FAILURE; seed `h.builds.variables` for every ordinary value. */
   repositoryVariable?: BuildsPort['repositoryVariable'];
+  /**
+   * The containment gate (RFC-001 5.4). `fakeBuilds()` answers from `h.builds.gateAnswer`; pass
+   * the REAL adapter's pair here to drive the gate-file check end to end (`containment.test.ts`).
+   */
+  verifyGates?: BuildsPort['verifyGates'];
+  readiness?: BuildsPort['readiness'];
 }
 
 /** Overrides for `IssuesPort`. `reopen` is on the port now and `fakeIssues()` implements it. */

@@ -109,7 +109,7 @@ export interface HistoryPorts {
   readonly discord: Pick<DiscordPort, 'post' | 'edit' | 'delete'>;
   readonly issues: Pick<IssuesPort, 'close'> & ReopensIssues;
   readonly jobs: JobsPort;
-  readonly builds: Pick<BuildsPort, 'environmentCredentials'> & CancelsRuns;
+  readonly builds: Pick<BuildsPort, 'environmentCredentials' | 'verifyGates'> & CancelsRuns;
 }
 
 /** Exactly the config these commands read. Kept explicit so the manifest is the only defaults. */
@@ -445,6 +445,12 @@ function retryCommand(deps: HistoryDeps): CommandSpec {
           error: errors.conflict('no_issue', 'That request never got as far as a GitHub issue.', 'Open a new one with /request new.'),
         };
       }
+
+      // BUILDS DISABLED, ON THE RETRY PATH TOO (RFC-001 5.4). The dispatch pass would refuse a
+      // drifted gate anyway; refusing here says so to the person asking instead of re-arming a
+      // row only to fail it again a moment later.
+      const gated = await deps.ports.builds.verifyGates();
+      if (!gated.ok) return { kind: 'fail', error: gated.error };
 
       // NO FREE BUILDS, ON THE RETRY PATH TOO. This is the check that makes a retry a fresh
       // request rather than a way around the gate: without it, one approved build that failed
