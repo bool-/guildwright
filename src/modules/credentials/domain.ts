@@ -37,6 +37,7 @@ import { errors, type AppError } from '#core/errors';
 import { toSecret, type UserText } from '#core/text';
 import type { UserId } from '#core/ids';
 import type { Audit } from '#core/ports/audit';
+import type { RepoRef, RepoScoped } from '#core/ports/repos';
 import {
   classifyCredential,
   toSecretName,
@@ -45,6 +46,60 @@ import {
   type SecretName,
   type Secrets,
 } from '#core/ports/secrets';
+
+// ---------------------------------------------------------------------------------------
+// Which repository (RFC-001 PR 2.1)
+// ---------------------------------------------------------------------------------------
+
+/**
+ * The sentence for a bot with several repositories and no default: there is no repository whose
+ * environments a credential could go into. RFC-001 8.1's unmapped refusal, with the next step
+ * this version can actually offer (guild routing, `/repo use`, is PR 2.2).
+ */
+export function noCredentialRepositoryError(): AppError {
+  return errors.config(
+    'repos.unmapped',
+    'This server is not linked to a repository yet, so there is nowhere to store a credential for it.',
+    'Ask the bot operator to mark one repository "default": true in GITHUB_REPOS_JSON.',
+  );
+}
+
+/** A `Secrets` that refuses everything with one error, for a bot with no repository to act on. */
+function refusingSecrets(error: AppError): Secrets {
+  const no = async (): Promise<Result<never, AppError>> => Err(error);
+  return { ensureEnvironment: no, put: no, list: no, remove: no, deleteEnvironment: no };
+}
+
+/** Which repository's `Secrets` this module acts on, or why there is none. */
+export interface CredentialRepository {
+  readonly secrets: Secrets;
+  /** Null when there is a repository; otherwise the `/status` sentence. */
+  readonly unavailable: string | null;
+}
+
+/**
+ * THE SEAM PR 2.3 REPLACES. Today every `/credentials` command acts on the DEFAULT repository of
+ * the set - which, for a one-repository install, is the repository it always acted on, so
+ * nothing changes there. PR 2.3 resolves per command instead: a guild's own repository
+ * (`repos.resolve(guildId)`), and in a DM a `repo:` option or every repository.
+ *
+ * With no default (several repositories, none marked), every command refuses with
+ * `noCredentialRepositoryError` and `/status` reports the module down: storing a credential in
+ * "the first repository" would put money where nobody asked for it.
+ */
+export function credentialRepository(
+  repos: { all(): readonly RepoRef[] },
+  secrets: RepoScoped<Secrets>,
+): CredentialRepository {
+  const target = repos.all().find((r) => r.isDefault) ?? null;
+  if (target === null) {
+    const error = noCredentialRepositoryError();
+    return { secrets: refusingSecrets(error), unavailable: `${error.internal ?? ''} ${error.nextStep}`.trim() };
+  }
+  const scoped = secrets.at(target);
+  if (!scoped.ok) return { secrets: refusingSecrets(scoped.error), unavailable: scoped.error.nextStep };
+  return { secrets: scoped.value, unavailable: null };
+}
 
 /** What `/credentials status` learned. `names` is empty when nothing is stored. */
 export interface CredentialStatus {

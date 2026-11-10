@@ -80,9 +80,11 @@ import {
   type CancelledRun,
 } from '#modules/builder/cards';
 import {
+  githubForRow,
   reopenIssue,
   requestRunCancellation,
   type CancelsRuns,
+  type GithubScopes,
   type IssueReopenReport,
   type ReopensIssues,
   type RunCancelReport,
@@ -102,15 +104,21 @@ import { deliverOutcome } from '#modules/builder/notify';
  * else owns; see `#modules/builder/ports` for why they are declared as optional companions
  * rather than waited for.
  */
-export interface HistoryPorts {
+export interface HistoryPorts extends GithubScopes<HistoryIssues, HistoryBuilds> {
   readonly audit: AuditPort;
   readonly clock: ClockPort;
   readonly access: AccessPort;
   readonly discord: Pick<DiscordPort, 'post' | 'edit' | 'delete'>;
-  readonly issues: Pick<IssuesPort, 'close'> & ReopensIssues;
   readonly jobs: JobsPort;
-  readonly builds: Pick<BuildsPort, 'environmentCredentials' | 'verifyGates'> & CancelsRuns;
 }
+
+/**
+ * What this file needs from ONE repository's ports. They arrive per repository behind
+ * `.at(repo)` (RFC-001 PR 2.1), and every command here reaches the row's own repository
+ * through `githubForRow`, never "the" repository.
+ */
+export type HistoryIssues = Pick<IssuesPort, 'close'> & ReopensIssues;
+export type HistoryBuilds = Pick<BuildsPort, 'environmentCredentials' | 'verifyGates'> & CancelsRuns;
 
 /** Exactly the config these commands read. Kept explicit so the manifest is the only defaults. */
 export interface HistoryConfig {
@@ -336,7 +344,9 @@ function cancelCommand(deps: HistoryDeps): CommandSpec {
  */
 async function stopTheRun(deps: HistoryDeps, row: BuildRow, wasRunning: boolean): Promise<RunCancelReport> {
   if (!wasRunning || row.runId === null) return { kind: 'unavailable' };
-  return requestRunCancellation(deps.ports.builds, row.runId);
+  const target = githubForRow(deps.ports, row);
+  if (!target.ok) return { kind: 'refused', error: target.error };
+  return requestRunCancellation(target.value.builds, row.runId);
 }
 
 /** Turn what GitHub said into the one sentence the card and the receipt both render. */
@@ -449,7 +459,10 @@ function retryCommand(deps: HistoryDeps): CommandSpec {
       // BUILDS DISABLED, ON THE RETRY PATH TOO (RFC-001 5.4). The dispatch pass would refuse a
       // drifted gate anyway; refusing here says so to the person asking instead of re-arming a
       // row only to fail it again a moment later.
-      const gated = await deps.ports.builds.verifyGates();
+      // THE ROW'S OWN REPOSITORY, which is where a retry builds (RFC-001 7.3).
+      const target = githubForRow(deps.ports, row);
+      if (!target.ok) return { kind: 'fail', error: target.error };
+      const gated = await target.value.builds.verifyGates();
       if (!gated.ok) return { kind: 'fail', error: gated.error };
 
       // NO FREE BUILDS, ON THE RETRY PATH TOO. This is the check that makes a retry a fresh
@@ -459,7 +472,7 @@ function retryCommand(deps: HistoryDeps): CommandSpec {
       // It asks about the ROW's requester, not the caller, because they are who pays - an
       // approver retrying somebody else's build does not put it on their own key.
       if (deps.cfg.requireOwnCredentials) {
-        const gate = await requireOwnCredentialsGate(deps.ports.builds, row.requesterId);
+        const gate = await requireOwnCredentialsGate(target.value.builds, row.requesterId);
         if (!gate.ok) {
           const mine = row.requesterId === inv.actor.userId;
           return {
@@ -658,7 +671,8 @@ async function reArmForApproval(
   //
   // AFTER the compare-and-set, never before: reopening an issue for a retry that then LOSES the
   // race would leave a live issue for a request that stayed expired.
-  const reopened = await reopenIssue(deps.ports.issues, issueNumber);
+  const target = githubForRow(deps.ports, row);
+  const reopened = target.ok ? await reopenIssue(target.value.issues, issueNumber) : { kind: 'failed' as const, error: target.error };
   if (reopened.kind === 'failed') {
     // Not fatal. The row is `awaiting_approval` and that is the state governing spend; the worst
     // case is a closed issue, and the receipt below says so rather than claiming otherwise.
@@ -819,7 +833,9 @@ function cardChannel(previousChannelId: string | null, fallback: ChannelId): Cha
  *  governs spend and the slot, so the worst case is a stale open issue the card admits to. */
 async function closeIssue(deps: HistoryDeps, row: BuildRow): Promise<boolean> {
   if (row.issueNumber === null) return true;
-  const closed = await deps.ports.issues.close(row.issueNumber, 'not_planned');
+  const target = githubForRow(deps.ports, row);
+  if (!target.ok) return false;
+  const closed = await target.value.issues.close(row.issueNumber, 'not_planned');
   return closed.ok;
 }
 

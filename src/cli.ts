@@ -8,7 +8,7 @@
  *   <bin> scaffold <id> [--summary "..."] [--db] [--force]
  *   <bin> init <dir> [--existing]        write the module-repo template (or convert a repo)
  *   <bin> template check|apply           compare / rewrite the gated .github files and AGENTS.md
- *   <bin> gc-approvals [--older-than 90d] [--yes]
+ *   <bin> gc-approvals [--older-than 90d] [--yes] [--repo <key>]
  *
  * WHY THE ARGUMENT PARSER IS HAND-ROLLED: it is twenty lines, every subcommand takes at most three
  * flags, and a dependency is behind human approval for a reason (AGENTS.md "If you are blocked").
@@ -44,7 +44,7 @@ export const USAGE = `usage: ${CLI_BIN} <command>
                                    --existing converts the repository there (never src/modules/, never .env)
   template check                   do the gated .github files and AGENTS.md match the installed engine?
   template apply                   rewrite them from the installed engine (refuses a dirty tree)
-  gc-approvals [--older-than ${DEFAULT_OLDER_THAN}] [--yes]
+  gc-approvals [--older-than ${DEFAULT_OLDER_THAN}] [--yes] [--repo <key>]
                                    list (and with --yes delete) old refs/approvals/* refs
 `;
 
@@ -213,12 +213,16 @@ export async function runCli(argv: readonly string[], io: CliIo, deps: CliDeps):
     }
 
     case 'gc-approvals': {
-      const p = args(io, rest, { 'older-than': 'value', yes: 'boolean' }, 0);
+      const p = args(io, rest, { 'older-than': 'value', yes: 'boolean', repo: 'value' }, 0);
       if (typeof p === 'number') return p;
       return await gcApprovals(
         { ...io, env: withDotEnv(io.cwd, io.env) },
         deps.gcRequest === undefined ? {} : { request: deps.gcRequest },
-        { olderThan: stringFlag(p, 'older-than') ?? DEFAULT_OLDER_THAN, yes: p.flags.has('yes') },
+        (() => {
+          const repo = stringFlag(p, 'repo');
+          const base = { olderThan: stringFlag(p, 'older-than') ?? DEFAULT_OLDER_THAN, yes: p.flags.has('yes') };
+          return repo === null ? base : { ...base, repo };
+        })(),
       );
     }
 

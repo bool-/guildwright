@@ -53,6 +53,7 @@ import { Err, Ok, type Result } from '#core/result';
 import { errors, type AppError } from '#core/errors';
 import { redactSecrets } from '#core/text';
 import type { GitRef, LoggerPort, WorkflowFile } from '#core/ports';
+import { ENV_REPO_SETTING_NAMES, type RepoSettingNames } from '#core/config';
 import { GithubAuthFailure, readGithubFailure, type GithubRepo } from '#adapters/github/client';
 
 // ---------------------------------------------------------------------------------------
@@ -172,6 +173,11 @@ export interface GithubPreflightInput {
   readonly ref: GitRef;
   /** Wall clock, for the expiry arithmetic. Injected so the warning is testable. */
   readonly nowMs: number;
+  /**
+   * How the sentences name this repository's settings: `GITHUB_REF` for the single-repository
+   * pair (the default), `GITHUB_REPOS_JSON.<key>.ref` for an entry of the set (RFC-001 PR 2.1).
+   */
+  readonly names?: RepoSettingNames;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -274,6 +280,7 @@ export async function preflightGithub(
 ): Promise<Result<GithubPreflightReport, AppError>> {
   const { octokit, nowMs } = input;
   const { owner, repo } = input.repo;
+  const names = input.names ?? ENV_REPO_SETTING_NAMES;
   const warnings: string[] = [];
   /** WHY a box and not a `let`: it is written from inside a closure, and a `let` written that
    *  way reads back with the narrowing it had at its declaration. */
@@ -302,7 +309,7 @@ export async function preflightGithub(
       // value rather than the configured pair, which is why this is only worth a line.
       if (fullName !== `${owner}/${repo}` && fullName.toLowerCase() === `${owner}/${repo}`.toLowerCase()) {
         warnings.push(
-          `GITHUB_OWNER/GITHUB_REPO is spelled ${owner}/${repo} but GitHub spells it ${fullName}. Approval tokens are signed with GitHub's spelling, so nothing is broken; fixing .env removes this notice.`,
+          `${names.ownerRepo} is spelled ${owner}/${repo} but GitHub spells it ${fullName}. Approval tokens are signed with GitHub's spelling, so nothing is broken; fixing .env removes this notice.`,
         );
       }
       if (parsed.data.has_issues === false) {
@@ -318,9 +325,9 @@ export async function preflightGithub(
     const verdict = classifyPreflightFailure({
       cause,
       nowMs,
-      location: 'GITHUB_OWNER/GITHUB_REPO',
+      location: names.ownerRepo,
       operation: 'preflight.repo',
-      notFoundNextStep: `GitHub cannot see a repository called ${owner}/${repo}. On a private repository that usually means GITHUB_TOKEN has no access to it rather than that it is missing: check GITHUB_OWNER, GITHUB_REPO, and the token's repository access, then restart.`,
+      notFoundNextStep: `GitHub cannot see a repository called ${owner}/${repo}. On a private repository that usually means GITHUB_TOKEN has no access to it rather than that it is missing: check ${names.owner}, ${names.repo}, and the token's repository access, then restart.`,
       // Metadata read is mandatory on every fine-grained PAT, so a 404 here is unambiguous:
       // either the name is wrong or the token cannot see the repository. Both are fatal.
       notFoundIsFatal: true,
@@ -351,9 +358,9 @@ export async function preflightGithub(
     const verdict = classifyPreflightFailure({
       cause,
       nowMs,
-      location: 'GITHUB_WORKFLOW_FILE',
+      location: names.workflowFile,
       operation: 'preflight.workflow',
-      notFoundNextStep: `${owner}/${repo} has no workflow file called ${input.workflowFile} on its default branch. Set GITHUB_WORKFLOW_FILE to a file that exists under .github/workflows/ and restart. If the file IS there, GITHUB_TOKEN is missing the repository Actions permission - which the build poller needs on every build anyway.`,
+      notFoundNextStep: `${owner}/${repo} has no workflow file called ${input.workflowFile} on its default branch. Set ${names.workflowFile} to a file that exists under .github/workflows/ and restart. If the file IS there, GITHUB_TOKEN is missing the repository Actions permission - which the build poller needs on every build anyway.`,
       // The poller reads GET /actions/runs on every single build, so a token that cannot answer
       // this cannot run one either. Refusing to start is the honest answer.
       notFoundIsFatal: true,
@@ -374,9 +381,9 @@ export async function preflightGithub(
     const verdict = classifyPreflightFailure({
       cause,
       nowMs,
-      location: 'GITHUB_REF',
+      location: names.ref,
       operation: 'preflight.ref',
-      notFoundNextStep: `GitHub could not resolve "${input.ref}" in ${owner}/${repo}. Either GITHUB_REF names a branch or tag that no longer exists - every workflow dispatch is sent against it, so no build can start - or GITHUB_TOKEN lacks the repository Contents permission, which the gate-file check needs too (builds stay disabled until both resolve). Check both.`,
+      notFoundNextStep: `GitHub could not resolve "${input.ref}" in ${owner}/${repo}. Either ${names.ref} names a branch or tag that no longer exists - every workflow dispatch is sent against it, so no build can start - or GITHUB_TOKEN lacks the repository Contents permission, which the gate-file check needs too (builds stay disabled until both resolve). Check both.`,
       // NOT FATAL, and the asymmetry is deliberate. This probe cannot tell a wrong ref from a
       // token without Contents read, and nothing ELSE in the bot needs Contents: a dispatch
       // needs Actions write. Refusing to boot on an ambiguous answer would stop a bot that has

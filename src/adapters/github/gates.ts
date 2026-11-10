@@ -158,11 +158,11 @@ export function gateDriftError(files: readonly string[], fullName: string, engin
 }
 
 /** The ref every dispatch names cannot be resolved, so the files that would run cannot be read. */
-export function gateRefError(ref: GitRef, fullName: string, status: number): AppError {
+export function gateRefError(ref: GitRef, fullName: string, status: number, refName = 'GITHUB_REF'): AppError {
   return errors.config(
-    'GITHUB_REF',
-    `Builds are disabled: GitHub could not resolve GITHUB_REF "${ref}" in ${fullName} (HTTP ${status}), so the gate files a build would run cannot be checked.`,
-    'Set GITHUB_REF to a branch or tag that exists, and make sure the token has Contents: read (the gate-file check needs it), then restart.',
+    refName,
+    `Builds are disabled: GitHub could not resolve ${refName} "${ref}" in ${fullName} (HTTP ${status}), so the gate files a build would run cannot be checked.`,
+    `Set ${refName} to a branch or tag that exists, and make sure the token has Contents: read (the gate-file check needs it), then restart.`,
   );
 }
 
@@ -249,6 +249,8 @@ export interface GateCheckInput {
   readonly engineVersion: string;
   readonly nowMs: () => number;
   readonly logger: LoggerPort;
+  /** What the ref's sentence calls the setting: `GITHUB_REF` (default) or an entry's `ref`. */
+  readonly refName?: string;
 }
 
 export function createGateCheck(input: GateCheckInput): GateCheck {
@@ -308,7 +310,7 @@ export function createGateCheck(input: GateCheckInput): GateCheck {
         sha = parsed.data.sha;
       } catch (cause: unknown) {
         return settle(
-          failed(cause, 'gates.ref', (status) => ({ kind: 'blocked', error: gateRefError(input.ref, input.fullName(), status) })),
+          failed(cause, 'gates.ref', (status) => ({ kind: 'blocked', error: gateRefError(input.ref, input.fullName(), status, input.refName) })),
         );
       }
 

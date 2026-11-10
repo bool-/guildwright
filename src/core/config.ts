@@ -20,8 +20,8 @@ import type { Result } from '#core/result';
 import { Err, Ok } from '#core/result';
 import type { AppError } from '#core/errors';
 import { errors } from '#core/errors';
-import type { GitRef, LogLevel, WorkflowFile } from '#core/ports';
-import { toGitRef, toWorkflowFile } from '#core/ports';
+import type { GitRef, LogLevel, RepoKey, WorkflowFile } from '#core/ports';
+import { DEFAULT_REPO_KEY, REPO_KEY_PATTERN, isRepoKey, toGitRef, toWorkflowFile } from '#core/ports';
 
 /**
  * `Secret` now lives in `#core/secret`, a leaf file with no imports, and is re-exported here
@@ -36,6 +36,12 @@ export type { Secret } from '#core/secret';
 export { secret } from '#core/secret';
 
 const snowflake = z.string().regex(/^\d{17,20}$/u, 'must be a Discord snowflake');
+
+/** GitHub's own rules for an account and a repository name; shared by both repository forms. */
+const GITHUB_OWNER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/u;
+const GITHUB_REPO_PATTERN = /^[A-Za-z0-9._-]{1,100}$/u;
+const DEFAULT_WORKFLOW_FILE = 'agent-implement-request.yml';
+const DEFAULT_GIT_REF = 'main';
 
 /**
  * Whether a string is shaped like a PEM private key (PKCS#1 `RSA PRIVATE KEY`, which is what
@@ -93,10 +99,18 @@ export const EnvSchema = z.object({
     .optional(),
   GITHUB_APP_PRIVATE_KEY_FILE: z.string().min(1).optional(),
   GITHUB_APP_INSTALLATION_ID: z.string().regex(/^[1-9]\d{0,15}$/u, 'must be a numeric installation id').optional(),
-  GITHUB_OWNER: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/u),
-  GITHUB_REPO: z.string().regex(/^[A-Za-z0-9._-]{1,100}$/u),
-  GITHUB_WORKFLOW_FILE: z.string().default('agent-implement-request.yml'),
-  GITHUB_REF: z.string().default('main'),
+  /**
+   * THE REPOSITORY SET (RFC-001 7.1). Either `GITHUB_REPOS_JSON` (one entry per repository), or
+   * the single-repository pair below, which the compatibility shim turns into a one-repository
+   * set keyed `default` - so a phase-1 install needs no change. Never both: which one is
+   * required, and the never-both rule, are enforced by `githubRepoSetIssues` below, for the same
+   * reason the auth rule is (every problem reported in one pass).
+   */
+  GITHUB_OWNER: z.string().regex(GITHUB_OWNER_PATTERN).optional(),
+  GITHUB_REPO: z.string().regex(GITHUB_REPO_PATTERN).optional(),
+  GITHUB_WORKFLOW_FILE: z.string().default(DEFAULT_WORKFLOW_FILE),
+  GITHUB_REF: z.string().default(DEFAULT_GIT_REF),
+  GITHUB_REPOS_JSON: z.string().optional(),
   /** Shared with the repo's Actions secrets and nowhere else (SC-6). */
   APPROVAL_HMAC_KEY: z.string().min(32, 'must be at least 32 chars of entropy'),
   /**
@@ -163,6 +177,250 @@ export function githubAuthModeIssues(env: Readonly<Record<string, string | undef
   return issues;
 }
 
+// ---------------------------------------------------------------------------------------
+// The repository set (RFC-001 7.1)
+// ---------------------------------------------------------------------------------------
+
+/** The single-repository variables that `GITHUB_REPOS_JSON` replaces, and so must not sit beside. */
+const SINGLE_REPO_VARIABLES = ['GITHUB_OWNER', 'GITHUB_REPO', 'GITHUB_REF', 'GITHUB_WORKFLOW_FILE', 'GITHUB_APP_INSTALLATION_ID'] as const;
+
+/** One `GITHUB_REPOS_JSON` entry. Strict: a misspelt `workflowfile` is refused, not ignored. */
+const RepoEntrySchema = z.strictObject({
+  owner: z.string().regex(GITHUB_OWNER_PATTERN, 'must be a GitHub user or organisation name'),
+  repo: z.string().regex(GITHUB_REPO_PATTERN, 'must be a GitHub repository name'),
+  ref: z.string().default(DEFAULT_GIT_REF),
+  workflowFile: z.string().default(DEFAULT_WORKFLOW_FILE),
+  installationId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+  default: z.boolean().optional(),
+});
+
+/** One finished sentence and the variable it is about. */
+export interface RepoSetIssue {
+  readonly message: string;
+  readonly at: string;
+}
+
+/** The parsed set, or every reason it does not parse. */
+export type RepoSetParse =
+  | { readonly repos: readonly GithubRepoConfig[]; readonly source: 'env' | 'json' }
+  | { readonly issues: readonly RepoSetIssue[] };
+
+/**
+ * The top-level keys of a JSON object, IN THE ORDER WRITTEN AND WITH DUPLICATES - which
+ * `JSON.parse` cannot report: it keeps the last of two equal keys and silently drops the first,
+ * so a repository pasted twice under one key with two different `owner`s would boot against
+ * whichever came second. `null` when the text is not an object this scanner can walk (the
+ * caller has already run `JSON.parse`, so that only happens for a non-object).
+ */
+export function topLevelJsonKeys(text: string): readonly string[] | null {
+  const keys: string[] = [];
+  let depth = 0;
+  let i = 0;
+  let expectKey = false;
+  while (i < text.length) {
+    const c = text[i];
+    if (c === '"') {
+      let j = i + 1;
+      while (j < text.length && text[j] !== '"') j += text[j] === '\\' ? 2 : 1;
+      const literal = text.slice(i, j + 1);
+      if (depth === 1 && expectKey) {
+        const decoded: unknown = JSON.parse(literal);
+        if (typeof decoded === 'string') keys.push(decoded);
+        expectKey = false;
+      }
+      i = j + 1;
+      continue;
+    }
+    if (c === '{' || c === '[') {
+      depth += 1;
+      expectKey = depth === 1 && c === '{';
+      if (depth === 1 && c === '[') return null;
+    } else if (c === '}' || c === ']') {
+      depth -= 1;
+    } else if (c === ',' && depth === 1) {
+      expectKey = true;
+    }
+    i += 1;
+  }
+  return keys;
+}
+
+/** Whether the raw env selects PAT mode unambiguously (the auth rule reports every other case). */
+function isPatOnly(env: Readonly<Record<string, string | undefined>>): boolean {
+  return env['GITHUB_TOKEN'] !== undefined && APP_VARIABLES.every((name) => env[name] === undefined);
+}
+
+/**
+ * THE REPOSITORY SET, from the raw env (RFC-001 7.1).
+ *
+ * WHY THE RAW ENV, like `githubAuthModeIssues`: it must report its problems in the same pass as
+ * every other bad variable, even when `EnvSchema` failed on something unrelated.
+ *
+ * TWO FORMS, NEVER BOTH:
+ *
+ *  - `GITHUB_REPOS_JSON` absent: THE COMPATIBILITY SHIM. `GITHUB_OWNER`, `GITHUB_REPO`,
+ *    `GITHUB_REF`, `GITHUB_WORKFLOW_FILE` and `GITHUB_APP_INSTALLATION_ID` define one repository
+ *    keyed `default`, marked default - exactly the phase-1 meaning of each variable, so an
+ *    existing install needs no change and behaves identically.
+ *  - `GITHUB_REPOS_JSON` present: one entry per repository, keyed by `/^[a-z][a-z0-9-]{0,30}$/`;
+ *    `owner`/`repo` use the same rules as the pair; `ref` and `workflowFile` default as before;
+ *    `installationId` optional (App mode only); at most one `"default": true`. A set of exactly
+ *    one entry that says nothing about `default` is the default, so a one-entry JSON set behaves
+ *    exactly like the pair. The pair's variables beside it are refused rather than merged: two
+ *    places to say which repository the bot builds in is how a build lands in the wrong one.
+ *
+ * Refused as well: a key written twice (see `topLevelJsonKeys`), and two keys naming the same
+ * repository (compared case-insensitively, as GitHub does), which would give one repository two
+ * adapters, two gate caches and two answers to "how many builds ran today?".
+ */
+export function githubRepoSet(env: Readonly<Record<string, string | undefined>>): RepoSetParse {
+  const raw = env['GITHUB_REPOS_JSON'];
+  return raw === undefined ? shimRepoSet(env) : jsonRepoSet(raw, env);
+}
+
+/** The phase-1 pair as a one-repository set. */
+function shimRepoSet(env: Readonly<Record<string, string | undefined>>): RepoSetParse {
+  const issues: RepoSetIssue[] = [];
+  const owner = env['GITHUB_OWNER'];
+  const repo = env['GITHUB_REPO'];
+  for (const [name, value] of [['GITHUB_OWNER', owner], ['GITHUB_REPO', repo]] as const) {
+    if (value === undefined) {
+      issues.push({
+        message: `${name} is required: set GITHUB_OWNER and GITHUB_REPO to the module repository, or list the repositories in GITHUB_REPOS_JSON.`,
+        at: name,
+      });
+    }
+  }
+  const workflowFile = toWorkflowFile(env['GITHUB_WORKFLOW_FILE'] ?? DEFAULT_WORKFLOW_FILE);
+  if (!workflowFile.ok) issues.push({ message: `${workflowFile.error.internal ?? 'not a workflow file'}. ${workflowFile.error.nextStep}`, at: 'GITHUB_WORKFLOW_FILE' });
+  const ref = toGitRef(env['GITHUB_REF'] ?? DEFAULT_GIT_REF);
+  if (!ref.ok) issues.push({ message: `${ref.error.internal ?? 'not a git ref'}. ${ref.error.nextStep}`, at: 'GITHUB_REF' });
+  const pinned = env['GITHUB_APP_INSTALLATION_ID'];
+  // A malformed GITHUB_OWNER/GITHUB_REPO/GITHUB_APP_INSTALLATION_ID is reported by `EnvSchema`;
+  // this only has to stop building a set from it.
+  if (
+    issues.length > 0 ||
+    owner === undefined ||
+    repo === undefined ||
+    !workflowFile.ok ||
+    !ref.ok ||
+    !GITHUB_OWNER_PATTERN.test(owner) ||
+    !GITHUB_REPO_PATTERN.test(repo) ||
+    (pinned !== undefined && !/^[1-9]\d{0,15}$/u.test(pinned)) ||
+    // Never refuses (`default` matches the key pattern); it is here because the predicate IS the brand.
+    !isRepoKey(DEFAULT_REPO_KEY)
+  ) {
+    return { issues };
+  }
+  return {
+    source: 'env',
+    repos: [
+      {
+        key: DEFAULT_REPO_KEY,
+        owner,
+        repo,
+        workflowFile: workflowFile.value,
+        ref: ref.value,
+        installationId: pinned === undefined ? null : Number.parseInt(pinned, 10),
+        isDefault: true,
+        names: ENV_REPO_SETTING_NAMES,
+      },
+    ],
+  };
+}
+
+/** `GITHUB_REPOS_JSON`, validated entry by entry so every problem is named at once. */
+function jsonRepoSet(raw: string, env: Readonly<Record<string, string | undefined>>): RepoSetParse {
+  const issues: RepoSetIssue[] = [];
+  const mixed = SINGLE_REPO_VARIABLES.filter((name) => env[name] !== undefined);
+  if (mixed.length > 0) {
+    issues.push({
+      message: `GITHUB_REPOS_JSON is set, so ${mixed.join(', ')} must not be: the repository set comes from one place. Move each value onto its GITHUB_REPOS_JSON entry (owner, repo, ref, workflowFile, installationId) and delete ${mixed.length === 1 ? 'it' : 'them'} from .env. An empty line still counts as set.`,
+      at: 'GITHUB_REPOS_JSON',
+    });
+  }
+
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(raw);
+  } catch (cause: unknown) {
+    issues.push({ message: `not valid JSON: ${cause instanceof Error ? cause.message : 'unknown'}`, at: 'GITHUB_REPOS_JSON' });
+    return { issues };
+  }
+  if (typeof parsedJson !== 'object' || parsedJson === null || Array.isArray(parsedJson)) {
+    issues.push({ message: 'must be a JSON object keyed by repository key, e.g. {"main":{"owner":"acme","repo":"bot-modules"}}', at: 'GITHUB_REPOS_JSON' });
+    return { issues };
+  }
+
+  const written = topLevelJsonKeys(raw) ?? [];
+  const twice = [...new Set(written.filter((k, i) => written.indexOf(k) !== i))];
+  for (const key of twice) {
+    issues.push({ message: `the key "${key}" is written more than once; JSON keeps only the last, so the others would be silently dropped. Give each repository one entry.`, at: `GITHUB_REPOS_JSON.${key}` });
+  }
+
+  const patOnly = isPatOnly(env);
+  const repos: GithubRepoConfig[] = [];
+  const entries = Object.entries(parsedJson);
+  if (entries.length === 0) {
+    issues.push({ message: 'lists no repositories; add at least one entry, e.g. {"main":{"owner":"acme","repo":"bot-modules"}}', at: 'GITHUB_REPOS_JSON' });
+  }
+  for (const [key, value] of entries) {
+    const at = `GITHUB_REPOS_JSON.${key}`;
+    if (!isRepoKey(key)) {
+      issues.push({ message: `"${key}" is not a repository key: use a lowercase letter, then up to 30 lowercase letters, digits or dashes (${REPO_KEY_PATTERN.source}).`, at });
+      continue;
+    }
+    const entry = RepoEntrySchema.safeParse(value);
+    if (!entry.success) {
+      for (const issue of entry.error.issues) {
+        issues.push({ message: issue.message, at: [at, ...issue.path.map(String)].join('.') });
+      }
+      continue;
+    }
+    const workflowFile = toWorkflowFile(entry.data.workflowFile);
+    if (!workflowFile.ok) issues.push({ message: `${workflowFile.error.internal ?? 'not a workflow file'}. ${workflowFile.error.nextStep}`, at: `${at}.workflowFile` });
+    const ref = toGitRef(entry.data.ref);
+    if (!ref.ok) issues.push({ message: `${ref.error.internal ?? 'not a git ref'}. ${ref.error.nextStep}`, at: `${at}.ref` });
+    if (patOnly && entry.data.installationId !== undefined) {
+      issues.push({
+        message: 'installationId pins a GitHub App installation, but the bot authenticates with GITHUB_TOKEN (a personal access token, one token for the whole set). Remove installationId, or switch to a GitHub App.',
+        at: `${at}.installationId`,
+      });
+    }
+    if (!workflowFile.ok || !ref.ok) continue;
+    repos.push({
+      key,
+      owner: entry.data.owner,
+      repo: entry.data.repo,
+      workflowFile: workflowFile.value,
+      ref: ref.value,
+      installationId: entry.data.installationId ?? null,
+      // A one-entry set that says nothing about `default` IS the default, as the shim's is.
+      isDefault: entry.data.default ?? entries.length === 1,
+      names: jsonRepoSettingNames(key),
+    });
+  }
+
+  const defaults = repos.filter((r) => r.isDefault);
+  if (defaults.length > 1) {
+    issues.push({ message: `more than one repository is marked "default": true (${defaults.map((r) => r.key).join(', ')}); mark at most one.`, at: 'GITHUB_REPOS_JSON' });
+  }
+  const byName = new Map<string, string>();
+  for (const r of repos) {
+    const name = `${r.owner}/${r.repo}`.toLowerCase();
+    const first = byName.get(name);
+    if (first === undefined) {
+      byName.set(name, r.key);
+    } else {
+      issues.push({
+        message: `"${first}" and "${r.key}" both name ${r.owner}/${r.repo}; a repository may appear in the set once (GitHub compares names case-insensitively).`,
+        at: `GITHUB_REPOS_JSON.${r.key}`,
+      });
+    }
+  }
+  return issues.length > 0 ? { issues } : { repos, source: 'json' };
+}
+
 /**
  * Where the App's private key comes from. A FILE is read by the composition root, not here:
  * `loadConfig` stays a pure function of the env, which is what makes it testable.
@@ -178,9 +436,66 @@ export type GithubAuthConfig =
       readonly kind: 'app';
       readonly appId: number;
       readonly privateKey: GithubAppPrivateKeySource;
-      /** `GITHUB_APP_INSTALLATION_ID`, or `null` to look it up from the repository. */
-      readonly installationId: number | null;
+      // NO installation id here any more (RFC-001 PR 2.1): one App has one installation PER
+      // REPOSITORY, so the pinned id lives on each `GithubRepoConfig`. The shim puts
+      // `GITHUB_APP_INSTALLATION_ID` on its single repository.
     };
+
+/**
+ * What a sentence about one repository's settings calls each of them, so an operator is told
+ * the variable they actually wrote: `GITHUB_REF` for the single-repository pair,
+ * `GITHUB_REPOS_JSON.events.ref` for an entry of the set.
+ */
+export interface RepoSettingNames {
+  readonly owner: string;
+  readonly repo: string;
+  /** Both, as one location (`GITHUB_OWNER/GITHUB_REPO`). */
+  readonly ownerRepo: string;
+  readonly ref: string;
+  readonly workflowFile: string;
+  readonly installationId: string;
+}
+
+/** The single-repository variables, as every phase-1 sentence named them. */
+export const ENV_REPO_SETTING_NAMES: RepoSettingNames = {
+  owner: 'GITHUB_OWNER',
+  repo: 'GITHUB_REPO',
+  ownerRepo: 'GITHUB_OWNER/GITHUB_REPO',
+  ref: 'GITHUB_REF',
+  workflowFile: 'GITHUB_WORKFLOW_FILE',
+  installationId: 'GITHUB_APP_INSTALLATION_ID',
+};
+
+/** The same names for the `GITHUB_REPOS_JSON` entry `key`. */
+export function jsonRepoSettingNames(key: string): RepoSettingNames {
+  const at = `GITHUB_REPOS_JSON.${key}`;
+  return {
+    owner: `${at}.owner`,
+    repo: `${at}.repo`,
+    ownerRepo: `${at}.owner/repo`,
+    ref: `${at}.ref`,
+    workflowFile: `${at}.workflowFile`,
+    installationId: `${at}.installationId`,
+  };
+}
+
+/**
+ * ONE configured repository (RFC-001 7.1). Everything a per-repository GitHub adapter binds:
+ * the dispatch ref and workflow are per repository, exactly as `GITHUB_REF` and
+ * `GITHUB_WORKFLOW_FILE` were for the one repository of phase 1.
+ */
+export interface GithubRepoConfig {
+  readonly key: RepoKey;
+  readonly owner: string;
+  readonly repo: string;
+  readonly workflowFile: WorkflowFile;
+  readonly ref: GitRef;
+  /** Pinned App installation id, or `null` to look it up (`GET /repos/{o}/{r}/installation`). */
+  readonly installationId: number | null;
+  readonly isDefault: boolean;
+  /** How sentences name this repository's settings. */
+  readonly names: RepoSettingNames;
+}
 
 /** Raw per-module slices. Each module's own schema validates its own slice. */
 export type ModuleConfigMap = Readonly<Record<string, unknown>>;
@@ -198,13 +513,20 @@ export interface AppConfig {
     readonly messageContent: boolean;
   };
   readonly github: {
-    /** PAT or GitHub App; see `GithubAuthConfig`. */
+    /** PAT or GitHub App; see `GithubAuthConfig`. ONE credential for the whole set (6.6, 7.1). */
     readonly auth: GithubAuthConfig;
-    readonly owner: string;
-    readonly repo: string;
-    /** Branded at boot, so a module can never hand `dispatch` a free-text workflow name. */
-    readonly workflowFile: WorkflowFile;
-    readonly ref: GitRef;
+    /**
+     * The repository set, in configuration order, never empty. From `GITHUB_REPOS_JSON`, or the
+     * one-element set keyed `default` that the single-repository shim builds.
+     */
+    readonly repos: readonly GithubRepoConfig[];
+    /** Where the set came from, for sentences and `doctor`. */
+    readonly reposSource: 'env' | 'json';
+    /**
+     * ONE key per bot instance, set as a repository secret in every configured repository
+     * (RFC-001 7.1, "Resolved"): the signed `repository` field already makes a token
+     * non-transferable between repositories.
+     */
     readonly approvalHmacKey: Secret;
     /** `ALLOW_PUBLIC_TARGET_REPO`. */
     readonly allowPublicTargetRepo: boolean;
@@ -228,21 +550,21 @@ export interface AppConfig {
 export function loadConfig(env: Readonly<Record<string, string | undefined>>): Result<AppConfig, AppError> {
   const parsed = EnvSchema.safeParse(env);
   const modeIssues = githubAuthModeIssues(env);
-  if (!parsed.success || modeIssues.length > 0) {
+  const repoSet = githubRepoSet(env);
+  const repoIssues = 'issues' in repoSet ? repoSet.issues : [];
+  if (!parsed.success || modeIssues.length > 0 || repoIssues.length > 0) {
     // ONE error naming everything, in zod's own `✖ ... → at X` shape, so the GitHub auth rule
-    // reads like every other line of the report rather than like a second, later failure.
+    // and the repository-set rules read like every other line of the report rather than like a
+    // second, later failure.
     const lines = [
       ...(parsed.success ? [] : [z.prettifyError(parsed.error)]),
       ...modeIssues.map((issue) => `✖ ${issue}\n  → at GitHub auth mode`),
+      ...repoIssues.map((issue) => `✖ ${issue.message}\n  → at ${issue.at}`),
     ];
     return Err(errors.config('env', lines.join('\n'), 'Set the missing environment variables and restart. See .env.example.'));
   }
   const e = parsed.data;
-
-  const workflowFile = toWorkflowFile(e.GITHUB_WORKFLOW_FILE);
-  if (!workflowFile.ok) return workflowFile;
-  const ref = toGitRef(e.GITHUB_REF);
-  if (!ref.ok) return ref;
+  if (!('repos' in repoSet)) return Err(errors.internal('config.repos', 'repository set unparsed without an issue'));
 
   let modules: ModuleConfigMap;
   try {
@@ -270,10 +592,8 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): R
     },
     github: {
       auth: githubAuthFrom(e),
-      owner: e.GITHUB_OWNER,
-      repo: e.GITHUB_REPO,
-      workflowFile: workflowFile.value,
-      ref: ref.value,
+      repos: repoSet.repos,
+      reposSource: repoSet.source,
       approvalHmacKey: secret(e.APPROVAL_HMAC_KEY),
       allowPublicTargetRepo: e.ALLOW_PUBLIC_TARGET_REPO,
     },
@@ -298,13 +618,7 @@ function githubAuthFrom(e: z.infer<typeof EnvSchema>): GithubAuthConfig {
     e.GITHUB_APP_PRIVATE_KEY !== undefined
       ? { kind: 'inline', pem: secret(e.GITHUB_APP_PRIVATE_KEY) }
       : { kind: 'file', path: e.GITHUB_APP_PRIVATE_KEY_FILE ?? '' };
-  return {
-    kind: 'app',
-    appId: Number.parseInt(e.GITHUB_APP_ID ?? '0', 10),
-    privateKey,
-    installationId:
-      e.GITHUB_APP_INSTALLATION_ID === undefined ? null : Number.parseInt(e.GITHUB_APP_INSTALLATION_ID, 10),
-  };
+  return { kind: 'app', appId: Number.parseInt(e.GITHUB_APP_ID ?? '0', 10), privateKey };
 }
 
 /**

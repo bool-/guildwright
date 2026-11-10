@@ -43,6 +43,8 @@ import type { ChannelId, JobId } from '#core/ids';
 import type { SurfaceRef, View } from '#core/view';
 import { SHARED_BUILD_ENVIRONMENT, actionsToken, parseHttpsUrl, renderIssueBody, renderPlainName } from '#core/text';
 import { Err } from '#core/result';
+import { createRepoSet, createReposPort, repoScoped, type RepoScoped, type RepoSet, type RepoSetEntry, type ReposPort } from '#core/ports/repos';
+import type { GuildId } from '#core/ids';
 
 /** WHY the fake records statements: the ownership test asserts on the exact text. */
 export interface FakeDb extends DbPort {
@@ -158,13 +160,12 @@ export function fakePorts(prefix: string): Readonly<Partial<PortRegistry>> {
     catalog: fakeCatalog(),
     jobs: fakeJobs(),
     discord: fakeDiscord(),
-    issues: fakeIssues(),
-    builds: fakeBuilds(),
     settings: fakeSettings(),
     access: fakeAccess(),
-    secrets: fakeSecrets(),
     admin: fakeAdmin(),
     version: fakeVersion(),
+    // `repos`, and `issues`/`builds`/`secrets` behind `.at()`, over the one-repository set.
+    ...oneRepoPorts(),
   };
 }
 
@@ -229,8 +230,69 @@ export function fakeAdmin(): FakeAdmin {
  * only ever ran against this fake has been exercised on the `gitSha === null` path - which is
  * the path a containerised deploy actually takes.
  */
-export function fakeVersion(info: BuildInfo = UNKNOWN_BUILD, github: GithubAuthSummary = UNKNOWN_GITHUB_AUTH): VersionPort {
-  return { current: () => info, githubAuth: () => github };
+export function fakeVersion(
+  info: BuildInfo = UNKNOWN_BUILD,
+  github: GithubAuthSummary | readonly GithubAuthSummary[] = UNKNOWN_GITHUB_AUTH,
+): VersionPort {
+  const all: readonly GithubAuthSummary[] = Array.isArray(github) ? github : [github];
+  return { current: () => info, githubAuth: () => all[0] ?? UNKNOWN_GITHUB_AUTH, githubAuthAll: () => all };
+}
+
+// ---------------------------------------------------------------------------------------
+// The repository set (RFC-001 PR 2.1)
+// ---------------------------------------------------------------------------------------
+
+/**
+ * A minted repository set for tests. The DEFAULT is what the single-repository shim builds from
+ * `GITHUB_OWNER=o`/`GITHUB_REPO=r`: one repository keyed `default`, marked default - the `o/r`
+ * that `fakeIssues` already builds its URLs on.
+ */
+export function fakeRepoSet(entries: readonly RepoSetEntry[] = [{ key: 'default', owner: 'o', repo: 'r', isDefault: true }]): RepoSet {
+  const minted = createRepoSet(entries);
+  if (!minted.ok) throw new Error(`fakeRepoSet: ${minted.error.internal ?? minted.error.code}`);
+  return minted.value;
+}
+
+/** `ctx.ports.repos` over a set, mapping no guild (every guild resolves to the default). */
+export function fakeRepos(set: RepoSet = fakeRepoSet(), mapping?: (guildId: GuildId) => string | null): ReposPort {
+  return mapping === undefined ? createReposPort(set) : createReposPort(set, mapping);
+}
+
+/** ONE fake serving every repository of the set: the single-repository case. */
+export function fakeScoped<T>(set: RepoSet, port: T): RepoScoped<T> {
+  return repoScoped(set.refs.map((ref) => [ref, port] as const));
+}
+
+/** One fake PER repository, by key; a key left out has no port (`.at()` answers `Err`). */
+export function fakeScopedByKey<T>(set: RepoSet, ports: Readonly<Record<string, T>>): RepoScoped<T> {
+  return repoScoped(
+    set.refs.flatMap((ref) => {
+      const hit = ports[ref.key];
+      return hit === undefined ? [] : [[ref, hit] as const];
+    }),
+  );
+}
+
+/**
+ * The GitHub-facing ports of ONE repository, as a module receives them: `repos`, and `issues`,
+ * `builds`, `secrets` behind `.at()`. Spread it into a port bag in place of the bare fakes:
+ * `ports: { db, audit, ..., ...oneRepoPorts({ issues, builds }) }`.
+ */
+export function oneRepoPorts<I extends IssuesPort = FakeIssues, B extends BuildsPort = FakeBuilds, S extends SecretsPort = FakeSecrets>(
+  ports: { readonly issues?: I; readonly builds?: B; readonly secrets?: S } = {},
+  set: RepoSet = fakeRepoSet(),
+): {
+  readonly repos: ReposPort;
+  readonly issues: RepoScoped<IssuesPort>;
+  readonly builds: RepoScoped<BuildsPort>;
+  readonly secrets: RepoScoped<SecretsPort>;
+} {
+  return {
+    repos: fakeRepos(set),
+    issues: fakeScoped<IssuesPort>(set, ports.issues ?? fakeIssues()),
+    builds: fakeScoped<BuildsPort>(set, ports.builds ?? fakeBuilds()),
+    secrets: fakeScoped<SecretsPort>(set, ports.secrets ?? fakeSecrets()),
+  };
 }
 
 /** WHY exported: the ownership test needs an `AppError`-shaped assertion helper. */

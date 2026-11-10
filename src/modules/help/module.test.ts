@@ -7,7 +7,7 @@ import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 
 import { createEventBus } from '#core/events';
-import { UNKNOWN_BUILD, describeGithubAuth, type GithubAuthSummary } from '#core/ports';
+import { UNKNOWN_BUILD, describeGithubAuth, describeGithubAuthSet, type GithubAuthSummary } from '#core/ports';
 import { renderSafeMarkdown } from '#core/text';
 import type { View } from '#core/view';
 import { fakeCatalog, fakeLogger, fakeVersion } from '#testing/fakes';
@@ -51,4 +51,36 @@ test('the auth line says what it does not know instead of leaving a gap', () => 
     'GitHub: app id 424242 on octo/demo, installation 777',
   );
   assert.equal(describeGithubAuth({ kind: 'unknown' }), 'GitHub: auth not checked yet');
+});
+
+// ---------------------------------------------------------------------------------------
+// The repository set (RFC-001 PR 2.1): one auth line for every repository
+// ---------------------------------------------------------------------------------------
+
+test('/status names EVERY installation of the App when the bot serves several repositories', () => {
+  const installed = helpModule.install({
+    ports: {
+      catalog: fakeCatalog(),
+      version: fakeVersion(UNKNOWN_BUILD, [
+        { kind: 'app', slug: 'gw-builder', appId: 424242, repo: 'acme/bot-modules', installationId: 11 },
+        { kind: 'app', slug: 'gw-builder', appId: 424242, repo: 'acme/events-modules', installationId: 22 },
+      ]),
+    },
+    rawConfig: {},
+    bus: createEventBus(() => undefined),
+    logger: fakeLogger(),
+  });
+  assert.ok(installed.ok);
+  const view = installed.ok ? installed.value.previews['status'] : undefined;
+  assert.ok(view !== undefined);
+  if (view === undefined) return;
+  assert.match(viewText(view), /GitHub: app gw-builder on acme\/bot-modules \(installation 11\), acme\/events-modules \(installation 22\)/u);
+});
+
+test('describeGithubAuthSet: a one-repository set reads EXACTLY as the single-repository line did', () => {
+  const app: GithubAuthSummary = { kind: 'app', slug: 'gw-builder', appId: 424242, repo: 'octo/demo', installationId: 777 };
+  assert.equal(describeGithubAuthSet([app]), describeGithubAuth(app));
+  const pat: GithubAuthSummary = { kind: 'pat', expiresAtMs: null };
+  assert.equal(describeGithubAuthSet([pat]), 'GitHub: PAT, no expiry reported', 'one token for the whole set: one line');
+  assert.equal(describeGithubAuthSet([]), 'GitHub: auth not checked yet');
 });

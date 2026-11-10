@@ -115,7 +115,8 @@ test('the approval MAC is computed over the body GitHub returns, not the body we
   // If this regresses, every dispatch is rejected by the workflow gate the first time GitHub
   // normalises anything in the body.
   assert.ok(
-    moduleSource.includes('ports.issues.bodySha256('),
+    // Through the request's OWN repository's issues port (RFC-001 PR 2.1), resolved once per pass.
+    moduleSource.includes('gh.issues.bodySha256('),
     'the digest must be read back from GitHub before signing',
   );
 });

@@ -10,7 +10,7 @@
  * module declaring `capabilities: ['issues']` must not receive `builds`.
  */
 
-import type { Secret } from '#core/config';
+import type { RepoSettingNames, Secret } from '#core/config';
 import { errors, type AppError } from '#core/errors';
 import { Err, Ok, type Result } from '#core/result';
 import type { Octokit } from 'octokit';
@@ -25,7 +25,7 @@ import type {
   WorkflowFile,
 } from '#core/ports';
 import { createGithubClient, type GithubRepo } from '#adapters/github/client';
-import { startGithubAppSession, type GithubAdapterAuth } from '#adapters/github/app-auth';
+import { startGithubAppSession, type GithubAdapterAuth, type GithubCredentials } from '#adapters/github/app-auth';
 import { createGithubIssues, type GithubIssuesPort } from '#adapters/github/issues';
 import { createGithubBuilds } from '#adapters/github/runs';
 import { createGithubSecrets } from '#adapters/github/secrets';
@@ -50,11 +50,18 @@ export {
 export {
   REQUIRED_APP_PERMISSIONS,
   missingAppPermissions,
+  openGithubInstallation,
   resolveGithubAuth,
+  startGithubApp,
   startGithubAppSession,
   type GithubAdapterAuth,
+  type GithubAppHandle,
   type GithubAppSession,
+  type GithubCredentials,
 } from '#adapters/github/app-auth';
+// The repository set (`createGithubRepoSet`) lives in `#adapters/github/repo-set` and is imported
+// from there: it builds ON this file's `assembleGithubAdapter`, so re-exporting it here would be
+// an import cycle.
 export { createGithubIssues, issueMarker, type GithubIssuesPort } from '#adapters/github/issues';
 export { createGithubBuilds, toRunStatus } from '#adapters/github/runs';
 export { dispatchWorkflow } from '#adapters/github/dispatch';
@@ -113,8 +120,11 @@ export {
  * (`GET /app`, the installation lookup and its permission checks included), as the bot.
  */
 export async function createGithubRequester(input: {
-  readonly auth: GithubAdapterAuth;
+  readonly auth: GithubCredentials;
   readonly repo: GithubRepo;
+  /** That repository's pinned installation id (App mode), or `null` to look it up. */
+  readonly installationId: number | null;
+  readonly names?: RepoSettingNames;
   readonly clock: ClockPort;
   readonly logger: LoggerPort;
   readonly fetch?: typeof globalThis.fetch;
@@ -126,7 +136,8 @@ export async function createGithubRequester(input: {
   const session = await startGithubAppSession({
     appId: input.auth.appId,
     privateKey: input.auth.privateKey,
-    installationId: input.auth.installationId,
+    installationId: input.installationId,
+    ...(input.names === undefined ? {} : { names: input.names }),
     repo: input.repo,
     clock: input.clock,
     logger: input.logger,
@@ -218,6 +229,25 @@ export interface GithubAdapterInput {
    * run through the same octokit as every other call.
    */
   readonly probeRequest?: GithubRequest;
+  /**
+   * How sentences name this repository's settings (RFC-001 PR 2.1): the single-repository env
+   * names by default, `GITHUB_REPOS_JSON.<key>.*` for an entry of a repository set.
+   */
+  readonly names?: RepoSettingNames;
+}
+
+/**
+ * An authenticated client for ONE repository, before any port is built on it: a PAT client
+ * (which a repository set shares across every repository, one token for the set), or an App
+ * installation client (one per repository).
+ */
+export interface GithubConnection {
+  readonly octokit: Octokit;
+  readonly authKind: 'pat' | 'app';
+  /** The App summary, or a PAT summary whose expiry the preflight fills in. */
+  readonly summary: GithubAuthSummary;
+  /** Non-fatal findings of the auth checks, for this repository's preflight report. */
+  readonly warnings: readonly string[];
 }
 
 /**
@@ -227,18 +257,19 @@ export interface GithubAdapterInput {
  *
  * PAT mode makes no request here; it builds the same client it always did and logs
  * `PAT_MODE_WARNING`.
+ *
+ * ONE REPOSITORY. A bot configured with a set builds one adapter per repository through
+ * `createGithubRepoSet` (`repo-set.ts`), which shares one PAT client, or one App, across them and
+ * then calls `assembleGithubAdapter` for each; this function is that, for a set of one.
  */
 export async function createGithubAdapter(input: GithubAdapterInput): Promise<Result<GithubAdapter, AppError>> {
   const transport = input.fetch === undefined ? {} : { fetch: input.fetch };
-  let octokit: Octokit;
-  /** WHY a box: the PAT's expiry is learned by the preflight, after construction. */
-  const summary: { value: GithubAuthSummary } = { value: { kind: 'unknown' } };
-  const bootWarnings: string[] = [];
+  let connection: GithubConnection;
 
   if (input.auth.kind === 'pat') {
-    octokit = createGithubClient({ token: input.auth.token, logger: input.logger, ...transport });
+    const octokit = createGithubClient({ token: input.auth.token, logger: input.logger, ...transport });
     input.logger.warn(PAT_MODE_WARNING, {});
-    summary.value = { kind: 'pat', expiresAtMs: null };
+    connection = { octokit, authKind: 'pat', summary: { kind: 'pat', expiresAtMs: null }, warnings: [] };
   } else {
     const session = await startGithubAppSession({
       appId: input.auth.appId,
@@ -247,13 +278,27 @@ export async function createGithubAdapter(input: GithubAdapterInput): Promise<Re
       repo: input.repo,
       clock: input.clock,
       logger: input.logger,
+      ...(input.names === undefined ? {} : { names: input.names }),
       ...transport,
     });
     if (!session.ok) return session;
-    octokit = session.value.octokit;
-    summary.value = session.value.summary;
-    bootWarnings.push(...session.value.warnings);
+    connection = { octokit: session.value.octokit, authKind: 'app', summary: session.value.summary, warnings: session.value.warnings };
   }
+  return Ok(assembleGithubAdapter(input, connection));
+}
+
+/** What `assembleGithubAdapter` reads: everything but the credential, which `connection` replaces. */
+export type GithubAdapterAssembly = Omit<GithubAdapterInput, 'auth' | 'fetch'>;
+
+/**
+ * The ports, the containment gate and the preflight for ONE repository, on an already
+ * authenticated client. No request is made here.
+ */
+export function assembleGithubAdapter(input: GithubAdapterAssembly, connection: GithubConnection): GithubAdapter {
+  const octokit = connection.octokit;
+  /** WHY a box: the PAT's expiry is learned by the preflight, after construction. */
+  const summary: { value: GithubAuthSummary } = { value: connection.summary };
+  const bootWarnings: string[] = [...connection.warnings];
 
   const shared = { octokit, repo: input.repo, clock: input.clock, logger: input.logger };
   // THE REPOSITORY'S NAME AS GITHUB SPELLS IT. It is part of the approval token's signed tuple,
@@ -270,7 +315,7 @@ export async function createGithubAdapter(input: GithubAdapterInput): Promise<Re
     request,
     repo: input.repo,
     fullName,
-    authKind: input.auth.kind,
+    authKind: connection.authKind,
     allowPublicTargetRepo: input.allowPublicTargetRepo,
     builder: input.builder,
     nowMs,
@@ -288,6 +333,7 @@ export async function createGithubAdapter(input: GithubAdapterInput): Promise<Re
           engineVersion: input.engineVersion,
           nowMs,
           logger: input.logger,
+          ...(input.names === undefined ? {} : { refName: input.names.ref }),
         });
 
   /** No request: the first thing that is not fine, as one sentence, or `ready`. */
@@ -337,7 +383,7 @@ export async function createGithubAdapter(input: GithubAdapterInput): Promise<Re
     },
   };
 
-  return Ok({
+  return {
     issues: createGithubIssues(shared),
     builds,
     secrets: createGithubSecrets(shared),
@@ -351,6 +397,7 @@ export async function createGithubAdapter(input: GithubAdapterInput): Promise<Re
         // Read at CALL time, not at construction. Boot does real work between the two, and an
         // expiry warning computed against a stale instant is wrong by exactly that much.
         nowMs: input.clock.now(),
+        ...(input.names === undefined ? {} : { names: input.names }),
       });
       if (!report.ok) return report;
       identity.fullName = report.value.fullName;
@@ -374,5 +421,5 @@ export async function createGithubAdapter(input: GithubAdapterInput): Promise<Re
       // channels (log and stderr) as every other boot warning.
       return Ok({ ...report.value, warnings: [...bootWarnings, ...report.value.warnings, ...contained.value, ...gateWarnings] });
     },
-  });
+  };
 }

@@ -29,6 +29,7 @@ import { openSqlite } from '#adapters/sqlite/db';
 import { newApprovalId, newCardNonce, newFenceNonce, newRequestId, type RequestId } from '#core/ids';
 import type { BuildsPort, IssuesPort, PrRef, RunStatus } from '#core/ports';
 import type { CancelsRuns, ReopensIssues } from '#modules/builder/module';
+import type { RepoSet } from '#core/ports/repos';
 import type { SurfaceRef, View, ViewNode } from '#core/view';
 import { parseHttpsUrl, renderSafeMarkdown, toEnum, userTextForTest } from '#core/text';
 import { toChannelId, toGuildId, toUserId, type ChannelId, type GuildId, type UserId } from '#core/ids';
@@ -36,7 +37,7 @@ import type { Args, FormValues } from '#core/args';
 import type { FormHandlerSpec, FormSubmission, Invocation, ProgressHandle } from '#core/module';
 import { Err } from '#core/result';
 import { errors } from '#core/errors';
-import { fakeAccess, fakeAudit, fakeBuilds, fakeClock, fakeDiscord, fakeIssues, fakeJobs, fakeLogger, type FakeAudit, type FakeBuilds, type FakeDiscord, type FakeIssues, type FakeJobs } from '#testing/fakes';
+import { fakeAccess, fakeAudit, fakeBuilds, fakeClock, fakeDiscord, fakeIssues, fakeJobs, fakeLogger, fakeRepos, fakeScopedByKey, oneRepoPorts, type FakeAudit, type FakeBuilds, type FakeDiscord, type FakeIssues, type FakeJobs } from '#testing/fakes';
 import type { AccessPort } from '#core/ports';
 import type { CommandSpec } from '#core/module';
 
@@ -117,6 +118,12 @@ export interface Harness {
    * that only ever allows would make the refusal branch unreachable in every test.
    */
   setApprover(allowed: boolean): void;
+  /**
+   * THE OTHER REPOSITORIES of a multi-repository set (RFC-001 PR 2.1), by key: what each one's
+   * fakes saw. `issues`/`builds` above are the DEFAULT repository's. Empty for the usual
+   * one-repository harness.
+   */
+  readonly neighbours: Readonly<Record<string, { readonly issues: FakeIssues; readonly builds: FakeBuilds }>>;
   close(): void;
 }
 
@@ -132,6 +139,12 @@ export function harness(
   rawConfig: unknown = {},
   overrides: BuildsOverrides = {},
   issuesOverrides: IssuesOverrides = {},
+  /**
+   * A repository set (RFC-001 PR 2.1). The harness's `issues`/`builds` serve its DEFAULT
+   * repository; every other repository gets fresh fakes, exposed as `neighbours`. Omitted: the
+   * one-repository set the single-repository shim builds.
+   */
+  repoSet: RepoSet | null = null,
 ): Harness {
   const opened = openSqlite(':memory:');
   assert.ok(opened.ok, 'the in-memory database must open');
@@ -173,8 +186,28 @@ export function harness(
   const bus = createEventBus(() => undefined);
   bus.on('builder.pr_opened', (e) => void prOpened.push({ requestId: e.requestId, prUrl: e.prUrl }));
 
+  const neighbours: Record<string, { issues: FakeIssues; builds: FakeBuilds }> = {};
+  let github: ReturnType<typeof oneRepoPorts> = oneRepoPorts({ issues, builds });
+  if (repoSet !== null) {
+    const issuesBy: Record<string, IssuesPort> = {};
+    const buildsBy: Record<string, BuildsPort> = {};
+    for (const ref of repoSet.refs) {
+      if (ref.isDefault) {
+        issuesBy[ref.key] = issues;
+        buildsBy[ref.key] = builds;
+      } else {
+        const other = { issues: fakeIssues(), builds: fakeBuilds() };
+        other.builds.environments.set(`user-${REQUESTER}`, ['ANTHROPIC_API_KEY']);
+        neighbours[ref.key] = other;
+        issuesBy[ref.key] = other.issues;
+        buildsBy[ref.key] = other.builds;
+      }
+    }
+    github = { ...github, repos: fakeRepos(repoSet), issues: fakeScopedByKey(repoSet, issuesBy), builds: fakeScopedByKey(repoSet, buildsBy) };
+  }
+
   const r = builder.install({
-    ports: { db: db.moduleDb('builder'), audit, clock, jobs, discord, issues, builds, access },
+    ports: { db: db.moduleDb('builder'), audit, clock, jobs, discord, access, ...github },
     rawConfig,
     bus,
     logger: fakeLogger(),
@@ -194,6 +227,7 @@ export function harness(
     builds: base,
     dispatched: base.dispatched,
     prOpened,
+    neighbours,
     setNow: (ms) => clock.set(ms),
     failPosts: (error) => {
       postFailure = error;

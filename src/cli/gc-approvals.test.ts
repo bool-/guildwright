@@ -9,13 +9,14 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 
+import { githubRepoSet } from '#core/config';
 import type { GithubRequest } from '#adapters/github/gates';
 import { enginePackageRoot } from '#adapters/system/version';
 import { captureIo, VALID_ENV } from '#testing/fixtures/cli-io';
 import { githubError } from '#testing/fixtures/github-fake';
 
 import { runCli } from '../cli.ts';
-import { parseOlderThan } from './gc-approvals.ts';
+import { parseOlderThan, pickGcRepo } from './gc-approvals.ts';
 
 const NOW = Date.parse('2026-11-09T12:00:00Z');
 const DAY = 24 * 60 * 60 * 1000;
@@ -132,4 +133,23 @@ test('--older-than must be a duration of at least one day', async () => {
   const r = await gc(fake, '--older-than', '1h', '--yes');
   assert.equal(r.code, 2);
   assert.deepEqual(fake.routes, [], 'a refused duration asks GitHub nothing');
+});
+
+// ---------------------------------------------------------------------------------------
+// The repository set (RFC-001 PR 2.1): which repository to collect in
+// ---------------------------------------------------------------------------------------
+
+test('pickGcRepo: one repository needs no flag; several need --repo, and an unknown key is refused naming the keys', () => {
+  const one = githubRepoSet({ GITHUB_OWNER: 'o', GITHUB_REPO: 'r' });
+  const two = githubRepoSet({ GITHUB_REPOS_JSON: '{"main":{"owner":"acme","repo":"a","default":true},"events":{"owner":"acme","repo":"b"}}' });
+  assert.ok('repos' in one && 'repos' in two);
+  if (!('repos' in one) || !('repos' in two)) return;
+  const solo = pickGcRepo(one.repos, undefined);
+  assert.ok('repo' in solo && solo.repo.key === 'default');
+  const missing = pickGcRepo(two.repos, undefined);
+  assert.ok('error' in missing && /several repositories \(main, events\); name one with --repo <key>/u.test(missing.error), 'never "the first one" for a delete');
+  const picked = pickGcRepo(two.repos, 'events');
+  assert.ok('repo' in picked && picked.repo.owner === 'acme' && picked.repo.repo === 'b');
+  const unknown = pickGcRepo(two.repos, 'nope');
+  assert.ok('error' in unknown && /--repo nope is not a configured repository; the keys are: main, events/u.test(unknown.error));
 });

@@ -1,5 +1,6 @@
 /**
- * `<bin> gc-approvals [--older-than <duration>] [--yes]` (RFC-001 section 12 decision 7).
+ * `<bin> gc-approvals [--older-than <duration>] [--yes] [--repo <key>]` (RFC-001 section 12 decision 7;
+ * `--repo` picks one repository of a set, RFC-001 PR 2.1, and is needed only when there are several).
  *
  * Lists every `refs/approvals/*` ref in the module repository, dates each by the workflow run
  * that consumed it, and prints what is older than `--older-than` (default 90 days). It deletes
@@ -8,7 +9,7 @@
  * `src/adapters/github/approvals-gc.ts`.
  */
 
-import { loadConfig } from '#core/config';
+import { loadConfig, type GithubRepoConfig } from '#core/config';
 import { systemClock } from '#adapters/system/clock';
 import {
   createGithubRequester,
@@ -65,7 +66,26 @@ function line(r: DatedApprovalRef): string {
   return r.createdAtMs === null ? `    ${r.ref}` : `    ${r.ref}  consumed ${isoDay(r.createdAtMs)} by run ${String(r.runId)}`;
 }
 
-export async function gcApprovals(io: CliIo, deps: GcDeps, opts: { readonly olderThan: string; readonly yes: boolean }): Promise<number> {
+/**
+ * Which repository of the set to collect in (RFC-001 PR 2.1). One repository needs no flag;
+ * several need `--repo <key>`, because deleting refs is not a thing to do in "the first one".
+ */
+export function pickGcRepo(repos: readonly GithubRepoConfig[], key: string | undefined): { readonly repo: GithubRepoConfig } | { readonly error: string } {
+  const keys = repos.map((r) => r.key).join(', ');
+  if (key === undefined) {
+    const [only, ...rest] = repos;
+    if (only !== undefined && rest.length === 0) return { repo: only };
+    return { error: `this bot is configured for several repositories (${keys}); name one with --repo <key>.` };
+  }
+  const hit = repos.find((r) => r.key === key);
+  return hit === undefined ? { error: `--repo ${key} is not a configured repository; the keys are: ${keys}.` } : { repo: hit };
+}
+
+export async function gcApprovals(
+  io: CliIo,
+  deps: GcDeps,
+  opts: { readonly olderThan: string; readonly yes: boolean; readonly repo?: string },
+): Promise<number> {
   const age = parseOlderThan(opts.olderThan);
   if ('error' in age) {
     io.err(`gc-approvals: ${age.error}\n`);
@@ -77,7 +97,13 @@ export async function gcApprovals(io: CliIo, deps: GcDeps, opts: { readonly olde
     return EXIT_PROBLEM;
   }
   const cfg = parsed.value;
-  const repo = { owner: cfg.github.owner, repo: cfg.github.repo };
+  const picked = pickGcRepo(cfg.github.repos, opts.repo);
+  if ('error' in picked) {
+    io.err(`gc-approvals: ${picked.error}\n`);
+    return EXIT_USAGE;
+  }
+  const target = picked.repo;
+  const repo = { owner: target.owner, repo: target.repo };
   const fullName = `${repo.owner}/${repo.repo}`;
 
   let request: GithubRequest;
@@ -89,7 +115,14 @@ export async function gcApprovals(io: CliIo, deps: GcDeps, opts: { readonly olde
       io.err(formatConfigFailure(auth.error));
       return EXIT_PROBLEM;
     }
-    const made = await createGithubRequester({ auth: auth.value, repo, clock: systemClock(), logger: silentLogger() });
+    const made = await createGithubRequester({
+      auth: auth.value,
+      repo,
+      installationId: target.installationId,
+      names: target.names,
+      clock: systemClock(),
+      logger: silentLogger(),
+    });
     if (!made.ok) {
       io.err(formatConfigFailure(made.error));
       return EXIT_PROBLEM;
@@ -102,7 +135,7 @@ export async function gcApprovals(io: CliIo, deps: GcDeps, opts: { readonly olde
     io.err(`gc-approvals: ${describeAppError(listed.error)}\n`);
     return EXIT_PROBLEM;
   }
-  const dated = await dateApprovalRefs(request, repo, cfg.github.workflowFile, listed.value.refs, io.nowMs);
+  const dated = await dateApprovalRefs(request, repo, target.workflowFile, listed.value.refs, io.nowMs);
   if (!dated.ok) {
     io.err(`gc-approvals: ${describeAppError(dated.error)}\n`);
     return EXIT_PROBLEM;
@@ -114,7 +147,7 @@ export async function gcApprovals(io: CliIo, deps: GcDeps, opts: { readonly olde
   for (const r of plan.remove) io.out(`${line(r)}\n`);
   io.out(`  kept, younger than ${opts.olderThan}: ${String(plan.keepYoung.length)}\n`);
   if (plan.keepUndated.length > 0) {
-    io.out(`  kept, age unknown (no run of ${cfg.github.workflowFile} names the approval): ${String(plan.keepUndated.length)}\n`);
+    io.out(`  kept, age unknown (no run of ${target.workflowFile} names the approval): ${String(plan.keepUndated.length)}\n`);
     for (const r of plan.keepUndated) io.out(`${line(r)}\n`);
   }
   if (listed.value.foreign.length > 0) {

@@ -47,7 +47,7 @@ import { App, type Octokit } from 'octokit';
 import { z } from 'zod';
 import { Err, Ok, type Result } from '#core/result';
 import { errors, type AppError } from '#core/errors';
-import { isPemPrivateKey, secret, type GithubAuthConfig, type Secret } from '#core/config';
+import { ENV_REPO_SETTING_NAMES, isPemPrivateKey, secret, type GithubAuthConfig, type RepoSettingNames, type Secret } from '#core/config';
 import type { ClockPort, GithubAuthSummary, LoggerPort } from '#core/ports';
 import type { JsonObject } from '#core/json';
 import { GithubAuthFailure, githubOctokitClass, readGithubFailure, type GithubRepo } from '#adapters/github/client';
@@ -150,21 +150,23 @@ export function appUninstalledError(slug: string | null, appId: number, repo: Gi
   );
 }
 
-/** `GITHUB_APP_INSTALLATION_ID` names nothing this App can see. */
-function configuredInstallationUnknownError(installationId: number, slug: string | null, appId: number): AppError {
+/** The pinned installation id (`GITHUB_APP_INSTALLATION_ID`, or an entry's `installationId`) names nothing this App can see. */
+function configuredInstallationUnknownError(installationId: number, slug: string | null, appId: number, names: RepoSettingNames): AppError {
+  const v = names.installationId;
   return errors.config(
-    'GITHUB_APP_INSTALLATION_ID',
-    `GITHUB_APP_INSTALLATION_ID ${installationId} is not an installation of the GitHub App "${appName(slug, appId)}"`,
-    'Remove GITHUB_APP_INSTALLATION_ID to let the bot find the installation itself, or set it to the number at the end of the installation\'s Configure URL, then restart.',
+    v,
+    `${v} ${installationId} is not an installation of the GitHub App "${appName(slug, appId)}"`,
+    `Remove ${v} to let the bot find the installation itself, or set it to the number at the end of the installation's Configure URL, then restart.`,
   );
 }
 
-/** `GITHUB_APP_INSTALLATION_ID` is an installation on a different account. */
-function configuredInstallationElsewhereError(installationId: number, account: string, repo: GithubRepo): AppError {
+/** The pinned installation id is an installation on a different account. */
+function configuredInstallationElsewhereError(installationId: number, account: string, repo: GithubRepo, names: RepoSettingNames): AppError {
+  const v = names.installationId;
   return errors.config(
-    'GITHUB_APP_INSTALLATION_ID',
-    `GITHUB_APP_INSTALLATION_ID ${installationId} is an installation on ${account}, not on ${repo.owner}`,
-    `Remove GITHUB_APP_INSTALLATION_ID to let the bot find the installation on ${repo.owner}/${repo.repo} itself, then restart.`,
+    v,
+    `${v} ${installationId} is an installation on ${account}, not on ${repo.owner}`,
+    `Remove ${v} to let the bot find the installation on ${repo.owner}/${repo.repo} itself, then restart.`,
   );
 }
 
@@ -213,16 +215,40 @@ export interface GithubAppSession {
   readonly warnings: readonly string[];
 }
 
-export interface GithubAppSessionInput {
+export interface GithubAppSessionInput extends GithubAppInput, GithubInstallationInput {}
+
+/** Steps 1-2: the App itself. ONE per process, however many repositories it is installed on. */
+export interface GithubAppInput {
   readonly appId: number;
   readonly privateKey: Secret;
-  /** `GITHUB_APP_INSTALLATION_ID`; `null` looks the installation up from `repo`. */
-  readonly installationId: number | null;
-  readonly repo: GithubRepo;
   readonly clock: ClockPort;
   readonly logger: LoggerPort;
   /** Transport override; see `githubOctokitClass`. */
   readonly fetch?: typeof globalThis.fetch;
+}
+
+/** Steps 3-5: one installation, for one repository of the set. */
+export interface GithubInstallationInput {
+  /** The pinned id (`GITHUB_APP_INSTALLATION_ID` or the entry's `installationId`); `null` looks it up from `repo`. */
+  readonly installationId: number | null;
+  readonly repo: GithubRepo;
+  /** How sentences name this repository's settings; the single-repository env names by default. */
+  readonly names?: RepoSettingNames;
+}
+
+/**
+ * The App, authenticated (steps 1-2 of the header). Hand it to `openGithubInstallation` once per
+ * repository: one App, one key, one `GET /app`, an installation each (RFC-001 PR 2.1).
+ */
+export interface GithubAppHandle {
+  readonly app: App;
+  readonly appId: number;
+  /** From `GET /app`, or `null` when that read failed transiently. */
+  readonly slug: string | null;
+  /** Non-fatal findings of steps 1-2, reported ONCE for the whole set. */
+  readonly warnings: readonly string[];
+  readonly clock: ClockPort;
+  readonly logger: LoggerPort;
 }
 
 /** A sentence for a probe that failed for a reason that is not evidence of misconfiguration. */
@@ -231,10 +257,18 @@ function transientWarning(what: string, status: number): string {
   return `GitHub ${answer} while the bot ${what} at boot; the bot is starting anyway, but this is unverified until the next restart.`;
 }
 
-/** Steps 1-5 of the header, then the installation client. */
+/** Steps 1-5 of the header, then the installation client: the single-repository shape. */
 export async function startGithubAppSession(input: GithubAppSessionInput): Promise<Result<GithubAppSession, AppError>> {
-  const { appId, repo, clock } = input;
-  const log = input.logger.child({ component: 'github-app' });
+  const started = await startGithubApp(input);
+  if (!started.ok) return started;
+  const opened = await openGithubInstallation(started.value, input);
+  if (!opened.ok) return opened;
+  return Ok({ ...opened.value, warnings: [...started.value.warnings, ...opened.value.warnings] });
+}
+
+/** Steps 1-2 of the header: sign a JWT locally, then `GET /app`. */
+export async function startGithubApp(input: GithubAppInput): Promise<Result<GithubAppHandle, AppError>> {
+  const { appId, clock } = input;
   const warnings: string[] = [];
 
   const GithubOctokit = githubOctokitClass(
@@ -269,6 +303,23 @@ export async function startGithubAppSession(input: GithubAppSessionInput): Promi
     if (status === 401) return Err(appKeyRejectedError(appId));
     warnings.push(transientWarning(`read GitHub App ${appId}`, status));
   }
+  return Ok({ app, appId, slug, warnings: [...warnings], clock, logger: input.logger });
+}
+
+/**
+ * Steps 3-5 of the header for ONE repository, then its installation client. Each repository of
+ * the set gets its own call, so each is checked (permissions, `repository_selection`) on its
+ * own, and an App missing from one repository refuses naming THAT repository.
+ */
+export async function openGithubInstallation(
+  handle: GithubAppHandle,
+  input: GithubInstallationInput,
+): Promise<Result<GithubAppSession, AppError>> {
+  const { app, appId, slug, clock } = handle;
+  const { repo } = input;
+  const names = input.names ?? ENV_REPO_SETTING_NAMES;
+  const log = handle.logger.child({ component: 'github-app' });
+  const warnings: string[] = [];
 
   // --- 3. the installation ----------------------------------------------------------------
   let installation: Installation | null = null;
@@ -289,7 +340,7 @@ export async function startGithubAppSession(input: GithubAppSessionInput): Promi
         errors.config(
           'github.app',
           `could not look up the GitHub App installation on ${repo.owner}/${repo.repo} (GitHub ${status === 0 ? 'gave no response' : `answered ${status}`}), and without it no token can be minted`,
-          'Restart once GitHub is reachable, or set GITHUB_APP_INSTALLATION_ID to the installation id so the next boot can skip the lookup.',
+          `Restart once GitHub is reachable, or set ${names.installationId} to the installation id so the next boot can skip the lookup.`,
         ),
       );
     }
@@ -298,7 +349,7 @@ export async function startGithubAppSession(input: GithubAppSessionInput): Promi
         errors.config(
           'github.app',
           `GitHub answered the installation lookup for ${repo.owner}/${repo.repo} with a shape the bot does not recognise`,
-          'Set GITHUB_APP_INSTALLATION_ID to the installation id (the number at the end of its Configure URL), then restart.',
+          `Set ${names.installationId} to the installation id (the number at the end of its Configure URL), then restart.`,
         ),
       );
     }
@@ -312,12 +363,12 @@ export async function startGithubAppSession(input: GithubAppSessionInput): Promi
     } catch (cause: unknown) {
       const status = readGithubFailure(cause, clock.now()).status;
       if (status === 401) return Err(appKeyRejectedError(appId));
-      if (status === 404) return Err(configuredInstallationUnknownError(installationId, slug, appId));
+      if (status === 404) return Err(configuredInstallationUnknownError(installationId, slug, appId, names));
       warnings.push(transientWarning(`checked installation ${installationId}`, status));
     }
     const account = installation?.account?.login;
     if (account !== undefined && account.toLowerCase() !== repo.owner.toLowerCase()) {
-      return Err(configuredInstallationElsewhereError(installationId, account, repo));
+      return Err(configuredInstallationElsewhereError(installationId, account, repo, names));
     }
   }
 
@@ -366,7 +417,18 @@ export async function startGithubAppSession(input: GithubAppSessionInput): Promi
 // From config to adapter input
 // ---------------------------------------------------------------------------------------
 
-/** What `createGithubAdapter` takes: the config union with the key resolved to a `Secret`. */
+/**
+ * The config union with the App key resolved to a `Secret`: ONE credential for the whole
+ * repository set (a PAT, or an App). What `createGithubRepoSet` takes.
+ */
+export type GithubCredentials =
+  | { readonly kind: 'pat'; readonly token: Secret }
+  | { readonly kind: 'app'; readonly appId: number; readonly privateKey: Secret };
+
+/**
+ * What the single-repository `createGithubAdapter` takes: the credentials plus, in App mode, that
+ * repository's pinned installation id (`null` to look it up).
+ */
 export type GithubAdapterAuth =
   | { readonly kind: 'pat'; readonly token: Secret }
   | { readonly kind: 'app'; readonly appId: number; readonly privateKey: Secret; readonly installationId: number | null };
@@ -381,10 +443,10 @@ export type GithubAdapterAuth =
 export function resolveGithubAuth(
   auth: GithubAuthConfig,
   readText: (path: string) => string = (path) => readFileSync(path, 'utf8'),
-): Result<GithubAdapterAuth, AppError> {
+): Result<GithubCredentials, AppError> {
   if (auth.kind === 'pat') return Ok(auth);
   if (auth.privateKey.kind === 'inline') {
-    return Ok({ kind: 'app', appId: auth.appId, privateKey: auth.privateKey.pem, installationId: auth.installationId });
+    return Ok({ kind: 'app', appId: auth.appId, privateKey: auth.privateKey.pem });
   }
   const path = auth.privateKey.path;
   let pem: string;
@@ -409,5 +471,5 @@ export function resolveGithubAuth(
       ),
     );
   }
-  return Ok({ kind: 'app', appId: auth.appId, privateKey: secret(pem), installationId: auth.installationId });
+  return Ok({ kind: 'app', appId: auth.appId, privateKey: secret(pem) });
 }
