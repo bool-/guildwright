@@ -26,8 +26,8 @@
  * every failure here degrades to `UNKNOWN_BUILD`'s value for that field and the bot boots.
  */
 
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { findPackedRef, isCommitSha, parseGitHead, UNKNOWN_BUILD, type BuildInfo, type PackageIdentity } from '#core/version';
@@ -96,8 +96,8 @@ export function shaFromGitDir(gitDir: string): string | null {
   return packed === null ? null : findPackedRef(packed, head.ref);
 }
 
-/** `name` and `version` out of `package.json`, or the unknown placeholders. */
-function readPackage(root: string): PackageIdentity {
+/** `name` and `version` out of `<root>/package.json`, or the unknown placeholders. Never throws. */
+export function readPackage(root: string): PackageIdentity {
   const raw = readTextOrNull(join(root, 'package.json'));
   if (raw === null) return { name: UNKNOWN_BUILD.engine.name, version: UNKNOWN_BUILD.engine.version };
   let parsed: unknown;
@@ -146,6 +146,67 @@ export function readBuildInfo(
       gitSha: shaFromEnv(env) ?? shaFromGitDir(join(cwd, '.git')),
     },
     node: process.version,
+  };
+}
+
+// ---------------------------------------------------------------------------------------
+// One copy of zod (RFC-001 4.3, "Two copies of zod"; 5.4)
+// ---------------------------------------------------------------------------------------
+
+/**
+ * The real directory of the `zod` package that `fromDir` resolves, or `null` when it resolves
+ * none: the first `node_modules/zod/package.json` walking up from `fromDir`, which is the lookup
+ * Node performs for a bare `import 'zod'` from a file there.
+ *
+ * WHY NOT `createRequire(...).resolve`: Node caches that resolution per process, so a second
+ * question about the same directory gets the first answer even after the tree changed; this is
+ * a few `existsSync` calls and always answers about the disk as it is.
+ */
+export function zodPackageDir(fromDir: string): string | null {
+  for (let dir = resolve(fromDir); ; dir = dirname(dir)) {
+    const candidate = join(dir, 'node_modules', 'zod', 'package.json');
+    if (existsSync(candidate)) {
+      try {
+        return dirname(realpathSync(candidate));
+      } catch {
+        return null;
+      }
+    }
+    if (dirname(dir) === dir) return null;
+  }
+}
+
+/** What the zod single-copy check concluded. */
+export type ZodCopyVerdict = { readonly kind: 'ok' } | { readonly kind: 'refuse'; readonly sentence: string };
+
+/**
+ * Does the engine resolve the SAME `zod` as the module repository?
+ *
+ * WHY IT IS A REFUSAL: a module hands the engine `z.object(...)` schemas (`config`, `publishes`)
+ * and the engine calls `.safeParse` on them. Across two copies that still works at runtime, but
+ * `z.ZodType` from two `node_modules/zod` directories are different TYPES, so every manifest in
+ * the module repo fails to typecheck with a structural error nobody can read - and the one place
+ * that can say "you have two zods" in plain words is here, before anything else goes wrong.
+ *
+ * `zod` is a PEER dependency of the engine at an exact version, so a correct install has exactly
+ * one, hoisted to the module repo's `node_modules`. A nested `node_modules/<engine>/node_modules/zod`
+ * is what an unpinned or mismatched `zod` in the module repo's `package.json` produces.
+ *
+ * Only two RESOLVED, DIFFERENT directories refuse. A side that resolves no zod at all is not a
+ * second copy (in the engine's own checkout both sides are the same directory), and whatever
+ * cannot import zod fails loudly on its own.
+ */
+export function checkZodSingleCopy(engineRoot: string, cwd: string = process.cwd()): ZodCopyVerdict {
+  const engineZod = zodPackageDir(engineRoot);
+  const repoZod = zodPackageDir(cwd);
+  if (engineZod === null || repoZod === null || engineZod === repoZod) return { kind: 'ok' };
+  const manifest = readRepoManifest(engineRoot);
+  const peers: unknown = typeof manifest === 'object' && manifest !== null ? Reflect.get(manifest, 'peerDependencies') : undefined;
+  const peerPin: unknown = typeof peers === 'object' && peers !== null ? Reflect.get(peers, 'zod') : undefined;
+  const pin = typeof peerPin === 'string' ? peerPin : readPackage(engineZod).version;
+  return {
+    kind: 'refuse',
+    sentence: `two copies of zod are installed (${engineZod} and ${repoZod}); pin "zod": "${pin}" in package.json to match the engine and run npm ci`,
   };
 }
 

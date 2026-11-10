@@ -95,6 +95,46 @@ export {
   type GithubRequest,
 } from '#adapters/github/gates';
 
+export {
+  APPROVAL_REF_PREFIX,
+  dateApprovalRefs,
+  deleteApprovalRefs,
+  gitDeleteCommand,
+  listApprovalRefs,
+  planApprovalGc,
+  type ApprovalGcPlan,
+  type ApprovalRef,
+  type DatedApprovalRef,
+} from '#adapters/github/approvals-gc';
+
+/**
+ * A bare request seam on the bot's OWN credential, for an operator command (`<bin> gc-approvals`)
+ * that needs neither the ports nor the boot checks: the same PAT client, or the same App session
+ * (`GET /app`, the installation lookup and its permission checks included), as the bot.
+ */
+export async function createGithubRequester(input: {
+  readonly auth: GithubAdapterAuth;
+  readonly repo: GithubRepo;
+  readonly clock: ClockPort;
+  readonly logger: LoggerPort;
+  readonly fetch?: typeof globalThis.fetch;
+}): Promise<Result<GithubRequest, AppError>> {
+  const transport = input.fetch === undefined ? {} : { fetch: input.fetch };
+  if (input.auth.kind === 'pat') {
+    return Ok(githubRequester(createGithubClient({ token: input.auth.token, logger: input.logger, ...transport })));
+  }
+  const session = await startGithubAppSession({
+    appId: input.auth.appId,
+    privateKey: input.auth.privateKey,
+    installationId: input.auth.installationId,
+    repo: input.repo,
+    clock: input.clock,
+    logger: input.logger,
+    ...transport,
+  });
+  return session.ok ? Ok(githubRequester(session.value.octokit)) : session;
+}
+
 /** The three ports the GitHub side of the bot provides, plus the one boot-time check. */
 export interface GithubAdapter {
   readonly issues: GithubIssuesPort;

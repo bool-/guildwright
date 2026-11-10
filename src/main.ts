@@ -94,7 +94,7 @@ import { createJobSystem } from '#adapters/system/jobs';
 import { createLogger } from '#adapters/system/logger';
 import { createRateGate } from '#adapters/system/ratelimit';
 import { createSettings } from '#adapters/system/settings';
-import { enginePackageRoot, readBuildInfo, readRepoManifest } from '#adapters/system/version';
+import { checkZodSingleCopy, enginePackageRoot, readBuildInfo, readRepoManifest } from '#adapters/system/version';
 
 import {
   builtinRoot,
@@ -313,6 +313,12 @@ export async function run(env: Readonly<Record<string, string | undefined>> = pr
     return 1;
   }
   if (pin.kind === 'warn') say(`  warning: ${pin.sentence}`);
+  // ONE COPY OF ZOD (RFC-001 4.3): `doctor` runs the same check, so the sentence is the same.
+  const zodCopies = checkZodSingleCopy(enginePackageRoot());
+  if (zodCopies.kind === 'refuse') {
+    say(`\ndiscord-bot cannot start: ${zodCopies.sentence}\n`);
+    return 1;
+  }
 
   // --- (0) crash handlers, before anything can crash -------------------------------------
   //

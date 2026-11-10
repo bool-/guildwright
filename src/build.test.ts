@@ -460,4 +460,29 @@ test('pack, install into a module repo, typecheck it there, and discover its mod
     assert.ok(source.endsWith(`node_modules/${PKG}/dist/modules/${id}/module.js`), source);
   }
   assert.ok(byId.get('demo')?.endsWith('src/modules/demo/module.ts'), discovered.stdout);
+
+  // --- the installed BIN runs: `<bin> doctor --offline` from the module repo (RFC-001 PR 1.4) ---
+  // Through the package's own `bin` entry, the way `npx <bin>` resolves it, with no source
+  // condition: the compiled CLI must find the built-ins as module.js beside the repo's module.ts.
+  const installedPkg = readJson(join(repo, 'node_modules', PKG, 'package.json')) as { bin: Record<string, string> };
+  const bin = installedPkg.bin[PKG];
+  assert.equal(bin, './dist/cli.js');
+  const doctor = spawnSync(process.execPath, [join(repo, 'node_modules', PKG, bin), 'doctor', '--offline'], {
+    cwd: repo,
+    encoding: 'utf8',
+    timeout: 120_000,
+    env: {
+      ...process.env,
+      DISCORD_TOKEN: 'x'.repeat(60),
+      DISCORD_CLIENT_ID: '123456789012345678',
+      DISCORD_OWNER_ID: '223456789012345678',
+      GITHUB_TOKEN: `github_pat_${'C'.repeat(40)}`,
+      GITHUB_OWNER: 'o',
+      GITHUB_REPO: 'r',
+      APPROVAL_HMAC_KEY: 'h'.repeat(48),
+    },
+  });
+  assert.equal(doctor.status, 0, output(doctor));
+  const listed = /modules discovered: (.+)/u.exec(doctor.stdout)?.[1]?.split(', ') ?? [];
+  for (const id of ['access', 'admin', 'builder', 'credentials', 'help', 'ping', 'demo']) assert.ok(listed.includes(id), `${id}: ${output(doctor)}`);
 });
