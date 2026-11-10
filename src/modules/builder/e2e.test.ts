@@ -86,6 +86,7 @@ import {
   type FakeDiscord,
   type FakeIssues,
   type FakeJobs,
+  oneRepoPorts,
 } from '#testing/fakes';
 
 const MIGRATIONS_DIR = 'src/modules/builder/migrations';
@@ -271,7 +272,7 @@ function world(rawConfig: unknown = {}): World {
     script,
     boot() {
       const r = builder.install({
-        ports: { db: db.moduleDb('builder'), audit, clock, jobs, discord, issues, builds, access },
+        ports: { db: db.moduleDb('builder'), audit, clock, jobs, discord, access, ...oneRepoPorts({ issues, builds }) },
         rawConfig,
         bus: createEventBus(() => undefined),
         logger: fakeLogger(),

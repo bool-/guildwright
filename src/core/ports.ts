@@ -39,6 +39,7 @@ import type { AccessPort } from '#core/ports/access';
 import type { SecretsPort } from '#core/ports/secrets';
 import type { AdminPort } from '#core/ports/admin';
 import type { VersionPort } from '#core/ports/version';
+import type { RepoScoped, ReposPort } from '#core/ports/repos';
 
 export type { Db, DbPort, DocRecord, DocStore, SqlQuery, SqlValue, WriteResult } from '#core/ports/db';
 export { sql, sqlJoin, sqlValues } from '#core/ports/db';
@@ -48,7 +49,7 @@ export { oldestRunningJob } from '#core/ports/admin';
 export type { CatalogCommand, CatalogHealth, CatalogModule, CatalogPermission, CatalogPort } from '#core/ports/catalog';
 export type { Version, VersionPort } from '#core/ports/version';
 export type { BuildInfo, GithubAuthSummary, PackageIdentity, RepoIdentity } from '#core/version';
-export { UNKNOWN_BUILD, UNKNOWN_GITHUB_AUTH, describeBuild, describeGithubAuth, shortSha } from '#core/version';
+export { UNKNOWN_BUILD, UNKNOWN_GITHUB_AUTH, describeBuild, describeGithubAuth, describeGithubAuthSet, shortSha } from '#core/version';
 export type { AccessPort, AccessSubjectSnapshot, Grant, GrantSubject } from '#core/ports/access';
 export type { EnvironmentListing, EnvironmentName, SecretName, Secrets, SecretsPort } from '#core/ports/secrets';
 export {
@@ -63,6 +64,8 @@ export {
   userEnvironmentName,
 } from '#core/ports/secrets';
 export type { DiscordPermission } from '#core/permissions';
+export type { RepoKey, RepoRef, RepoScoped, RepoSet, RepoSetEntry, Repos, ReposPort } from '#core/ports/repos';
+export { DEFAULT_REPO_KEY, REPO_KEY_PATTERN, isRepoKey, repoFullName } from '#core/ports/repos';
 
 // ---------------------------------------------------------------------------------------
 // Clock
@@ -841,14 +844,24 @@ export interface PortRegistry {
   readonly clock: ClockPort;
   readonly jobs: JobsPort;
   readonly discord: DiscordPort;
-  readonly issues: IssuesPort;
-  readonly builds: BuildsPort;
+  /**
+   * `issues`, `builds` and `secrets` exist ONCE PER CONFIGURED REPOSITORY (RFC-001 7.4):
+   * `ctx.ports.issues.at(repo)` is that repository's `IssuesPort`. The ports' own methods are
+   * unchanged; which repository is a `RepoRef` from `repos`, never a string.
+   */
+  readonly issues: RepoScoped<IssuesPort>;
+  readonly builds: RepoScoped<BuildsPort>;
   readonly settings: SettingsPort;
   readonly catalog: CatalogPort;
   readonly access: AccessPort;
-  readonly secrets: SecretsPort;
+  readonly secrets: RepoScoped<SecretsPort>;
   readonly admin: AdminPort;
   readonly version: VersionPort;
+  /**
+   * The configured repository set (RFC-001 7.2): `all`, `resolve(guildId)`, `byKey`. Read-only
+   * and request-free; it is how a module obtains the `RepoRef` that `.at()` takes.
+   */
+  readonly repos: ReposPort;
 }
 
 /** WHY derived from the registry rather than written twice: adding a port makes it a legal
@@ -874,6 +887,7 @@ export const ALL_CAPABILITIES = [
   'secrets',
   'admin',
   'version',
+  'repos',
 ] as const satisfies readonly Capability[];
 
 /** Compile-time completeness check for `ALL_CAPABILITIES`. Never read at runtime. */

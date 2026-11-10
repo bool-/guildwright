@@ -32,9 +32,94 @@
  */
 
 import type { AppError } from '#core/errors';
+import { errors } from '#core/errors';
 import { isJsonObject } from '#core/json';
 import type { Result } from '#core/result';
-import type { BuildsPort, IssuesPort } from '#core/ports';
+import { Err, Ok } from '#core/result';
+import type { BuildsPort, IssuesPort, RepoRef, RepoScoped, ReposPort } from '#core/ports';
+import { toGuildId, type GuildId } from '#core/ids';
+
+// ---------------------------------------------------------------------------------------
+// Which repository (RFC-001 PR 2.1)
+// ---------------------------------------------------------------------------------------
+
+/**
+ * The GitHub side of the ports as the builder holds them: one `issues` and one `builds` PER
+ * CONFIGURED REPOSITORY behind `.at(repo)`, and `repos` to say which. Generic over the port
+ * shapes so a call site that needs only `close` can say so (`history.ts`).
+ */
+export interface GithubScopes<I, B> {
+  readonly repos: Pick<ReposPort, 'resolve' | 'all'>;
+  readonly issues: RepoScoped<I>;
+  readonly builds: RepoScoped<B>;
+}
+
+/** One repository's ports, resolved: what every builder path then calls methods on. */
+export interface RepoGithub<I, B> {
+  readonly repo: RepoRef;
+  readonly issues: I;
+  readonly builds: B;
+}
+
+/**
+ * The refusal for a guild with no repository (RFC-001 7.3's sentence). With one repository this
+ * is unreachable - the shim's only repository is the default. With several and no
+ * `"default": true`, nothing can be built until one is marked; the next step says how in THIS
+ * version, because `/repo use` (guild routing) arrives with PR 2.2.
+ */
+export function noBuildRepositoryError(): AppError {
+  return errors.config(
+    'repos.unmapped',
+    'This server is not linked to a repository yet, so nothing can be built from it.',
+    'Ask the bot operator to mark one repository "default": true in GITHUB_REPOS_JSON.',
+  );
+}
+
+/** `.at()` on both ports, for one ref. */
+function scopeTo<I, B>(ports: GithubScopes<I, B>, repo: RepoRef): Result<RepoGithub<I, B>, AppError> {
+  const issues = ports.issues.at(repo);
+  if (!issues.ok) return issues;
+  const builds = ports.builds.at(repo);
+  if (!builds.ok) return builds;
+  return Ok({ repo, issues: issues.value, builds: builds.value });
+}
+
+/**
+ * THE FRONT DOOR'S REPOSITORY: where a NEW request from this guild is filed and built
+ * (RFC-001 7.3: the guild's mapping, else the default repository, else refuse - nothing filed).
+ * `ReposPort.resolve` is synchronous, so this is safe ahead of a `showModal` too.
+ */
+export function githubForGuild<I, B>(ports: GithubScopes<I, B>, guildId: GuildId): Result<RepoGithub<I, B>, AppError> {
+  const repo = ports.repos.resolve(guildId);
+  return repo === null ? Err(noBuildRepositoryError()) : scopeTo(ports, repo);
+}
+
+/**
+ * THE REPOSITORY AN EXISTING ROW LIVES IN: every later step of a request (approve, dispatch,
+ * poll, reject, cancel, retry, expire) calls `.at()` once, here.
+ *
+ * THE SEAM PR 2.2 FILLS. The row carries no repository key yet - `repo_key` is PR 2.2's
+ * migration `0005_repo_key.sql`, which also makes a mapping change mid-build unable to move a
+ * poll - so today this resolves the row's GUILD exactly as the front door did. That is the same
+ * answer for the row's whole life, because in this version nothing can change it while the
+ * process runs: there is no guild mapping, and the set and its default are static config.
+ * PR 2.2 replaces the body with `repos.byKey(row.repoKey)` and keeps every caller.
+ */
+export function githubForRow<I, B>(ports: GithubScopes<I, B>, row: { readonly guildId: string }): Result<RepoGithub<I, B>, AppError> {
+  const guildId = toGuildId(row.guildId);
+  if (!guildId.ok) return guildId;
+  return githubForGuild(ports, guildId.value);
+}
+
+/**
+ * The repository `/status` and the boot cap check report on: the DEFAULT one, which in this
+ * version is the only repository a build can land in. `null` with no default. Per-repository
+ * caps and drift reporting across the set are PR 2.4.
+ */
+export function githubForDefault<I, B>(ports: GithubScopes<I, B>): Result<RepoGithub<I, B>, AppError> | null {
+  const repo = ports.repos.all().find((r) => r.isDefault) ?? null;
+  return repo === null ? null : scopeTo(ports, repo);
+}
 
 // ---------------------------------------------------------------------------------------
 // Cancelling a workflow run

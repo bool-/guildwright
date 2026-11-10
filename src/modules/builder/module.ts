@@ -68,7 +68,16 @@ import {
   type RequestId,
 } from '#core/ids';
 import { limit } from '#core/ratelimit';
-import { type AuditPort, type BuildsPort, type ClockPort, type DiscordPort, type LoggerPort, type PrRef } from '#core/ports';
+import {
+  repoFullName,
+  type AuditPort,
+  type BuildsPort,
+  type ClockPort,
+  type DiscordPort,
+  type LoggerPort,
+  type PrRef,
+  type RepoRef,
+} from '#core/ports';
 import type { SurfaceRef, View } from '#core/view';
 
 import {
@@ -116,7 +125,15 @@ import { classifyEnding, failureError, noPrError } from '#modules/builder/ending
 import { historyCommands } from '#modules/builder/history';
 import { KIND_OPTIONS, REQUEST_KINDS, kindIssueLabel } from '#modules/builder/kinds';
 import { requireOwnCredentialsGate, resolveBuildPayer } from '#modules/builder/payer';
-import { readAgentDailyRunCap, type DailyCapReading } from '#modules/builder/ports';
+import {
+  githubForDefault,
+  githubForGuild,
+  githubForRow,
+  noBuildRepositoryError,
+  readAgentDailyRunCap,
+  type DailyCapReading,
+  type GithubScopes,
+} from '#modules/builder/ports';
 
 /**
  * ONE PUBLIC FACE FOR THE MODULE.
@@ -252,7 +269,6 @@ function retryAfter(error: AppError, floorMs: number, why: string): JobOutcome {
  */
 interface CapContext {
   readonly ports: {
-    readonly builds: Pick<BuildsPort, 'runsSince'>;
     readonly clock: ClockPort;
     readonly audit: AuditPort;
     readonly discord: Pick<DiscordPort, 'edit'>;
@@ -290,6 +306,8 @@ interface CapContext {
  */
 async function checkDailyCap(
   jctx: CapContext,
+  /** THE REQUEST'S repository's builds port: the cap is per repository (RFC-001 7.5). */
+  builds: Pick<BuildsPort, 'runsSince'>,
   repo: BuildRepo,
   cfg: { readonly dailyRunCap: number; readonly pollIntervalMs: number },
   input: {
@@ -302,7 +320,7 @@ async function checkDailyCap(
   // The SAME window the workflow counts: runs created since UTC midnight, for the one workflow
   // file the adapter dispatches. A different boundary would mean the bot and the runner disagree
   // about what day it is.
-  const used = await jctx.ports.builds.runsSince(startOfUtcDay(now));
+  const used = await builds.runsSince(startOfUtcDay(now));
   if (!used.ok) {
     if (used.error.retryable) return retryAfter(used.error, cfg.pollIntervalMs, 'could not read the daily run count');
     jctx.logger.warn('could not read the daily agent run count; dispatching anyway', {
@@ -495,8 +513,13 @@ export default defineModule({
    * revoking another module's key is impossible from here by construction (`PermissionRef`
    * carries a module-private symbol), and `checkTableOwnership` still refuses `core_access` to
    * the `db` port.
+   *
+   * `repos` IS NEW WITH RFC-001 PR 2.1, and it is a READ. `issues` and `builds` are now one
+   * port per configured repository behind `.at(repo)`, and `repos` is the list that says which
+   * repository a guild's requests land in. It adds no write and no spend of its own: every
+   * GitHub call still goes through the two words before it.
    */
-  capabilities: ['db', 'audit', 'clock', 'jobs', 'discord', 'issues', 'builds', 'access'],
+  capabilities: ['db', 'audit', 'clock', 'jobs', 'discord', 'issues', 'builds', 'access', 'repos'],
   config: z.object({
     // NO `workflowFile` AND NO `ref` (RFC-001 5.4). They duplicated GITHUB_WORKFLOW_FILE and
     // GITHUB_REF, so the preflight and the gate-file check could verify one ref while builds ran
@@ -769,12 +792,19 @@ export default defineModule({
             const guildId = sub.space.guildId;
             if (guildId === null) return { kind: 'silent' };
 
+            // WHICH REPOSITORY (RFC-001 7.3): this guild's, else the default, else refused here,
+            // before anything is filed. Every check below is about THAT repository: a drifted
+            // gate in another repository of the set does not stop this one.
+            const target = githubForGuild(ctx.ports, guildId);
+            if (!target.ok) return { kind: 'fail', error: target.error };
+            const gh = target.value;
+
             // BUILDS DISABLED, REFUSED BEFORE ANYTHING IS FILED (RFC-001 5.4). The gate files at
             // the dispatch ref no longer match the engine's, or a containment check has not
             // passed: an approved build would be refused at dispatch anyway, so filing an issue
             // and an approval card for it is litter. Evaluated per submission, not per boot, so
             // drift merged after boot is caught here without a restart.
-            const gated = await ctx.ports.builds.verifyGates();
+            const gated = await gh.builds.verifyGates();
             if (!gated.ok) return { kind: 'fail', error: gated.error };
 
             // NO FREE BUILDS, REFUSED BEFORE ANYTHING IS FILED.
@@ -784,7 +814,7 @@ export default defineModule({
             // the repository and a card demanding an approver's attention, both for a build that
             // could never have run - litter that somebody has to clean up by hand.
             if (cfg.requireOwnCredentials) {
-              const gate = await requireOwnCredentialsGate(ctx.ports.builds, sub.actor.userId);
+              const gate = await requireOwnCredentialsGate(gh.builds, sub.actor.userId);
               if (!gate.ok) return { kind: 'fail', error: gate.error };
             }
 
@@ -866,7 +896,7 @@ export default defineModule({
             // SC-3 layer 4, as a type: the ONLY producer of an `IssueBody` is `buildIssueBody`,
             // and the only producer of a `FencedField` is `fence`. There is no parameter here
             // through which unfenced user text could enter.
-            const issue = await ctx.ports.issues.create({
+            const issue = await gh.issues.create({
               title: title.value,
               body: buildIssueBody({
                 nonce: fenceNonce,
@@ -917,7 +947,7 @@ export default defineModule({
               // only on GitHub and can never be acted on from the product - exactly the litter
               // Reject and the expiry sweep both close. Best-effort: the submission has already
               // failed and a second failure must not change what the user is told.
-              await ctx.ports.issues.close(issue.value.number, 'not_planned');
+              await gh.issues.close(issue.value.number, 'not_planned');
               return { kind: 'fail', error: posted.error };
             }
 
@@ -1057,7 +1087,8 @@ export default defineModule({
             // a build nobody approved. We tell the approver instead of pretending it worked.
             let issueClosed = true;
             if (row.issueNumber !== null) {
-              const closed = await ctx.ports.issues.close(row.issueNumber, 'not_planned');
+              const target = githubForRow(ctx.ports, row);
+              const closed = target.ok ? await target.value.issues.close(row.issueNumber, 'not_planned') : target;
               issueClosed = closed.ok;
               if (!closed.ok) {
                 ctx.ports.audit.record({
@@ -1148,6 +1179,18 @@ export default defineModule({
               return { kind: 'done' };
             }
 
+            // WHICH REPOSITORY THIS REQUEST LIVES IN, once per pass (RFC-001 7.4). Not
+            // retryable: the set is static config, so a row whose repository is gone stays gone
+            // until an operator changes it and restarts. Finished `failed` first, exactly like the
+            // other terminal refusals of this job, so the slot is released and `/request retry`
+            // accepts the row once the configuration is fixed.
+            const target = githubForRow(jctx.ports, row);
+            if (!target.ok) {
+              repo.finish(p.value.id, 'failed', jctx.ports.clock.now());
+              return { kind: 'failed', error: target.error };
+            }
+            const gh = target.value;
+
             // First pass: dispatch. `dispatch` returns a union, so the 204/blind case cannot be
             // forgotten - the caller MUST write the run-name fallback.
             if (row.runId === null) {
@@ -1177,7 +1220,7 @@ export default defineModule({
               // the payer and `signApproval`: nothing is signed or counted for a build that may
               // not run. A refusal is terminal (finished `failed`, so the slot is released and
               // `/request retry` works once the files are fixed); "could not check" retries.
-              const gated = await jctx.ports.builds.verifyGates();
+              const gated = await gh.builds.verifyGates();
               if (!gated.ok) {
                 if (gated.error.retryable) return retryAfter(gated.error, cfg.pollIntervalMs, 'could not check the gate files');
                 repo.finish(p.value.id, 'failed', jctx.ports.clock.now());
@@ -1187,7 +1230,7 @@ export default defineModule({
               // IS THERE A RUN LEFT TODAY? Asked BEFORE anything is spent and BEFORE a dispatch
               // attempt is counted, because being over cap is not this request's fault and must
               // not consume its ceiling.
-              const capped = await checkDailyCap(jctx, repo, cfg, {
+              const capped = await checkDailyCap(jctx, gh.builds, repo, cfg, {
                 row,
                 issueNumber: p.value.issueNumber,
                 surface: surface.value,
@@ -1203,7 +1246,7 @@ export default defineModule({
               // refused anyone without a credential, but that was minutes to days ago; a user
               // can run `/credentials clear`, or have a key revoked, between being filed and
               // being approved.
-              const payer = await resolveBuildPayer(jctx.ports.builds, row.requesterId, cfg.requireOwnCredentials);
+              const payer = await resolveBuildPayer(gh.builds, row.requesterId, cfg.requireOwnCredentials);
               if (!payer.ok) {
                 // A GitHub blip must not burn the request; only a real "no credentials" answer
                 // is terminal, and those two AppErrors are not retryable.
@@ -1226,7 +1269,7 @@ export default defineModule({
               // that pays for it, and the workflow refuses to spend anything without it. The
               // digest must be of the body as GitHub returns it, so we read it back rather than
               // hashing what we sent - see BuildsPort.signApproval.
-              const bodySha = await jctx.ports.issues.bodySha256(p.value.issueNumber);
+              const bodySha = await gh.issues.bodySha256(p.value.issueNumber);
               if (!bodySha.ok) {
                 return retryAfter(bodySha.error, cfg.pollIntervalMs, 'could not read the issue body digest');
               }
@@ -1238,7 +1281,7 @@ export default defineModule({
               // verifier compares it to the run's `created_at` in seconds.
               const issuedAtMs = jctx.ports.clock.now();
               const issuedAtSec = Math.floor(issuedAtMs / 1000);
-              const approvalToken = jctx.ports.builds.signApproval({
+              const approvalToken = gh.builds.signApproval({
                 requestId: p.value.id,
                 approvalId: approvalId.value,
                 issueNumber: p.value.issueNumber,
@@ -1264,7 +1307,7 @@ export default defineModule({
               // with the instant the token above was signed with.
               repo.countDispatchAttempt(p.value.id, issuedAtMs);
 
-              const out = await jctx.ports.builds.dispatch({
+              const out = await gh.builds.dispatch({
                 // SC-1: `ActionsInput = number | boolean | ActionsToken`. A string here is
                 // TS2322, so there is nothing for `${{ }}` to interpolate.
                 inputs: {
@@ -1301,7 +1344,7 @@ export default defineModule({
                 return { kind: 'retry', afterMs: cfg.pollIntervalMs, why: 'dispatched; polling' };
               }
               // Blind dispatch (HTTP 204, empty body): correlate by run-name instead.
-              const found = await jctx.ports.builds.findRunByName(out.value.correlateBy, 0);
+              const found = await gh.builds.findRunByName(out.value.correlateBy, 0);
               if (found.ok && found.value !== null) {
                 repo.recordRun(p.value.id, found.value.runId, found.value.runUrl, jctx.ports.clock.now());
                 const foundUrl = storedUrl(found.value.runUrl);
@@ -1313,7 +1356,7 @@ export default defineModule({
             // Subsequent passes: poll. `retry` does NOT consume an attempt, so a 30-minute
             // build cannot exhaust `maxAttempts` and tell the user it failed while the PR is
             // open - which is what happened when "still running" was expressed as an error.
-            const status = await jctx.ports.builds.runStatus(row.runId);
+            const status = await gh.builds.runStatus(row.runId);
             if (!status.ok) return retryAfter(status.error, cfg.pollIntervalMs, 'poll failed');
 
             // KEEP THE RUN LOG URL THE MOMENT ANYTHING REPORTS IT, finished or not: the frame
@@ -1344,9 +1387,9 @@ export default defineModule({
                 // pull request (the turn limit ends it as a failure), and a green run with no PR
                 // can be a blocked push rather than a refusal. `classifyEnding` reads the PR and
                 // the workflow's own report instead - see `ending.ts`.
-                const pr = await jctx.ports.builds.findPrForBranch(agentBranchName(p.value.id));
+                const pr = await gh.builds.findPrForBranch(agentBranchName(p.value.id));
                 if (!pr.ok) return retryAfter(pr.error, cfg.pollIntervalMs, 'looking for the PR');
-                const report = await jctx.ports.builds.findRunReport(p.value.issueNumber, row.runId);
+                const report = await gh.builds.findRunReport(p.value.issueNumber, row.runId);
                 if (!report.ok) return retryAfter(report.error, cfg.pollIntervalMs, 'reading the run report');
 
                 // A REPLAY REFUSAL IS USUALLY OUR OWN EARLIER RUN. The workflow consumes each
@@ -1363,7 +1406,7 @@ export default defineModule({
                   const earlierId = toApprovalId(row.approvalId);
                   if (earlierId.ok) {
                     const since = (row.firstDispatchAt ?? row.createdAt) - REPLAY_ADOPT_SLACK_MS;
-                    const earlier = await jctx.ports.builds.findRunByName(actionsToken.uuid(earlierId.value), since, row.runId);
+                    const earlier = await gh.builds.findRunByName(actionsToken.uuid(earlierId.value), since, row.runId);
                     if (!earlier.ok) return retryAfter(earlier.error, cfg.pollIntervalMs, 'looking for the run this approval already started');
                     if (earlier.value !== null) {
                       const adoptedAt = jctx.ports.clock.now();
@@ -1588,7 +1631,8 @@ export default defineModule({
               // fatal: the row is already `expired`, which is the state that governs spend.
               let issueClosed = true;
               if (row.issueNumber !== null) {
-                const closed = await jctx.ports.issues.close(row.issueNumber, 'not_planned');
+                const target = githubForRow(jctx.ports, row);
+                const closed = target.ok ? await target.value.issues.close(row.issueNumber, 'not_planned') : target;
                 issueClosed = closed.ok;
               }
 
@@ -1684,8 +1728,15 @@ export default defineModule({
         // crash orphaned is what this hook exists for; a diagnostic read of a repository variable
         // is a nice-to-have that reaches the network, and a nice-to-have must never be positioned
         // where it can cost the durability work.
-        capAgreement = compareDailyRunCap(await readAgentDailyRunCap(ctx.ports.builds), cfg.dailyRunCap);
-        reportCapAgreement(ctx.logger, ctx.ports.audit, capAgreement);
+        //
+        // THE DEFAULT REPOSITORY's variable: in this version the only repository a build can land
+        // in. With no default there is nothing to compare, and the check stays `unchecked`.
+        // Per-repository caps and drift reporting are PR 2.4.
+        const primary = githubForDefault(ctx.ports);
+        if (primary !== null && primary.ok) {
+          capAgreement = compareDailyRunCap(await readAgentDailyRunCap(primary.value.builds), cfg.dailyRunCap);
+          reportCapAgreement(ctx.logger, ctx.ports.audit, capAgreement);
+        }
       },
 
       // EVERY card, not the three that happened to exist. These run through the real renderer
@@ -1699,8 +1750,19 @@ export default defineModule({
         // unresolvable ref, a check GitHub has not answered yet) are the one state in which
         // everything below is irrelevant. `readiness()` makes no request: this runs on every
         // `/status`, and a health check must not spend the API budget of what it reports on.
-        const ready = ctx.ports.builds.readiness();
-        if (ready.status === 'down') return { status: 'down', detail: ready.detail };
+        //
+        // PER REPOSITORY (RFC-001 PR 2.1): the status is the DEFAULT repository's, because in
+        // this version that is where every build lands; with several repositories configured,
+        // the others' readiness is appended so a drifted gate in one is visible, scoped to it.
+        const primary = githubForDefault(ctx.ports);
+        if (primary === null) {
+          const none = noBuildRepositoryError();
+          return { status: 'down', detail: `${none.internal ?? ''} ${none.nextStep}`.trim() };
+        }
+        if (!primary.ok) return { status: 'down', detail: primary.error.nextStep };
+        const others = otherRepositoriesDetail(ctx.ports, primary.value.repo);
+        const ready = primary.value.builds.readiness();
+        if (ready.status === 'down') return { status: 'down', detail: `${ready.detail}${others}` };
 
         // THREE NUMBERS, ALL OTHERWISE INVISIBLE. "Who is paying" is the first thing an operator
         // wants confirmed after flipping `requireOwnCredentials`. The TTL is the setting that
@@ -1718,7 +1780,8 @@ export default defineModule({
             // Reporting the bot's cap alone was a half-truth: the workflow enforces its own, and
             // when the two drifted the product's answer to "how many runs a day?" was confidently
             // wrong in a way only a failed build would reveal.
-            `up to ${String(cfg.dailyRunCap)} agent runs per UTC day (${capAgreementDetail(capAgreement)})`,
+            `up to ${String(cfg.dailyRunCap)} agent runs per UTC day (${capAgreementDetail(capAgreement)})` +
+            others,
         };
       },
     };
@@ -1728,6 +1791,25 @@ export default defineModule({
 // ---------------------------------------------------------------------------------------
 // Small helpers kept below the manifest so the manifest reads top to bottom
 // ---------------------------------------------------------------------------------------
+
+/**
+ * `/status`'s note on the repositories builds do NOT land in yet (RFC-001 PR 2.1): each one's
+ * readiness, so drift or a transient probe failure in one repository of the set is reported
+ * against THAT repository. Empty for a one-repository set, so its `/status` line is unchanged.
+ * No request: `readiness()` reads the last answer.
+ */
+export function otherRepositoriesDetail(ports: GithubScopes<unknown, Pick<BuildsPort, 'readiness'>>, primary: RepoRef): string {
+  const others = ports.repos.all().filter((r) => r !== primary);
+  if (others.length === 0) return '';
+  const parts = others.map((r) => {
+    const name = `${r.key} (${repoFullName(r)})`;
+    const builds = ports.builds.at(r);
+    if (!builds.ok) return `${name}: unavailable`;
+    const ready = builds.value.readiness();
+    return ready.status === 'ready' ? `${name}: ready` : `${name}: down - ${ready.detail}`;
+  });
+  return `; builds land in ${primary.key} (${repoFullName(primary)}); other repositories: ${parts.join('; ')}`;
+}
 
 /** WHY exported: the reconciler test asserts the number a stuck row is compared against. */
 export const RECONCILE_STALE_MS = 5 * 60_000;

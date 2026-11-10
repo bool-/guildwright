@@ -213,3 +213,45 @@ test('the unanswered-check shapes are the ones the preflight, the probes and the
     assert.equal(isUnansweredWarning(w), false, w);
   }
 });
+
+// ---------------------------------------------------------------------------------------
+// The repository set (RFC-001 PR 2.1): every repository is checked, and findings name theirs
+// ---------------------------------------------------------------------------------------
+
+test('doctor online, GITHUB_REPOS_JSON: every repository is checked in one pass, and a refusal names its repository', async () => {
+  const gh = fakeGithub();
+  const engine = tempDir('doctor-engine-');
+  const repo = tempDir('doctor-repo-');
+  engineAt(engine.dir, '1.7.0');
+  writeJson(join(repo.dir, 'package.json'), { name: 'my-bot' });
+  const { GITHUB_OWNER: _o, GITHUB_REPO: _r, ...rest } = VALID_ENV;
+  const env = {
+    ...rest,
+    GITHUB_REPOS_JSON: JSON.stringify({ main: { owner: 'acme', repo: 'priv', default: true }, events: { owner: 'acme', repo: 'pub', ref: 'trunk' } }),
+  };
+  const transport = stubFetch((req: RecordedRequest): StubResponse => {
+    const p = new URL(req.url).pathname;
+    if (p === '/repos/acme/priv') return { status: 200, body: { full_name: 'acme/priv', private: true, has_issues: true } };
+    if (p === '/repos/acme/pub') return { status: 200, body: { full_name: 'acme/pub', private: false, has_issues: true } };
+    if (p.includes('/actions/workflows/')) return { status: 200, body: { state: 'active' } };
+    if (p.includes('/commits/')) return { status: 200, body: { sha: SHA_A } };
+    return { status: 404, body: { message: 'unexpected in this test' } };
+  });
+  const c = captureIo(repo.dir, env);
+  try {
+    const code = await runCli(['doctor'], c.io, { engineRoot: engine.dir, fetch: transport.fetch, probeRequest: gh.request });
+    assert.equal(code, 1, c.all());
+    const out = c.all();
+    assert.match(out, /repositories: main \(acme\/priv\), events \(acme\/pub\); default: main/u);
+    assert.match(out, /\[main\] GitHub: PAT[^\n]*repository acme\/priv, workflow agent-implement-request\.yml \(active\), ref main/u);
+    assert.match(out, /\[main\] builder: ready/u, 'the healthy repository is reported healthy');
+    assert.match(c.stderr(), /acme\/pub is PUBLIC, so every request filed into it would be public\./u, 'the refusal names the public one');
+    assert.doesNotMatch(c.stderr(), /acme\/priv is PUBLIC/u);
+    const asked = transport.requests.map((r) => new URL(r.url).pathname);
+    assert.ok(asked.includes('/repos/acme/priv') && asked.includes('/repos/acme/pub'), 'both repositories were asked');
+    assert.ok(asked.includes('/repos/acme/pub/commits/trunk'), "and each at its own ref");
+  } finally {
+    engine.cleanup();
+    repo.cleanup();
+  }
+});

@@ -58,6 +58,14 @@ export interface VersionPort {
    * preflight has learned it, and constant after that.
    */
   githubAuth(): GithubAuthSummary;
+
+  /**
+   * The same for EVERY configured repository (RFC-001 PR 2.1): one PAT summary for the whole
+   * set (one token), or one App summary per repository (an installation each). Render it with
+   * `describeGithubAuthSet`, which reads exactly like `describeGithubAuth(githubAuth())` for a
+   * one-repository set. `githubAuth()` stays, and answers for the default (or first) repository.
+   */
+  githubAuthAll(): readonly GithubAuthSummary[];
 }
 
 /** Short alias, matching the style of every other port in `#core/ports`. */

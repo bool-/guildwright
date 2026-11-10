@@ -31,10 +31,13 @@ import { renderSafeMarkdown, userTextForTest } from '#core/text';
 import { decodeActionRef, type UserId } from '#core/ids';
 import { permissionRef } from '#core/policy';
 import type { View } from '#core/view';
-import { fakeAudit, fakeRecordingLogger, fakeSecrets, type FakeAudit, type FakeSecrets } from '#testing/fakes';
+import { fakeAudit, fakeRecordingLogger, fakeRepoSet, fakeRepos, fakeScopedByKey, fakeSecrets, type FakeAudit, type FakeSecrets } from '#testing/fakes';
+import type { SecretsPort } from '#core/ports';
+import { createEventBus } from '#core/events';
+import credentialsModule from '#modules/credentials/module';
 import { userEnvironmentName } from '#core/ports/secrets';
 
-import { CredentialService } from '#modules/credentials/domain';
+import { CredentialService, credentialRepository } from '#modules/credentials/domain';
 import {
   CREDENTIAL_FIELD,
   MODULE_ID,
@@ -691,4 +694,49 @@ test('THE HONESTY LINE: the /credentials set modal says who can use the credenti
   assert.match(intro, /Whoever runs this bot, and any admin of that repository, can use it/u);
   assert.match(intro, /spend-limited key/u, 'and what limits the damage');
   assert.doesNotMatch(intro, /Nobody can read it back/u);
+});
+
+// ---------------------------------------------------------------------------------------
+// WHICH REPOSITORY (RFC-001 PR 2.1): `secrets` is one port per repository behind `.at()`
+// ---------------------------------------------------------------------------------------
+
+function twoRepoSecrets(defaultKey: 'main' | null) {
+  const set = fakeRepoSet([
+    { key: 'main', owner: 'acme', repo: 'bot-modules', isDefault: defaultKey === 'main' },
+    { key: 'events', owner: 'acme', repo: 'events-modules', isDefault: false },
+  ]);
+  const main = fakeSecrets();
+  const events = fakeSecrets();
+  return { set, main, events, scoped: fakeScopedByKey<SecretsPort>(set, { main, events }) };
+}
+
+test('REPO SET: a credential is sealed into the DEFAULT repository\'s environment, and only there', async () => {
+  const r = twoRepoSecrets('main');
+  const target = credentialRepository(fakeRepos(r.set), r.scoped);
+  assert.equal(target.unavailable, null);
+  const svc = new CredentialService(target.secrets, fakeAudit());
+  assert.ok((await svc.set(USER, GUILD, userTextForTest(OAUTH))).ok);
+  assert.equal(r.main.writes.length, 1, 'stored in acme/bot-modules');
+  assert.equal(r.events.writes.length, 0, 'and not in a repository nobody built in');
+});
+
+test('REPO SET: several repositories and no default refuse every command, and /status says the module is down', async () => {
+  const r = twoRepoSecrets(null);
+  const target = credentialRepository(fakeRepos(r.set), r.scoped);
+  assert.match(target.unavailable ?? '', /nowhere to store a credential/u);
+  const svc = new CredentialService(target.secrets, fakeAudit());
+  const refused = await svc.set(USER, GUILD, userTextForTest(OAUTH));
+  assert.ok(!refused.ok);
+  assert.equal(refused.ok ? '' : refused.error.code, 'config.repos.unmapped');
+  assert.equal(r.main.writes.length + r.events.writes.length, 0, 'nothing stored anywhere');
+
+  const installed = credentialsModule.install({
+    ports: { audit: fakeAudit(), repos: fakeRepos(r.set), secrets: r.scoped },
+    rawConfig: {},
+    bus: createEventBus(() => undefined),
+    logger: fakeRecordingLogger(),
+  });
+  assert.ok(installed.ok);
+  if (!installed.ok) return;
+  assert.equal((await installed.value.health()).status, 'down');
 });

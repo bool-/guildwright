@@ -12,7 +12,8 @@
  *   ignored builder keys  `removedBuilderKeyWarnings`      (#core/config, PR 1.7)       warns
  *   PAT mode              the PAT-to-App nudge (RFC-001 6.6)                            note
  *   src/engine.d.ts       missing in a module repo (RFC-001 4.3)                        warns
- *   GitHub (not --offline): `createGithubAdapter` + `preflight()` - `GET /app` and the
+ *   GitHub (not --offline), for EVERY repository of the set (RFC-001 PR 2.1):
+ *                         `createGithubRepoSet` + `preflight()` - `GET /app` and the
  *                         installation checks in App mode, the three preflight reads, every
  *                         containment probe of 5.4 and the gate-file digest check - then the
  *                         builder's readiness exactly as `/status` would report it.
@@ -34,11 +35,12 @@ import { checkZodSingleCopy, readPackage, readRepoManifest } from '#adapters/sys
 import { checkEnginePin, describeGithubAuth, type PackageIdentity } from '#core/version';
 import {
   PAT_MODE_WARNING,
-  createGithubAdapter,
   readTemplateGateFiles,
   resolveGithubAuth,
+  type GithubCredentials,
   type GithubRequest,
 } from '#adapters/github/index';
+import { createGithubRepoSet } from '#adapters/github/repo-set';
 
 import { describeQuarantine } from '../loader.ts';
 import { formatConfigFailure } from '../main.ts';
@@ -157,48 +159,69 @@ export async function doctor(io: CliIo, deps: DoctorDeps, opts: { readonly offli
   return report(io, findings);
 }
 
+/**
+ * The GitHub half, for EVERY repository of the set (RFC-001 PR 2.1): the auth checks, the
+ * preflight, the containment probes and the gate-file check of each, all reported in this one
+ * pass. With one repository the output is what it always was; with several, each repository's
+ * lines are prefixed by its key, so a finding says which repository it is about.
+ */
 async function githubChecks(
   io: CliIo,
   deps: DoctorDeps,
   cfg: AppConfig,
-  auth: Parameters<typeof createGithubAdapter>[0]['auth'],
+  auth: GithubCredentials,
   builderLoads: boolean,
   add: (level: Finding['level'], text: string) => void,
 ): Promise<void> {
   const refused = (e: AppError): void => {
     add('refuse', formatConfigFailure(e).trim());
   };
-  const created = await createGithubAdapter({
+  const engineVersion = readPackage(deps.engineRoot).version;
+  const probeRequest = deps.probeRequest;
+  const created = await createGithubRepoSet({
     auth,
-    repo: { owner: cfg.github.owner, repo: cfg.github.repo },
+    repos: cfg.github.repos,
     clock: systemClock(),
     logger: silentLogger(),
     approvalHmacKey: cfg.github.approvalHmacKey,
-    workflowFile: cfg.github.workflowFile,
-    ref: cfg.github.ref,
     allowPublicTargetRepo: cfg.github.allowPublicTargetRepo,
     builder: builderLoads ? { requireOwnCredentials: builderRequiresOwnCredentials(cfg.modules) } : null,
-    engineVersion: readPackage(deps.engineRoot).version,
-    gateReference: readTemplateGateFiles(deps.engineRoot, readPackage(deps.engineRoot).version, cfg.github.workflowFile),
+    engineVersion,
+    gateReference: (r) => readTemplateGateFiles(deps.engineRoot, engineVersion, r.workflowFile),
     ...(deps.fetch === undefined ? {} : { fetch: deps.fetch }),
-    ...(deps.probeRequest === undefined ? {} : { probeRequest: deps.probeRequest }),
+    ...(probeRequest === undefined ? {} : { probeRequest: () => probeRequest }),
   });
   if (!created.ok) {
-    refused(created.error);
+    for (const e of created.error) refused(e);
     return;
   }
-  const adapter = created.value;
-  const pre = await adapter.preflight();
-  if (!pre.ok) {
-    refused(pre.error);
-    return;
+  const set = created.value;
+  const several = set.adapters.length > 1;
+  if (several) {
+    const dflt = set.set.default;
+    io.out(`  repositories: ${set.adapters.map((a) => `${a.ref.key} (${a.config.owner}/${a.config.repo})`).join(', ')}; default: ${dflt === null ? 'none' : dflt.key}\n`);
+    if (dflt === null) {
+      add(
+        'warn',
+        'no repository in GITHUB_REPOS_JSON is marked "default": true, and guild routing (/repo use) is not available in this version, so /request new and /credentials have no repository to act on. Mark one entry "default": true.',
+      );
+    }
   }
-  io.out(`  ${describeGithubAuth(adapter.authSummary())}; repository ${pre.value.fullName}, workflow ${cfg.github.workflowFile} (${pre.value.workflowState}), ref ${cfg.github.ref}\n`);
-  for (const w of pre.value.warnings) add(isUnansweredWarning(w) ? 'problem' : 'warn', w);
-  const ready = adapter.builds.readiness();
-  if (builderLoads) {
-    if (ready.status === 'down') add('problem', `builder: down. ${ready.detail}`);
-    else io.out('  builder: ready (gate files match, containment checks passed)\n');
+  for (const p of await set.preflight()) {
+    const tag = several ? `[${p.ref.key}] ` : '';
+    if (!p.result.ok) {
+      refused(p.result.error);
+      continue;
+    }
+    const adapter = set.adapters.find((a) => a.ref === p.ref)?.adapter;
+    if (adapter === undefined) continue;
+    io.out(`  ${tag}${describeGithubAuth(adapter.authSummary())}; repository ${p.result.value.fullName}, workflow ${p.config.workflowFile} (${p.result.value.workflowState}), ref ${p.config.ref}\n`);
+    for (const w of p.result.value.warnings) add(isUnansweredWarning(w) ? 'problem' : 'warn', `${tag}${w}`);
+    const ready = adapter.builds.readiness();
+    if (builderLoads) {
+      if (ready.status === 'down') add('problem', `${tag}builder: down. ${ready.detail}`);
+      else io.out(`  ${tag}builder: ready (gate files match, containment checks passed)\n`);
+    }
   }
 }
 

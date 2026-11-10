@@ -40,7 +40,7 @@
 
 import { z } from 'zod';
 import { defineModule } from '#core/module';
-import { CredentialService } from '#modules/credentials/domain';
+import { CredentialService, credentialRepository } from '#modules/credentials/domain';
 import { credentialCommands, credentialForms, present } from '#modules/credentials/present';
 
 export default defineModule({
@@ -59,8 +59,12 @@ export default defineModule({
    *
    * `secrets` is its own capability rather than a corner of `builds` precisely because it moves
    * the spend onto somebody else's account. That deserves its own word here.
+   *
+   * `repos` (RFC-001 PR 2.1): `secrets` is now one port PER CONFIGURED REPOSITORY, and `repos`
+   * is the read-only list that says which one. It grants no write anywhere: it is how this
+   * module learns WHICH repository's environment a credential goes into.
    */
-  capabilities: ['secrets', 'audit'],
+  capabilities: ['secrets', 'audit', 'repos'],
 
   /**
    * Nothing to configure, and that is a decision rather than an omission. The two credential
@@ -88,8 +92,13 @@ export default defineModule({
   migrations: false,
 
   setup(ctx) {
+    // WHICH REPOSITORY'S ENVIRONMENTS (RFC-001 PR 2.1): the default one, for every command, which
+    // for a one-repository install is the repository it always was. Per-guild and per-DM
+    // resolution (`/credentials set` in a guild seals into that guild's repository) is PR 2.3;
+    // `credentialRepository` is the one function that changes then.
+    const target = credentialRepository(ctx.ports.repos, ctx.ports.secrets);
     // The closure IS the dependency injection - no container, no registration call.
-    const svc = new CredentialService(ctx.ports.secrets, ctx.ports.audit);
+    const svc = new CredentialService(target.secrets, ctx.ports.audit);
 
     return {
       commands: credentialCommands(svc, ctx.perms),
@@ -116,6 +125,7 @@ export default defineModule({
        * feature down by itself.
        */
       async health() {
+        if (target.unavailable !== null) return { status: 'down', detail: target.unavailable };
         return { status: 'ok', detail: 'ready; nothing is stored locally' };
       },
     };

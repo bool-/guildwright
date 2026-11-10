@@ -20,7 +20,8 @@
  *   5. ports           - assembled once, handed out per module. `PortRegistry` is spelled in
  *                        full below so that adding a port to core fails to compile HERE until
  *                        someone wires it.
- *  5b. github preflight- three reads, once, right after the adapter exists. A 401 or a 404 is
+ *  5b. github preflight- three reads per configured repository (RFC-001 PR 2.1: one adapter per
+ *                        repository of the set), once, right after the adapters exist. A 401 or a 404 is
  *                        a wrong value in the environment and stops the boot with the same
  *                        sentence a bad DISCORD_TOKEN gets; anything else is warned about and
  *                        the bot starts. Without it the first person to learn that the PAT
@@ -84,7 +85,8 @@ import {
   type DeployableCommand,
 } from '#adapters/discord/client';
 import { attachRouter } from '#adapters/discord/router';
-import { createGithubAdapter, logPreflightWarnings, readTemplateGateFiles, resolveGithubAuth } from '#adapters/github/index';
+import { logPreflightWarnings, readTemplateGateFiles, resolveGithubAuth } from '#adapters/github/index';
+import { createGithubRepoSet } from '#adapters/github/repo-set';
 import { ensureCoreSchema, openSqlite } from '#adapters/sqlite/db';
 import { readMigrationDir, runCoreMigrations, runMigrations } from '#adapters/sqlite/migrate';
 import { createAccess, fallbacksFromCatalog } from '#adapters/system/access';
@@ -397,12 +399,16 @@ export async function run(env: Readonly<Record<string, string | undefined>> = pr
   const sqlite = opened.value;
 
   /** Every failure after this point must close the database, or the WAL stays checked out. */
-  const failBoot = (error: AppError): number => {
-    say(formatConfigFailure(error));
-    logger.error('boot failed', { cause: operatorMessage(error) });
+  /** Several refusals at once - one per repository of the set that refused (RFC-001 PR 2.1). */
+  const failBootAll = (all: readonly AppError[]): number => {
+    for (const error of all) {
+      say(formatConfigFailure(error));
+      logger.error('boot failed', { cause: operatorMessage(error) });
+    }
     sqlite.close();
     return 1;
   };
+  const failBoot = (error: AppError): number => failBootAll([error]);
 
   try {
     // `core_docs` and `core_migrations` - the ledger the core migration run below writes into.
@@ -531,21 +537,24 @@ export async function run(env: Readonly<Record<string, string | undefined>> = pr
   // installation on the module repository is sufficient (src/adapters/github/app-auth.ts):
   // a key that is not the App's, an App not installed on the repo, a missing permission, or an
   // install on ALL repositories each refuse to start with the sentence that names the fix.
+  //
+  // ONE ADAPTER PER CONFIGURED REPOSITORY (RFC-001 PR 2.1). `cfg.github.repos` is the set from
+  // GITHUB_REPOS_JSON, or the one-repository set keyed `default` that the shim makes of
+  // GITHUB_OWNER/GITHUB_REPO - so a phase-1 install builds exactly the one adapter it always did.
+  // One credential for the whole set: one PAT client shared by every repository, or one App with
+  // an installation looked up and checked per repository. Every repository the auth checks refuse
+  // is named before the boot stops (src/adapters/github/repo-set.ts).
   const githubAuth = resolveGithubAuth(cfg.github.auth);
   if (!githubAuth.ok) return failBoot(githubAuth.error);
-  const githubAdapter = await createGithubAdapter({
+  const githubSet = await createGithubRepoSet({
     auth: githubAuth.value,
-    repo: { owner: cfg.github.owner, repo: cfg.github.repo },
+    repos: cfg.github.repos,
     clock,
     logger,
     // The composition root is the only place this key is read. Modules receive a signing
     // FUNCTION on BuildsPort, never the key itself, so a signing secret never enters a
     // module's blast radius or MODULES_JSON.
     approvalHmacKey: cfg.github.approvalHmacKey,
-    // THE ONE workflow and ref: every dispatch runs them, the daily cap counts them, and the
-    // preflight and the gate-file check verify them. There is no second copy in MODULES_JSON.
-    workflowFile: cfg.github.workflowFile,
-    ref: cfg.github.ref,
     allowPublicTargetRepo: cfg.github.allowPublicTargetRepo,
     // The build-path probes (APPROVAL_HMAC_KEY, environments, gate files) only when the builder
     // will actually load; which environment probe runs depends on who pays.
@@ -553,10 +562,13 @@ export async function run(env: Readonly<Record<string, string | undefined>> = pr
       ? { requireOwnCredentials: builderRequiresOwnCredentials(cfg.modules) }
       : null,
     engineVersion: build.engine.version,
-    gateReference: readTemplateGateFiles(enginePackageRoot(), build.engine.version, cfg.github.workflowFile),
+    // PER REPOSITORY: each repository's ref and workflow are bound in its own adapter - every
+    // dispatch runs them, the daily cap counts them, and its preflight and gate-file check
+    // verify them. There is no second copy in MODULES_JSON.
+    gateReference: (r) => readTemplateGateFiles(enginePackageRoot(), build.engine.version, r.workflowFile),
   });
-  if (!githubAdapter.ok) return failBoot(githubAdapter.error);
-  const github = githubAdapter.value;
+  if (!githubSet.ok) return failBootAll(githubSet.error);
+  const github = githubSet.value;
 
   // --- (5b) THE GITHUB PREFLIGHT ---------------------------------------------------------
   //
@@ -576,17 +588,28 @@ export async function run(env: Readonly<Record<string, string | undefined>> = pr
   // WHY NOT IN `health()`: `/status` is polled, and hardest when something is already wrong. A
   // health check that spends the same quota as the feature it reports on can take that feature
   // down during the incident it exists to surface. See src/adapters/github/preflight.ts.
-  const preflight = await github.preflight();
-  if (!preflight.ok) return failBoot(preflight.error);
-  logPreflightWarnings(preflight.value, logger, say);
-  logger.info('github preflight passed', {
-    repo: preflight.value.fullName,
-    workflow: cfg.github.workflowFile,
-    workflowState: preflight.value.workflowState,
-    ref: cfg.github.ref,
-    warnings: preflight.value.warnings.length,
-    auth: describeGithubAuth(github.authSummary()),
-  });
+  //
+  // EVERY REPOSITORY of the set, each complete (RFC-001 7.1: "each repo passes the full
+  // preflight of 5.4 independently"). A refusal in any of them refuses the boot, after all of
+  // them have been asked, naming each; a transient answer or drifted gate files disable builds
+  // for THAT repository only, because each adapter holds its own containment state.
+  const preflights = await github.preflight();
+  const refusals = preflights.flatMap((p) => (p.result.ok ? [] : [p.result.error]));
+  if (refusals.length > 0) return failBootAll(refusals);
+  for (const p of preflights) {
+    if (!p.result.ok) continue;
+    logPreflightWarnings(p.result.value, logger, say);
+    const adapter = github.adapters.find((a) => a.ref === p.ref)?.adapter;
+    logger.info('github preflight passed', {
+      repoKey: p.ref.key,
+      repo: p.result.value.fullName,
+      workflow: p.config.workflowFile,
+      workflowState: p.result.value.workflowState,
+      ref: p.config.ref,
+      warnings: p.result.value.warnings.length,
+      auth: describeGithubAuth(adapter === undefined ? { kind: 'unknown' } : adapter.authSummary()),
+    });
+  }
 
   // Guilds-only unless a module needs message hooks. See client.ts for why the default moved.
   const client = createDiscordClient({ messageContent: cfg.discord.messageContent });
@@ -616,7 +639,11 @@ export async function run(env: Readonly<Record<string, string | undefined>> = pr
 
   /** Constant for the life of the process; see `#adapters/system/version` for why. */
   // `githubAuth` is read on every /status, after the preflight above has filled in a PAT's expiry.
-  const versionPort: VersionPort = { current: () => build, githubAuth: () => github.authSummary() };
+  const versionPort: VersionPort = {
+    current: () => build,
+    githubAuth: () => github.primaryAuthSummary(),
+    githubAuthAll: () => github.authSummaries(),
+  };
 
   /** One JobsPort per module id; the runner dispatches on `<moduleId>:<type>`. */
   const jobPorts = new Map<string, ReturnType<typeof jobs.portFor>>();
@@ -642,6 +669,7 @@ export async function run(env: Readonly<Record<string, string | undefined>> = pr
     clock,
     jobs: jobPortFor(moduleId),
     discord,
+    // One port per configured repository, reached through `.at(repo)` (RFC-001 7.4).
     issues: github.issues,
     builds: github.builds,
     settings,
@@ -650,6 +678,7 @@ export async function run(env: Readonly<Record<string, string | undefined>> = pr
     secrets: github.secrets,
     admin: adminPort,
     version: versionPort,
+    repos: github.repos,
   });
 
   // --- (6) install -----------------------------------------------------------------------

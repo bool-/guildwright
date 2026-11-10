@@ -24,16 +24,17 @@
 import { strict as assert } from 'node:assert';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
-import { Ok } from '#core/result';
+import { Err, Ok } from '#core/result';
 
 import builder, { CREDENTIALS_NEXT_STEP } from '#modules/builder/module';
 import type { FormHandlerSpec, FormSubmission, InstalledModule, Outcome, ProgressHandle } from '#core/module';
 import type { FormValues } from '#core/args';
 import { createEventBus } from '#core/events';
-import { userMessage } from '#core/errors';
+import { errors, userMessage } from '#core/errors';
 import { buildEnvironmentName, toEnum, userTextForTest } from '#core/text';
 import { newCardNonce, newRequestId, toChannelId, toGuildId, toUserId, type ChannelId, type GuildId, type UserId } from '#core/ids';
 import type { SurfaceRef } from '#core/view';
+import type { BuildsPort, IssuesPort } from '#core/ports';
 import {
   fakeAccess,
   fakeAudit,
@@ -48,6 +49,10 @@ import {
   type FakeDb,
   type FakeDiscord,
   type FakeIssues,
+  fakeRepoSet,
+  fakeRepos,
+  fakeScopedByKey,
+  oneRepoPorts,
 } from '#testing/fakes';
 
 const REQUESTER = '111111111111111111';
@@ -154,7 +159,7 @@ function harness(rawConfig: unknown = {}): Harness {
     // `access` is new this round: `/request cancel` and `/request list all` have to ask whether
     // the caller is an approver, and a module cannot answer that without the port. A missing one
     // QUARANTINES the module, which is why every harness in this folder has to be told about it.
-    ports: { db, audit: fakeAudit(), clock: fakeClock(NOW), jobs: fakeJobs(), discord, issues, builds, access: fakeAccess() },
+    ports: { db, audit: fakeAudit(), clock: fakeClock(NOW), jobs: fakeJobs(), discord, access: fakeAccess(), ...oneRepoPorts({ issues, builds }) },
     rawConfig,
     bus: createEventBus(() => undefined),
     logger: fakeLogger(),
@@ -355,4 +360,94 @@ test('with the gate off, /status says the operator is the one paying', async () 
   const h = harness({ requireOwnCredentials: false });
   const health = await h.installed.health();
   assert.match(health.detail, /ai-agent/u, 'the shared environment is named, so the bill is not a surprise');
+});
+
+// ---------------------------------------------------------------------------------------
+// WHICH REPOSITORY (RFC-001 PR 2.1): the front door builds in `ReposPort.resolve(guild)`
+// ---------------------------------------------------------------------------------------
+
+/** The builder over a TWO-repository set, each repository with its own fakes. */
+function twoRepoHarness(defaultKey: 'main' | 'events' | null) {
+  const set = fakeRepoSet([
+    { key: 'main', owner: 'acme', repo: 'bot-modules', isDefault: defaultKey === 'main' },
+    { key: 'events', owner: 'acme', repo: 'events-modules', isDefault: defaultKey === 'events' },
+  ]);
+  const repos = {
+    main: { issues: fakeIssues(), builds: fakeBuilds() },
+    events: { issues: fakeIssues(), builds: fakeBuilds() },
+  };
+  const discord = fakeDiscord();
+  const r = builder.install({
+    ports: {
+      db: fakeDb('m_builder_'),
+      audit: fakeAudit(),
+      clock: fakeClock(NOW),
+      jobs: fakeJobs(),
+      discord,
+      access: fakeAccess(),
+      repos: fakeRepos(set),
+      issues: fakeScopedByKey<IssuesPort>(set, { main: repos.main.issues, events: repos.events.issues }),
+      builds: fakeScopedByKey<BuildsPort>(set, { main: repos.main.builds, events: repos.events.builds }),
+    },
+    rawConfig: {},
+    bus: createEventBus(() => undefined),
+    logger: fakeLogger(),
+  });
+  assert.ok(r.ok, 'the builder installs over a repository set');
+  if (!r.ok) throw new Error('unreachable');
+  const form = r.value.forms.find((f) => f.name === 'request');
+  if (form === undefined) throw new Error('unreachable');
+  for (const k of ['main', 'events'] as const) repos[k].builds.environments.set(buildEnvironmentName(REQUESTER), ['CLAUDE_CODE_OAUTH_TOKEN']);
+  return { installed: r.value, form, repos, discord };
+}
+
+test('REPO SET: a request is filed, gated and credential-checked in the guild\'s repository (the default), and nowhere else', async () => {
+  const h = twoRepoHarness('main');
+  const outcome = await h.form.handle(submission(REQUESTER));
+  assert.equal(outcome.kind, 'view', 'filed');
+  assert.equal(h.repos.main.issues.created.length, 1, 'into the default repository');
+  assert.equal(h.repos.events.issues.created.length, 0, 'and not into its neighbour');
+  assert.equal(h.repos.main.builds.gateChecks, 1, 'the gate checked is the gate of the repository it lands in');
+  assert.equal(h.repos.events.builds.gateChecks, 0);
+});
+
+test('REPO SET: drifted gates in ANOTHER repository do not stop a request in this one (scoped refusal)', async () => {
+  const h = twoRepoHarness('main');
+  h.repos.events.builds.gateAnswer = Err(errors.config('github.gates', 'Builds are disabled: drift in acme/events-modules.', 'Run template apply.'));
+  const outcome = await h.form.handle(submission(REQUESTER));
+  assert.equal(outcome.kind, 'view');
+  assert.equal(h.repos.main.issues.created.length, 1);
+
+  // And the other way round: drift in the repository this guild builds in refuses, filing nothing.
+  const g = twoRepoHarness('events');
+  g.repos.events.builds.gateAnswer = Err(errors.config('github.gates', 'Builds are disabled: drift in acme/events-modules.', 'Run template apply.'));
+  assert.equal((await g.form.handle(submission(REQUESTER))).kind, 'fail');
+  assert.equal(g.repos.events.issues.created.length + g.repos.main.issues.created.length, 0);
+});
+
+test('REPO SET: several repositories and NO default refuses at the front door with the unmapped sentence, filing nothing', async () => {
+  const h = twoRepoHarness(null);
+  const outcome = await h.form.handle(submission(REQUESTER));
+  assert.equal(outcome.kind, 'fail');
+  if (outcome.kind !== 'fail') return;
+  assert.equal(outcome.error.code, 'config.repos.unmapped');
+  assert.equal(outcome.error.internal, 'This server is not linked to a repository yet, so nothing can be built from it.');
+  assert.equal(h.repos.main.issues.created.length + h.repos.events.issues.created.length, 0, 'nothing filed anywhere');
+  assert.equal(h.discord.posted.length, 0);
+  const health = await h.installed.health();
+  assert.equal(health.status, 'down', '/status says builds have nowhere to go');
+  assert.match(health.detail, /"default": true in GITHUB_REPOS_JSON/u);
+});
+
+test('REPO SET: /status reports the default repository, and each other repository\'s readiness against THAT repository', async () => {
+  const h = twoRepoHarness('main');
+  h.repos.events.builds.gateAnswer = Err(errors.config('github.gates', 'Builds are disabled: drift in acme/events-modules.', 'Run template apply.'));
+  await h.repos.events.builds.verifyGates();
+  const health = await h.installed.health();
+  assert.equal(health.status, 'ok', 'the repository builds land in is ready');
+  assert.match(health.detail, /builds land in main \(acme\/bot-modules\); other repositories: events \(acme\/events-modules\): down - /u);
+
+  // A one-repository install's line carries none of that: unchanged from phase 1.
+  const one = harness();
+  assert.doesNotMatch((await one.installed.health()).detail, /other repositories/u);
 });

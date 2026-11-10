@@ -157,6 +157,25 @@ export function describeGithubAuth(auth: GithubAuthSummary): string {
 }
 
 /**
+ * The auth line for a whole REPOSITORY SET (RFC-001 PR 2.1): one PAT for every repository, or
+ * one App with an installation per repository.
+ *
+ * One entry reads exactly as `describeGithubAuth` does, so a single-repository install's
+ * `/status` line is unchanged. Several installations of one App read
+ * `GitHub: app my-builder on acme/a (installation 1), acme/b (installation 2)`.
+ */
+export function describeGithubAuthSet(auths: readonly GithubAuthSummary[]): string {
+  const [first, ...rest] = auths;
+  if (first === undefined) return describeGithubAuth(UNKNOWN_GITHUB_AUTH);
+  if (rest.length === 0) return describeGithubAuth(first);
+  const apps = auths.filter((a) => a.kind === 'app');
+  if (first.kind === 'app' && apps.length === auths.length && apps.every((a) => a.appId === first.appId)) {
+    return `GitHub: app ${first.slug ?? `id ${first.appId}`} on ${apps.map((a) => `${a.repo} (installation ${a.installationId})`).join(', ')}`;
+  }
+  return auths.map(describeGithubAuth).join('; ');
+}
+
+/**
  * What `.git/HEAD` says.
  *
  * Two forms, both real: a detached head is the sha itself, and an attached one is
