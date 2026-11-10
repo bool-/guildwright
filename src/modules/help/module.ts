@@ -26,7 +26,7 @@ import { defineModule, type CommandSpec } from '#core/module';
 import { joinSafe, md, mdInlineCode, sanitizeStored } from '#core/text';
 import { PUBLIC } from '#core/policy';
 import { limit } from '#core/ratelimit';
-import { describeBuild, type CatalogHealth, type CatalogPort, type VersionPort } from '#core/ports';
+import { describeBuild, describeGithubAuth, type CatalogHealth, type CatalogPort, type VersionPort } from '#core/ports';
 import type { View } from '#core/view';
 
 function helpView(catalog: CatalogPort): View {
@@ -80,6 +80,9 @@ function statusView(rows: readonly CatalogHealth[], version: VersionPort): View 
         name: r.moduleId,
         md: md`${mdInlineCode(r.status)} ${mdInlineCode(r.detail)}`,
       })),
+      // "Running as what?" is the next triage question after "which build?": a PAT with an
+      // expiry date, or an App installation an admin can see and revoke in the repo settings.
+      { kind: 'text', md: md`${mdInlineCode(describeGithubAuth(version.githubAuth()))}` },
       { kind: 'text', md: md`${mdInlineCode(describeBuild(version.current()))}` },
     ],
   };

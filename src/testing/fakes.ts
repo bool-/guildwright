@@ -22,6 +22,7 @@ import type {
   CatalogPort,
   ClockPort,
   DiscordPort,
+  GithubAuthSummary,
   IssuesPort,
   JobRequest,
   JobsPort,
@@ -35,7 +36,7 @@ import type {
   SettingsPort,
   VersionPort,
 } from '#core/ports';
-import { UNKNOWN_BUILD, isRepositoryVariableName, toRepositoryVariable } from '#core/ports';
+import { UNKNOWN_BUILD, UNKNOWN_GITHUB_AUTH, isRepositoryVariableName, toRepositoryVariable } from '#core/ports';
 import { errors } from '#core/errors';
 import type { Secret } from '#core/secret';
 import type { ChannelId, JobId } from '#core/ids';
@@ -228,8 +229,8 @@ export function fakeAdmin(): FakeAdmin {
  * only ever ran against this fake has been exercised on the `gitSha === null` path - which is
  * the path a containerised deploy actually takes.
  */
-export function fakeVersion(info: BuildInfo = UNKNOWN_BUILD): VersionPort {
-  return { current: () => info };
+export function fakeVersion(info: BuildInfo = UNKNOWN_BUILD, github: GithubAuthSummary = UNKNOWN_GITHUB_AUTH): VersionPort {
+  return { current: () => info, githubAuth: () => github };
 }
 
 /** WHY exported: the ownership test needs an `AppError`-shaped assertion helper. */

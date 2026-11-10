@@ -94,16 +94,44 @@ interface ThrottleRequestOptions {
   readonly url?: string;
 }
 
+/** What `new Octokit(...)` accepts. Derived, so no transitive `@octokit/*` type is imported. */
+type OctokitOptions = NonNullable<ConstructorParameters<typeof Octokit>[0]>;
+
 /**
- * Build the octokit instance.
+ * THE PIN, as a plugin. See the header: a constructor `headers` option would be dropped silently.
+ *
+ * WHY A PLUGIN rather than one `hook.before` on one instance: in App mode the bundled
+ * `@octokit/app` constructs the instances itself (the JWT-authenticated `app.octokit`, and one
+ * per installation from `getInstallationOctokit`). A plugin on the CLASS is applied to every
+ * instance that class ever makes, so no instance the App builds can be the one that forgot.
+ */
+const pinApiVersion: Parameters<typeof Octokit.plugin>[0] = (octokit) => {
+  octokit.hook.before('request', (options) => {
+    options.headers['x-github-api-version'] = GITHUB_API_VERSION;
+  });
+};
+
+/** The class every GitHub client in the bot is an instance of. */
+export type GithubOctokitClass = typeof Octokit;
+
+/**
+ * The Octokit CLASS the bot uses, with every policy baked in: user agent, transport, retry,
+ * throttle, structured redacted logging, and the API-version pin.
  *
  * `octokit@5.0.5` already bundles `@octokit/plugin-retry` and `@octokit/plugin-throttling`
  * (see `node_modules/octokit/dist-src/octokit.js`), so this CONFIGURES them rather than adding
  * a dependency. The package's own defaults retry a rate limit exactly once and log to
  * `console`; both are replaced here so the policy is ours and the logging is structured.
+ *
+ * WHY A CLASS AND NOT AN INSTANCE: a PAT needs one instance, but a GitHub App hands its class to
+ * `@octokit/app`, which builds the instances (RFC-001 6.4 step 3). Both modes therefore get
+ * byte-for-byte the same options from this one function instead of two copies that drift.
+ *
+ * WHY THE DEFAULTS ARE A FUNCTION: `@octokit/app` builds each installation client from the
+ * App client's own constructor options, and `Octokit.defaults({...})` with an object CONCATENATES
+ * `userAgent` on every such hop. A function overwrites it, so the header stays one product name.
  */
-export function createGithubClient(input: {
-  readonly token: Secret;
+export function githubOctokitClass(input: {
   readonly logger: LoggerPort;
   /**
    * Transport override.
@@ -115,14 +143,14 @@ export function createGithubClient(input: {
    * behind a corporate proxy needs.
    */
   readonly fetch?: typeof globalThis.fetch;
-}): Octokit {
+}): GithubOctokitClass {
   const log = input.logger.child({ component: 'github' });
+  const fetchImpl = input.fetch;
 
-  const octokit = new Octokit({
-    // `reveal()` is the single greppable unwrap of a credential in the repo (SC-6).
-    auth: input.token.reveal(),
+  const policy = (options: OctokitOptions): OctokitOptions => ({
+    ...options,
     userAgent: GITHUB_USER_AGENT,
-    request: input.fetch === undefined ? {} : { fetch: input.fetch },
+    request: fetchImpl === undefined ? { ...options.request } : { ...options.request, fetch: fetchImpl },
     retry: { doNotRetry: [...DO_NOT_RETRY], retries: TRANSPORT_RETRIES },
     throttle: {
       onRateLimit(
@@ -165,12 +193,49 @@ export function createGithubClient(input: {
     },
   });
 
-  // THE PIN. See the header: a constructor `headers` option would be dropped silently.
-  octokit.hook.before('request', (options) => {
-    options.headers['x-github-api-version'] = GITHUB_API_VERSION;
-  });
+  return Octokit.plugin(pinApiVersion).defaults(policy);
+}
 
-  return octokit;
+/** Build the octokit instance for a personal access token (PAT mode). */
+export function createGithubClient(input: {
+  readonly token: Secret;
+  readonly logger: LoggerPort;
+  /** See `githubOctokitClass`. */
+  readonly fetch?: typeof globalThis.fetch;
+}): Octokit {
+  const GithubOctokit = githubOctokitClass(
+    input.fetch === undefined ? { logger: input.logger } : { logger: input.logger, fetch: input.fetch },
+  );
+  // `reveal()` is the single greppable unwrap of a credential in the repo (SC-6).
+  return new GithubOctokit({ auth: input.token.reveal() });
+}
+
+// ---------------------------------------------------------------------------------------
+// An auth failure that has already been translated
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Thrown by the GitHub App auth layer (`app-auth.ts`) out of the transport, carrying the
+ * `AppError` it has ALREADY chosen; `mapGithubError` and the boot preflight hand that error back
+ * unchanged instead of re-deriving one from a status code.
+ *
+ * WHY IT EXISTS: the one case today is an uninstalled App. Minting an installation token then
+ * answers 404, and a bare 404 is the worst possible status to let escape into the ports: the
+ * variable read turns 404 into `unset` and the environment probe turns it into "this user has no
+ * environment", so an uninstall would read as a quiet default rather than as the bot having lost
+ * its access. This carries NO `status` on purpose, so no `=== 404` branch anywhere can match it.
+ *
+ * Nothing read off the network is in it: `appError` is built from developer-authored sentences
+ * and config values (the App slug, the repository name).
+ */
+export class GithubAuthFailure extends Error {
+  readonly appError: AppError;
+
+  constructor(appError: AppError) {
+    super(appError.code);
+    this.name = 'GithubAuthFailure';
+    this.appError = appError;
+  }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -278,6 +343,8 @@ function boundedRetryAfter(ms: number | null): number {
  * file selected by status code, so no upstream body has a path to Discord.
  */
 export function mapGithubError(cause: unknown, operation: string, nowMs: number): AppError {
+  // Already translated by the App auth layer (an uninstalled App): see `GithubAuthFailure`.
+  if (cause instanceof GithubAuthFailure) return cause.appError;
   const f = readGithubFailure(cause, nowMs);
   const internal = redactSecrets(
     `${operation}: ${f.name} status=${f.status}${f.codes.length > 0 ? ` codes=${f.codes.join(',')}` : ''}`,

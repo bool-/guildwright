@@ -26,7 +26,7 @@
  * is a typo waiting to be reviewed as correct.
  */
 
-import type { BuildInfo } from '#core/version';
+import type { BuildInfo, GithubAuthSummary } from '#core/version';
 
 export interface VersionPort {
   /**
@@ -46,6 +46,18 @@ export interface VersionPort {
    * release note, and withholding them costs more than it protects.
    */
   current(): BuildInfo;
+
+  /**
+   * How this process authenticates to GitHub: App slug, repository and installation id, or a
+   * PAT and its expiry date. Render it through `describeGithubAuth` in `#core/version`.
+   *
+   * WHY IT RIDES ON THIS PORT rather than a new capability: it answers the same triage question
+   * as `current()` ("what exactly is this deployment running as?"), it is just as free and just
+   * as non-secret, and `/status` already holds `version`. A module still never sees the adapter
+   * (AGENTS.md rule 1); it sees this plain data, filled in by the composition root once the boot
+   * preflight has learned it, and constant after that.
+   */
+  githubAuth(): GithubAuthSummary;
 }
 
 /** Short alias, matching the style of every other port in `#core/ports`. */

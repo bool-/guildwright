@@ -57,7 +57,7 @@ import { errors, operatorMessage } from '#core/errors';
 import { createEventBus } from '#core/events';
 import { loadConfig, moduleConfigSlice, type AppConfig } from '#core/config';
 import type { AdminPort, CatalogPort, PortRegistry, VersionPort } from '#core/ports';
-import { describeBuild } from '#core/ports';
+import { describeBuild, describeGithubAuth } from '#core/ports';
 import type { DocStore } from '#core/ports/db';
 import { buildCatalog, formatProblems } from '#core/registry';
 
@@ -72,7 +72,7 @@ import {
   type DeployableCommand,
 } from '#adapters/discord/client';
 import { attachRouter } from '#adapters/discord/router';
-import { createGithubAdapter, logPreflightWarnings } from '#adapters/github/index';
+import { createGithubAdapter, logPreflightWarnings, resolveGithubAuth } from '#adapters/github/index';
 import { ensureCoreSchema, openSqlite } from '#adapters/sqlite/db';
 import { readMigrationDir, runCoreMigrations, runMigrations } from '#adapters/sqlite/migrate';
 import { createAccess, fallbacksFromCatalog } from '#adapters/system/access';
@@ -492,8 +492,17 @@ export async function run(env: Readonly<Record<string, string | undefined>> = pr
   // counter would make the limit meaningless to anyone who can bounce the process.
   const rateGate = createRateGate({ db: coreDb });
 
-  const github = createGithubAdapter({
-    token: cfg.github.token,
+  // --- (5a) GITHUB AUTH -----------------------------------------------------------------
+  //
+  // PAT or GitHub App, exactly one (config already refused both and neither). In App mode the
+  // key FILE is read here, and `createGithubAdapter` asks GitHub who the App is and whether its
+  // installation on the module repository is sufficient (src/adapters/github/app-auth.ts):
+  // a key that is not the App's, an App not installed on the repo, a missing permission, or an
+  // install on ALL repositories each refuse to start with the sentence that names the fix.
+  const githubAuth = resolveGithubAuth(cfg.github.auth);
+  if (!githubAuth.ok) return failBoot(githubAuth.error);
+  const githubAdapter = await createGithubAdapter({
+    auth: githubAuth.value,
     repo: { owner: cfg.github.owner, repo: cfg.github.repo },
     clock,
     logger,
@@ -506,6 +515,8 @@ export async function run(env: Readonly<Record<string, string | undefined>> = pr
     workflowFile: cfg.github.workflowFile,
     ref: cfg.github.ref,
   });
+  if (!githubAdapter.ok) return failBoot(githubAdapter.error);
+  const github = githubAdapter.value;
 
   // --- (5b) THE GITHUB PREFLIGHT ---------------------------------------------------------
   //
@@ -534,6 +545,7 @@ export async function run(env: Readonly<Record<string, string | undefined>> = pr
     workflowState: preflight.value.workflowState,
     ref: cfg.github.ref,
     warnings: preflight.value.warnings.length,
+    auth: describeGithubAuth(github.authSummary()),
   });
 
   // Guilds-only unless a module needs message hooks. See client.ts for why the default moved.
@@ -563,7 +575,8 @@ export async function run(env: Readonly<Record<string, string | undefined>> = pr
   };
 
   /** Constant for the life of the process; see `#adapters/system/version` for why. */
-  const versionPort: VersionPort = { current: () => build };
+  // `githubAuth` is read on every /status, after the preflight above has filled in a PAT's expiry.
+  const versionPort: VersionPort = { current: () => build, githubAuth: () => github.authSummary() };
 
   /** One JobsPort per module id; the runner dispatches on `<moduleId>:<type>`. */
   const jobPorts = new Map<string, ReturnType<typeof jobs.portFor>>();
