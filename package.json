@@ -1,0 +1,87 @@
+{
+  "name": "discord-ai-feature-builder",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A modular Discord bot whose flagship module turns /request into a GitHub issue, gates it behind human approval, and has Claude Code implement it as a pull request.",
+  "engines": {
+    "node": ">=24.12.0"
+  },
+  "files": [
+    "dist",
+    "src/core",
+    "tsconfig.module-repo.json",
+    "AGENTS.md",
+    "README.md"
+  ],
+  "exports": {
+    "./core/*": {
+      "types": "./dist/core/*.d.ts",
+      "default": "./dist/core/*.js"
+    },
+    "./testing/*": {
+      "types": "./dist/testing/*.d.ts",
+      "default": "./dist/testing/*.js"
+    },
+    "./events": {
+      "types": "./dist/engine-events.d.ts"
+    },
+    "./main": {
+      "types": "./dist/main.d.ts",
+      "default": "./dist/main.js"
+    },
+    "./loader": {
+      "types": "./dist/loader.d.ts",
+      "default": "./dist/loader.js"
+    },
+    "./tsconfig.module-repo.json": "./tsconfig.module-repo.json",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "start": "node --conditions=source --env-file-if-exists=.env src/main.ts",
+    "dev": "node --conditions=source --watch --env-file-if-exists=.env src/main.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint src test",
+    "test": "node --conditions=source --test --experimental-test-module-mocks \"test/**/*.test.ts\" \"src/**/*.test.ts\"",
+    "check": "npm run typecheck && npm run lint && npm test",
+    "build": "node --conditions=source scripts/build.ts",
+    "prepack": "npm run check && npm run build",
+    "scaffold": "node --conditions=source scripts/scaffold-module.ts"
+  },
+  "dependencies": {
+    "discord.js": "14.27.0",
+    "libsodium-wrappers": "0.8.4",
+    "octokit": "5.0.5",
+    "pino": "10.3.1"
+  },
+  "peerDependencies": {
+    "zod": "4.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "oxlint": "1.81.0",
+    "typescript": "7.0.2"
+  },
+  "imports": {
+    "#core/*": {
+      "source": "./src/core/*.ts",
+      "types": "./dist/core/*.d.ts",
+      "default": "./dist/core/*.js"
+    },
+    "#modules/*": {
+      "source": "./src/modules/*.ts",
+      "types": "./dist/modules/*.d.ts",
+      "default": "./dist/modules/*.js"
+    },
+    "#adapters/*": {
+      "source": "./src/adapters/*.ts",
+      "types": "./dist/adapters/*.d.ts",
+      "default": "./dist/adapters/*.js"
+    },
+    "#testing/*": {
+      "source": "./src/testing/*.ts",
+      "types": "./dist/testing/*.d.ts",
+      "default": "./dist/testing/*.js"
+    }
+  }
+}

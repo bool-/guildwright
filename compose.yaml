@@ -1,0 +1,31 @@
+# One bot, one database. Do not scale this service past 1: two processes on one SQLite file
+# fight over job leases (docs/SETUP.md, "Two bots, one database").
+#
+#   docker compose up -d --build     start, or rebuild after pulling
+#   docker compose logs -f bot       follow the logs
+#   docker compose down              stop (SIGTERM; in-flight jobs finish or checkpoint)
+#
+# To show the running commit in /status, build with it set:
+#   GIT_SHA=$(git rev-parse HEAD) docker compose up -d --build
+
+services:
+  bot:
+    build:
+      context: .
+      args:
+        GIT_SHA: ${GIT_SHA:-}
+    image: discord-bot:latest
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    # tini as PID 1, so SIGTERM reaches node and zombie processes are reaped.
+    init: true
+    # Docker's default is 10 s. The bot's shutdown lets in-flight jobs finish or checkpoint
+    # their lease first, so give it room before Docker sends SIGKILL.
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"

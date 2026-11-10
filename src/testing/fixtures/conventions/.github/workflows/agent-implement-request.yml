@@ -1,0 +1,17 @@
+name: agent-implement-request (fixture)
+on: workflow_dispatch
+jobs:
+  implement:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compose the delimited prompt file
+        run: |
+          {
+            echo "Write a pull request body with a '## Operator action required' section."
+            echo "Name a privileged gateway intent (MESSAGE_CONTENT, GUILD_MEMBERS, GUILD_PRESENCES) under"
+            echo "Privileged Gateway Intents. MESSAGE_CONTENT needs DISCORD_MESSAGE_CONTENT=true and the bot"
+            echo "REFUSES TO START without it. A name added to needs: [...] changes the permissions integer,"
+            echo "so the operator must re-invite the bot. A new key in EnvSchema. A new dependency is"
+            echo "CORE-CHANGE-NEEDED. Anything touching requireOwnCredentials or resolveBuildPayer; the"
+            echo "requester ran /credentials set. Write None. when nothing applies."
+          } > .agent/request.md

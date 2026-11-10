@@ -1,0 +1,241 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # `edited` is here for the TWO jobs that read the pull request BODY:
+    # `require-operator-disclosure` and `require-test-change`. In both, a
+    # contributor turns the check green by writing something in the description
+    # — the missing `## Operator action required` section, or a
+    # `NO-TEST-NEEDED:` line — so both must re-run on a description edit rather
+    # than demanding an empty commit to re-trigger CI.
+    #
+    # The expensive `check` job opts out of it below. A body edit changes no code,
+    # and re-running `npm ci` on every typo in a description is real money against
+    # a 2,000-minute monthly allowance (see the arithmetic in
+    # agent-implement-request.yml).
+    types: [opened, synchronize, reopened, edited]
+  # Lets a PR opened by the agent be re-checked without a push.
+  workflow_dispatch:
+
+# Read-only by default. No job here needs to write anything.
+permissions:
+  contents: read
+
+concurrency:
+  # One run per ref. A new push supersedes an in-flight check.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    # See the `edited` note above: editing a description changes no code, and this
+    # job is the one that costs minutes. On `push` and `workflow_dispatch` there is
+    # no `action`, so the expression is true and the job runs as it always has.
+    if: github.event.action != 'edited'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: "24"
+          cache: npm
+
+      # --ignore-scripts: a dependency's postinstall must not execute in CI.
+      # We have no dependency that needs a build step, so nothing is lost.
+      - name: Install
+        run: npm ci --ignore-scripts
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+  # Fails the build if a PR touches the files that define the bot's own
+  # authorization or CI. The agent cannot edit these (GITHUB_TOKEN has no
+  # `workflows` permission), but a human PR should still be forced to notice.
+  guard-privileged-paths:
+    if: github.event_name == 'pull_request' && github.event.action != 'edited'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Flag changes to privileged paths
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          CHANGED="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
+          printf 'changed files:\n%s\n\n' "$CHANGED"
+          if printf '%s\n' "$CHANGED" | grep -Eq '^\.github/|^src/core/(config|registry)\.ts$'; then
+            echo "::warning::This PR changes CI or core authorization wiring - review it by hand."
+          fi
+          # Hard failure: secrets must never appear in a diff.
+          if printf '%s\n' "$CHANGED" | grep -Eq '(^|/)\.env$|(^|/)\.env\.[^e]|(^|/)\.npmrc$|(^|/)\.ssh/'; then
+            echo "::error::PR touches a secret-bearing path"
+            exit 1
+          fi
+
+  # ------------------------------------------------------------------------
+  # THE FIRST OF THE TWO CHECKS THAT READ THE ACTUAL PULL REQUEST.
+  # (The second is `require-test-change`, at the bottom of this file.)
+  #
+  # Some changes cannot be finished by merging them. A privileged gateway intent
+  # has to be ticked by hand in the Discord Developer Portal. A name added to a
+  # `needs: [...]` array changes the permissions integer in the invite URL, so the
+  # bot must be RE-INVITED before the command works. A new required key in
+  # `EnvSchema` stops the bot at config parse. A new dependency is behind human
+  # approval. None of that is visible in a diff, and all of it lands on one person:
+  # whoever runs this bot.
+  #
+  # AGENTS.md requires an `## Operator action required` section in every PR body,
+  # and the prompt composed in agent-implement-request.yml requires the same of the
+  # agent. `src/conventions.test.ts` asserts that BOTH instructions still exist -
+  # but a unit test cannot see a pull request body, so it polices the instruction
+  # rather than the output. THIS job reads the output. It is the only place the
+  # rule is enforced rather than merely written down.
+  #
+  # "None." passes. An ABSENT section does not, and that asymmetry is the point:
+  # absent and "None." are the same diff to a reviewer, and only one of them is
+  # evidence that somebody checked.
+  # ------------------------------------------------------------------------
+  require-operator-disclosure:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require an Operator action required section in the PR body
+        env:
+          # Through `env:`, never `${{ }}` inside the script. A pull request body is
+          # attacker-controlled text, and a `${{ }}` expression is substituted
+          # TEXTUALLY before the shell parses the line - the same rule the agent
+          # workflow's header states, for exactly the same reason.
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          # GitHub delivers PR bodies with CRLF. Strip the CR once, up front, so
+          # every pattern below can anchor on end-of-line.
+          BODY_FILE="$(mktemp)"
+          printf '%s\n' "$PR_BODY" | tr -d '\r' > "$BODY_FILE"
+
+          if ! grep -qE '^## Operator action required[[:space:]]*$' "$BODY_FILE"; then
+            echo "::error::This pull request has no '## Operator action required' section. Add one listing what only the operator can do - enable a privileged gateway intent, re-invite the bot with a new permissions integer, set a new environment variable or secret, approve a new dependency - or write 'None.' under the heading. See AGENTS.md."
+            exit 1
+          fi
+
+          # The section runs to the next heading of the same level or higher.
+          FILLED="$(awk '
+            /^## Operator action required[ \t]*$/ { inside = 1; next }
+            inside && /^##? / { inside = 0 }
+            inside && NF { print }
+          ' "$BODY_FILE")"
+
+          if [ -z "$FILLED" ]; then
+            echo "::error::The '## Operator action required' section is empty. Write 'None.' if this change needs nothing from the operator, or list what they must do."
+            exit 1
+          fi
+
+          printf 'operator disclosure:\n%s\n' "$FILLED"
+
+  # ------------------------------------------------------------------------
+  # DID ANYBODY ACTUALLY WRITE A TEST?
+  #
+  # AGENTS.md's definition of done has said "you added a test that fails
+  # without your change" since it was written, and until this job existed
+  # nothing looked. That matters more here than in most repos: the premise of
+  # this one is that an AI agent reads that guide and contributes against it,
+  # and an unenforced line in a guide is a line a model may skip on a bad run
+  # at no cost, in a pull request that otherwise looks finished.
+  #
+  # BE HONEST ABOUT WHAT THIS PROVES, because a check trusted for more than it
+  # does is worse than no check at all:
+  #
+  #   It proves a `*.test.ts` file was TOUCHED in the same diff as a `.ts`
+  #   change under `src/`. It does NOT prove the test exercises the change,
+  #   that it fails without the change, or that it asserts anything —
+  #   `test('works', () => {})` passes this job, and so does deleting a test.
+  #   Judging the test is the reviewer's job and cannot be automated here.
+  #
+  # A cheap check stated accurately beats an expensive one stated vaguely.
+  # This is a floor: "somebody opened a test file". The floor is worth having
+  # because the failure it catches is the common one — not a bad test, but no
+  # test at all.
+  #
+  # THE ESCAPE HATCH IS DELIBERATE, AND IT IS NOT SILENT. Some `src/` changes
+  # genuinely have nothing to test: a comment, a rename, a reworded message.
+  # A line reading `NO-TEST-NEEDED: <reason>` in the pull request body passes
+  # this job and puts the reason in front of the reviewer — exactly what
+  # skipping a rule should cost. Same shape as `CORE-CHANGE-NEEDED` in
+  # AGENTS.md: routable around, never routable around quietly.
+  # ------------------------------------------------------------------------
+  require-test-change:
+    # No `action != 'edited'` guard, unlike `guard-privileged-paths`: adding
+    # the `NO-TEST-NEEDED:` line is a body edit, and it has to be able to turn
+    # this job green. The job is a full-history checkout and a `git diff` — no
+    # `npm ci`, so re-running it on a description edit costs seconds.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require a test change alongside any src change
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # Through `env:`, never `${{ }}` inside the script — a pull request
+          # body is attacker-controlled text and a `${{ }}` expression is
+          # substituted TEXTUALLY before the shell parses the line. Same rule,
+          # same reason, as the disclosure gate above.
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          CHANGED="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
+          printf 'changed files:\n%s\n\n' "$CHANGED"
+
+          # Only TypeScript under src/ triggers the rule. A .sql migration, a
+          # docs change or a workflow edit is not the thing AGENTS.md is
+          # talking about, and failing those would train people to reach for
+          # the escape hatch by reflex.
+          if ! printf '%s\n' "$CHANGED" | grep -Eq '^src/.*\.ts$'; then
+            echo "no TypeScript under src/ changed; this rule does not apply"
+            exit 0
+          fi
+
+          # Co-located tests, so the test for a src/ change is itself under
+          # src/ — but a change to test/**/*.test.ts counts too, because a
+          # test living there is still a test.
+          if printf '%s\n' "$CHANGED" | grep -Eq '\.test\.ts$'; then
+            echo "a *.test.ts file changed in the same diff"
+            exit 0
+          fi
+
+          # GitHub delivers PR bodies with CRLF. Strip the CR once so the
+          # pattern can anchor on start-of-line.
+          BODY_FILE="$(mktemp)"
+          printf '%s\n' "$PR_BODY" | tr -d '\r' > "$BODY_FILE"
+          if grep -qE '^[[:space:]]*NO-TEST-NEEDED:[[:space:]]*[^[:space:]]' "$BODY_FILE"; then
+            echo "::notice::src/ changed with no test change, and the PR body declares NO-TEST-NEEDED. A reviewer still has to agree."
+            grep -E '^[[:space:]]*NO-TEST-NEEDED:' "$BODY_FILE"
+            exit 0
+          fi
+
+          echo "::error::This pull request changes TypeScript under src/ but no *.test.ts file. AGENTS.md's definition of done includes a test that fails without your change. Add one - tests are co-located, so <thing>.test.ts sits next to <thing>.ts - or, if there is genuinely nothing to test, put a line reading 'NO-TEST-NEEDED: <reason>' in the pull request body so the reviewer sees the reason instead of nothing."
+          exit 1

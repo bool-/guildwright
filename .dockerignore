@@ -1,0 +1,38 @@
+# Everything listed here never reaches the Docker build context, so it cannot end up in an image.
+
+# Secrets. compose.yaml passes .env in at run time; it must never be baked into a layer.
+.env
+.env.*
+!.env.example
+
+# Runtime state. The database is a volume, not part of the image.
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Reinstalled inside the image by `npm ci`; a host copy may hold Windows-native binaries.
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Repository and tooling that the running bot never reads.
+.git/
+.github/
+.agent/
+.claude/
+.vscode/
+.idea/
+brand/
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# The image files themselves.
+Dockerfile
+compose.yaml
+.dockerignore

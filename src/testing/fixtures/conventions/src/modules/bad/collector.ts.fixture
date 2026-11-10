@@ -1,0 +1,1 @@
+export const wait = (m: { createMessageComponentCollector(): unknown }): unknown => m.createMessageComponentCollector();

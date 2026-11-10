@@ -1,0 +1,27 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Runtime state
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Dependencies / build
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Agent scratch (created inside CI, excluded here as belt-and-braces)
+.agent/
+
+# Logs / OS / editor
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json

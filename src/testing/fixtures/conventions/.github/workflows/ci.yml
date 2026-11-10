@@ -1,0 +1,21 @@
+name: ci (fixture)
+on: pull_request
+jobs:
+  require-operator-disclosure:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require an Operator action required section in the PR body
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          echo "$PR_BODY" | grep -q '^## Operator action required$' || exit 1
+
+  require-test-change:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a test change alongside any src change
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          echo "$PR_BODY" | grep -q 'NO-TEST-NEEDED:' && exit 0
+          exit 1

@@ -1,0 +1,4 @@
+import { Client } from 'discord.js';
+import { helper } from './helper.ts';
+
+export const wall = [Client, helper];
