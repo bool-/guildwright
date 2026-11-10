@@ -1,7 +1,8 @@
 /**
  * `init`, `template check` and `template apply` (RFC-001 9.1, 9.5, section 10 step 4), each over a
- * temp directory, against a fake installed engine whose `template/` is the fixture under
- * `src/testing/fixtures/template/`.
+ * temp directory. Most run against a fake installed engine whose `template/` is the fixture under
+ * `src/testing/fixtures/template/`, which a test can damage freely and which npm can resolve
+ * offline; the "real template" tests at the bottom run against this checkout's own `template/`.
  *
  * The lockfile test runs REAL npm, offline (`npm_config_offline=true`): the fixture template
  * depends only on a `file:` package it ships, so resolving it needs no registry, and `npm ci`
@@ -11,11 +12,12 @@
 
 import { strict as assert } from 'node:assert';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join, relative, sep } from 'node:path';
 import { test } from 'node:test';
 
 import { Ok } from '#core/result';
+import { enginePackageRoot, readPackage } from '#adapters/system/version';
 import { captureIo, ENGINE_NAME, fakeEngineRoot, FIXTURE_ENGINE_VERSION, tempDir } from '#testing/fixtures/cli-io';
 
 import { runCli } from '../cli.ts';
@@ -348,3 +350,86 @@ test('a lockfile that cannot be regenerated is reported, and the stale one is no
   assert.match(c.stderr(), /Run npm install --package-lock-only --ignore-scripts in \. before npm ci/u);
   assert.equal(existsSync(join(repo.dir, 'package-lock.json')), false, 'an out-of-sync lockfile must not survive looking valid');
 });
+
+// ---------------------------------------------------------------------------------------
+// The real template (RFC-001 PR 1.5)
+// ---------------------------------------------------------------------------------------
+
+const REAL_ENGINE = { name: readPackage(enginePackageRoot()).name, version: readPackage(enginePackageRoot()).version };
+
+/** RFC-001 9.1's file list, as `init` writes it: `gitignore` lands as `.gitignore`; no MANIFEST. */
+const NINE_ONE = [
+  '.editorconfig',
+  '.env.example',
+  '.gitattributes',
+  '.github/claude/agent-settings.json',
+  '.github/scripts/verify_approval.py',
+  '.github/workflows/agent-implement-request.yml',
+  '.github/workflows/ci.yml',
+  '.gitignore',
+  '.nvmrc',
+  'AGENTS.md',
+  'README.md',
+  'package-lock.json',
+  'package.json',
+  'src/conventions.test.ts',
+  'src/engine.d.ts',
+  'src/modules/tags/domain.ts',
+  'src/modules/tags/events.d.ts',
+  'src/modules/tags/migrations/0001_init.sql',
+  'src/modules/tags/module.test.ts',
+  'src/modules/tags/module.ts',
+  'src/modules/tags/present.ts',
+  'src/modules/tags/repo.ts',
+  'tsconfig.json',
+];
+
+function filesUnder(dir: string, base = dir): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const abs = join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...filesUnder(abs, base));
+    else out.push(relative(base, abs).split(sep).join('/'));
+  }
+  return out.sort();
+}
+
+test('the real template satisfies the contract, and template check is clean against itself', async () => {
+  const root = enginePackageRoot();
+  const r = readTemplate(root, REAL_ENGINE);
+  assert.ok(r.ok, r.ok ? '' : r.error.internal ?? '');
+  assert.deepEqual([...r.value.gated.keys()], [
+    '.github/claude/agent-settings.json',
+    '.github/scripts/verify_approval.py',
+    '.github/workflows/agent-implement-request.yml',
+    '.github/workflows/ci.yml',
+    'AGENTS.md',
+  ]);
+  const c = captureIo(join(root, 'template'));
+  assert.equal(await runCli(['template', 'check'], c.io, { engineRoot: root }), 0, c.all());
+  assert.ok(c.stdout().includes(`5 gated files match the installed engine's template (engine ${REAL_ENGINE.version})`), c.stdout());
+});
+
+test('init from the real template writes exactly the 9.1 tree, pins the engine, and passes template check', async (t) => {
+  const parent = tempDir('cli-real-init-');
+  t.after(parent.cleanup);
+  const root = enginePackageRoot();
+  const regen = recordingRegenerator();
+  const c = captureIo(parent.dir);
+  assert.equal(await runCli(['init', 'my-bot'], c.io, { engineRoot: root, regenerateLockfile: regen.regenerate }), 0, c.all());
+  const target = join(parent.dir, 'my-bot');
+
+  assert.deepEqual(filesUnder(target), NINE_ONE);
+  const pkg = JSON.parse(readFileSync(join(target, 'package.json'), 'utf8')) as { dependencies: Record<string, string>; imports: Record<string, string> };
+  assert.equal(pkg.dependencies[REAL_ENGINE.name], REAL_ENGINE.version, 'the <version> placeholder became the installed engine version');
+  assert.equal(pkg.imports['#adapters/*'], undefined, 'a module repo has no path to an adapter');
+  assert.ok(
+    readFileSync(join(target, 'src', 'modules', 'tags', 'migrations', '0001_init.sql')).equals(readFileSync(join(root, 'template', 'src', 'modules', 'tags', 'migrations', '0001_init.sql'))),
+    'the tags migration is copied byte for byte',
+  );
+  assert.match(readFileSync(join(target, '.gitignore'), 'utf8'), /^\.env$/mu, 'the secrets rules arrive as .gitignore');
+
+  const check = captureIo(target);
+  assert.equal(await runCli(['template', 'check'], check.io, { engineRoot: root }), 0, check.all());
+});
+

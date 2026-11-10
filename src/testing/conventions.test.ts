@@ -157,3 +157,90 @@ test('the fixture README of intent: the shipped fixture files are all masked', (
   assert.deepEqual(bare, []);
   assert.ok(readFileSync(join(FIXTURE, 'AGENTS.md'), 'utf8').includes('Operator action required'));
 });
+
+// ---------------------------------------------------------------------------------------
+// The module-repo template (RFC-001 PR 1.5)
+// ---------------------------------------------------------------------------------------
+
+const TEMPLATE = join(REPO, 'template');
+
+test('the template passes the module-repo suite, carrying every DISCLOSURES needle in its AGENTS.md', () => {
+  // `root: template/` with no `coreDir`: exactly the call a module repo makes, minus the engine
+  // contract (the template's package.json still holds the `<version>` placeholder `init` fills).
+  const { tap, status } = runHelper(`{ root: ${JSON.stringify(TEMPLATE)} }`, scratch);
+  const { passed, failed } = tapNames(tap);
+  assert.equal(status, 0, `the template must pass the module-repo conventions:\n${tap}`);
+  assert.deepEqual(failed, []);
+  assert.equal(passed.length, 11);
+  // The needles are asserted by this test of the helper, against the template's own AGENTS.md.
+  assert.ok(passed.includes('AGENTS.md documents the same `## Operator action required` rule'));
+  assert.ok(passed.includes('CI still fails a pull request whose body omits the section'));
+});
+
+/** A copy of the template as `init` leaves it: the engine pinned to this checkout's version. */
+function initialisedTemplate(): string {
+  const dest = mkdtempSync(join(scratch, 'module-repo-'));
+  cpSync(TEMPLATE, dest, { recursive: true });
+  const engine = JSON.parse(readFileSync(join(REPO, 'package.json'), 'utf8')) as { name: string; version: string };
+  const pkgPath = join(dest, 'package.json');
+  const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as { dependencies: Record<string, string> };
+  pkg.dependencies[engine.name] = engine.version;
+  writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
+  return dest;
+}
+
+const CONTRACT = [
+  'package.json pins the engine to an exact version',
+  'the pinned engine version is the installed one',
+  "every gated file matches the installed engine's template",
+  'the agent workflow has LF line endings',
+];
+
+test('with engineContract, the initialised template passes all four contract tests', () => {
+  const root = initialisedTemplate();
+  const { tap, status } = runHelper(`{ root: ${JSON.stringify(root)}, engineContract: true }`, scratch);
+  const { passed, failed } = tapNames(tap);
+  assert.equal(status, 0, tap);
+  assert.deepEqual(failed, []);
+  assert.equal(passed.length, 11 + CONTRACT.length);
+  for (const name of CONTRACT) assert.ok(passed.includes(name), name);
+});
+
+test('the engine contract fails a ranged pin, a pin to another version, and a drifted or CRLF gate file, by name', () => {
+  const ranged = initialisedTemplate();
+  const engine = JSON.parse(readFileSync(join(REPO, 'package.json'), 'utf8')) as { name: string; version: string };
+  const pkgPath = join(ranged, 'package.json');
+  const pin = (spec: string): void => {
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as { dependencies: Record<string, string> };
+    pkg.dependencies[engine.name] = spec;
+    writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
+  };
+  const contractFailures = (root: string): { readonly failed: string[]; readonly tap: string } => {
+    const { tap } = runHelper(`{ root: ${JSON.stringify(root)}, engineContract: true }`, scratch);
+    return { failed: tapNames(tap).failed.filter((n) => CONTRACT.includes(n)).sort(), tap };
+  };
+
+  pin(`^${engine.version}`);
+  const caret = contractFailures(ranged);
+  assert.deepEqual(caret.failed, ['package.json pins the engine to an exact version', 'the pinned engine version is the installed one'].sort(), caret.tap);
+  assert.ok(caret.tap.includes('Pin an exact version'), caret.tap);
+
+  pin('9.9.9');
+  const other = contractFailures(ranged);
+  assert.deepEqual(other.failed, ['the pinned engine version is the installed one'], other.tap);
+  assert.ok(other.tap.includes('Run npm ci'), other.tap);
+
+  const drifted = initialisedTemplate();
+  const ci = join(drifted, '.github', 'workflows', 'ci.yml');
+  writeFileSync(ci, `${readFileSync(ci, 'utf8')}# a local edit\n`);
+  const edit = contractFailures(drifted);
+  assert.deepEqual(edit.failed, ["every gated file matches the installed engine's template"], edit.tap);
+  assert.ok(edit.tap.includes('.github/workflows/ci.yml: differs from the engine'), edit.tap);
+  assert.ok(edit.tap.includes('template apply and commit'), edit.tap);
+
+  const crlf = initialisedTemplate();
+  const wf = join(crlf, '.github', 'workflows', 'agent-implement-request.yml');
+  writeFileSync(wf, readFileSync(wf, 'utf8').replace(/\n/gu, '\r\n'));
+  const cr = contractFailures(crlf);
+  assert.deepEqual(cr.failed, ["every gated file matches the installed engine's template", 'the agent workflow has LF line endings'].sort(), cr.tap);
+});

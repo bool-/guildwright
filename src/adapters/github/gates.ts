@@ -11,8 +11,8 @@
  *
  * Anyone with write access to that repository can edit them, and a merged edit weakens every
  * later build without the bot noticing. So before a build is filed or signed, the bot reads those
- * three files AT THE REF THE DISPATCH WILL RUN, hashes them, and compares each to the engine's own
- * copy. A mismatch disables builds (`/request new` refuses, `/status` says `builder: down`
+ * three files AT THE REF THE DISPATCH WILL RUN, hashes them, and compares each to the digest the
+ * installed engine's template records for it. A mismatch disables builds (`/request new` refuses, `/status` says `builder: down`
  * naming the files); `/help` and every other module keep working.
  *
  * WHY PER DISPATCH, NOT PER BOOT: drift merged an hour after boot is exactly as dangerous as
@@ -24,20 +24,19 @@
  * The files are read AT THE RESOLVED SHA, not at the ref name, so a push landing between the two
  * reads cannot produce a verdict about a commit that never existed.
  *
- * WHERE THE EXPECTED DIGESTS COME FROM, TODAY. RFC-001 says "the installed engine's
- * `template/MANIFEST.json`"; that manifest is written by `scripts/build.ts` once PR 1.5 adds
- * `template/`, and does not exist yet. Until then the reference is the engine's OWN copies of the
- * three files, read from the engine package root (`package.json` `files` ships them), which is
- * byte-identical to what the template will carry (`build.test.ts` will assert that in 1.2/1.5).
- * PR 1.5 swaps `readEngineGateFiles` for a manifest read; nothing else here changes.
+ * WHERE THE EXPECTED DIGESTS COME FROM: the installed engine's `template/MANIFEST.json`
+ * (RFC-001 5.4, 9.4), which `scripts/build.ts` writes over the template's `.github/**` and
+ * `AGENTS.md`, read and verified by `#adapters/system/template-manifest` - the same parser
+ * `template check` and `template apply` use, so the bot and the CLI cannot disagree about which
+ * bytes are right. `build.test.ts` asserts that the template's three gate files are
+ * byte-identical to the engine's own `.github` copies, so in the engine checkout this is the same
+ * reference the engine's own files would give.
  *
  * NO OVERRIDE FLAG, deliberately (RFC-001 section 12, decision 5). A group that needs a different
  * workflow changes it in the engine, where the contract tests see it.
  */
 
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import type { Octokit } from 'octokit';
 import { z } from 'zod';
 import { Err, Ok, type Result } from '#core/result';
@@ -46,6 +45,7 @@ import { redactSecrets } from '#core/text';
 import { CLI_BIN } from '#core/version';
 import type { GitRef, LoggerPort, WorkflowFile } from '#core/ports';
 import { GithubAuthFailure, readGithubFailure, type GithubRepo } from '#adapters/github/client';
+import { TEMPLATE_DIR, TEMPLATE_MANIFEST, readTemplateManifest } from '#adapters/system/template-manifest';
 
 // ---------------------------------------------------------------------------------------
 // A narrow request seam
@@ -112,29 +112,34 @@ export function gateFileMap(workflowFile: WorkflowFile): readonly { readonly rep
   ];
 }
 
+/** "Builds are disabled" because the reference itself is unusable; fail-closed, not retryable. */
+function referenceError(why: string): AppError {
+  return errors.config(
+    'engine.gates',
+    `Builds are disabled: the engine's ${TEMPLATE_DIR}/${TEMPLATE_MANIFEST} cannot be used (${why}), so the repository's gate files cannot be checked.`,
+    'Reinstall the engine (npm ci) so its template/ directory is intact, then restart.',
+  );
+}
+
 /**
- * The expected digests, from the engine package's own copies of the three files.
+ * The expected digests, from the installed engine's `template/MANIFEST.json`.
  *
  * An `Err` here is not fatal at boot (the builder reports `down` with it; `/help` keeps working),
  * and it is fail-CLOSED: an engine that cannot say what its gates should be cannot say that the
- * repository's match, so no build runs. PR 1.5 replaces this with a `template/MANIFEST.json` read.
+ * repository's match, so no build runs. That covers a missing or malformed manifest, one written
+ * for another engine version, one whose own files do not match it, and one that does not list
+ * all three gate files.
  */
-export function readEngineGateFiles(engineRoot: string, workflowFile: WorkflowFile): Result<readonly GateFile[], AppError> {
+export function readTemplateGateFiles(engineRoot: string, engineVersion: string, workflowFile: WorkflowFile): Result<readonly GateFile[], AppError> {
+  const manifest = readTemplateManifest(engineRoot, engineVersion);
+  if (!manifest.ok) {
+    return Err(referenceError(manifest.error.kind === 'missing' ? `${engineRoot} ships no ${TEMPLATE_DIR}/ directory` : manifest.error.reason));
+  }
   const out: GateFile[] = [];
   for (const { repoPath, enginePath } of gateFileMap(workflowFile)) {
-    let bytes: Uint8Array;
-    try {
-      bytes = readFileSync(join(engineRoot, ...enginePath.split('/')));
-    } catch {
-      return Err(
-        errors.config(
-          'engine.gates',
-          `Builds are disabled: the engine's own copy of ${enginePath} is missing from ${engineRoot}, so the repository's gate files cannot be checked.`,
-          'Reinstall the engine (npm ci) so its gate files are present, then restart.',
-        ),
-      );
-    }
-    out.push({ repoPath, sha256: sha256Hex(bytes) });
+    const sha256 = manifest.value.gated.get(enginePath);
+    if (sha256 === undefined) return Err(referenceError(`it does not list ${enginePath}`));
+    out.push({ repoPath, sha256 });
   }
   return Ok(out);
 }

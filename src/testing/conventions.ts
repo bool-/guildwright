@@ -22,9 +22,11 @@
  */
 
 import { strict as assert } from 'node:assert';
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 export interface ConventionOptions {
   /** Repo root; AGENTS.md and .github are read from here. */
@@ -35,7 +37,32 @@ export interface ConventionOptions {
   readonly coreDir?: string;
   /** Files allowed to contain `as never`. Engine: the octokit dispatch file; module repo: `[]`. */
   readonly allowedAsNever?: readonly string[];
+  /**
+   * Module repo: `true` (RFC-001 9.4). Adds the engine contract: `package.json` pins the engine to
+   * an exact version, that version is the installed one, every gated file (`.github/**`,
+   * `AGENTS.md`) has the digest the installed engine's `template/MANIFEST.json` records, and the
+   * agent workflow has LF line endings - the offline mirror of the bot's per-dispatch gate check.
+   */
+  readonly engineContract?: boolean;
+  /**
+   * The engine whose template the repo must match, for `engineContract`. Default: the engine
+   * this file belongs to - `node_modules/<engine>/` when imported from an installed engine, the
+   * checkout when imported from source. For tests.
+   */
+  readonly engineRoot?: string;
 }
+
+/**
+ * The package root of the engine this file ships in: two up from `src/testing/` in a checkout,
+ * or from `dist/testing/` in an installed engine. Computed here rather than imported, because
+ * this file must stay importable with no `#` subpath (a child `node --test` imports it bare).
+ */
+function ownEngineRoot(): string {
+  return fileURLToPath(new URL('../../', import.meta.url));
+}
+
+/** An exact version: what ties a module repo to ONE engine's ports and gate files. */
+const EXACT_VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u;
 
 /** Directories never walked: dependencies, build output, VCS metadata, runtime data. */
 const SKIP_DIRS = new Set(['node_modules', 'dist', '.git', 'data']);
@@ -152,6 +179,7 @@ export function registerConventionTests(opts: ConventionOptions): void {
     path: relative(root, f).replaceAll('\\', '/'),
     code: stripComments(readFileSync(f, 'utf8')),
   }));
+  const engineRoot = resolve(opts.engineRoot ?? ownEngineRoot());
   const isTest = (f: SourceFile): boolean => f.path.endsWith('.test.ts');
   const nonTest = all.filter((f) => !isTest(f));
   const underDir = (f: SourceFile, dir: string): boolean => f.path.startsWith(`${dir}/`);
@@ -490,4 +518,87 @@ export function registerConventionTests(opts: ConventionOptions): void {
       'the gate must FAIL the run; a warning is a rule nobody has to obey',
     );
   });
+  // -------------------------------------------------------------------------------------
+  // The engine contract (module repo only, RFC-001 9.4)
+  // -------------------------------------------------------------------------------------
+  //
+  // WHY IN THE CONVENTION SUITE: the engine version and the gate files under `.github/` must
+  // move together - "I bumped the engine" and "I re-copied the gates" is ONE commit. The bot
+  // refuses to build when they disagree (the per-dispatch digest check); these tests say so on
+  // the pull request, offline, before anything merges.
+
+  if (opts.engineContract === true) {
+    const engineManifest = readJsonFile(join(engineRoot, 'package.json'));
+    const engineName = stringField(engineManifest, 'name');
+    const engineVersion = stringField(engineManifest, 'version');
+    const binField: unknown = typeof engineManifest === 'object' && engineManifest !== null ? Reflect.get(engineManifest, 'bin') : undefined;
+    const bin = typeof binField === 'object' && binField !== null ? (Object.keys(binField)[0] ?? engineName) : engineName;
+    const fix = `run npx ${bin ?? '<engine>'} template apply and commit`;
+    const pinned = (): string | undefined => {
+      const deps: unknown = Reflect.get(Object(readJsonFile(join(root, 'package.json'))), 'dependencies');
+      const spec: unknown = typeof deps === 'object' && deps !== null && engineName !== undefined ? Reflect.get(deps, engineName) : undefined;
+      return typeof spec === 'string' ? spec : undefined;
+    };
+
+    test('package.json pins the engine to an exact version', () => {
+      assert.ok(engineName !== undefined, `the installed engine at ${engineRoot} has no package.json name`);
+      const spec = pinned();
+      assert.ok(spec !== undefined, `package.json does not list ${engineName} under "dependencies". A module repo depends on the engine at one exact version.`);
+      assert.match(
+        spec,
+        EXACT_VERSION,
+        `package.json asks for ${engineName}@${spec}. Pin an exact version - no ^, ~, >=, *, latest, git or file: specifiers - because the engine's ports are this repo's compile target and its template is this repo's gate files.`,
+      );
+    });
+
+    test('the pinned engine version is the installed one', () => {
+      assert.ok(engineVersion !== undefined, `the installed engine at ${engineRoot} has no package.json version`);
+      assert.equal(pinned(), engineVersion, `package.json pins ${engineName ?? 'the engine'}@${pinned() ?? '(nothing)'} but ${engineVersion} is installed. Run npm ci.`);
+    });
+
+    test("every gated file matches the installed engine's template", () => {
+      const manifestPath = join(engineRoot, 'template', 'MANIFEST.json');
+      const manifest = readJsonFile(manifestPath);
+      assert.ok(typeof manifest === 'object' && manifest !== null, `${manifestPath} is missing or is not JSON; reinstall the engine (npm ci).`);
+      assert.equal(
+        stringField(manifest, 'engineVersion'),
+        engineVersion,
+        `${manifestPath} was written for another engine version than the installed ${engineVersion ?? '(unknown)'}; reinstall the engine (npm ci).`,
+      );
+      const files: unknown = Reflect.get(manifest, 'files');
+      assert.ok(typeof files === 'object' && files !== null && Object.keys(files).length > 0, `${manifestPath} lists no gated files.`);
+      const drifted: string[] = [];
+      for (const [path, digest] of Object.entries(files)) {
+        const local = join(root, ...path.split('/'));
+        if (!existsSync(local)) drifted.push(`${path}: missing from this repository; ${fix}.`);
+        else if (createHash('sha256').update(readFileSync(local)).digest('hex') !== digest) {
+          drifted.push(`${path}: differs from the engine's copy (engine ${engineVersion ?? '?'}); ${fix}.`);
+        }
+      }
+      assert.deepEqual(drifted, [], `gated files do not match the installed engine's template:\n  ${drifted.join('\n  ')}`);
+    });
+
+    test('the agent workflow has LF line endings', () => {
+      // A CR in a `run:` block is `command not found` on a Linux runner, and it moves the digest,
+      // so the bot would refuse to build. `.gitattributes` pins LF; this proves it held.
+      const raw = readFileSync(join(root, '.github/workflows/agent-implement-request.yml'));
+      assert.ok(
+        !raw.includes(0x0d),
+        '.github/workflows/agent-implement-request.yml contains CR characters. Restore it with LF line endings (.gitattributes: * text=auto eol=lf).',
+      );
+    });
+  }
+}
+
+function readJsonFile(path: string): unknown {
+  try {
+    return JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function stringField(value: unknown, name: string): string | undefined {
+  const v: unknown = typeof value === 'object' && value !== null ? Reflect.get(value, name) : undefined;
+  return typeof v === 'string' ? v : undefined;
 }

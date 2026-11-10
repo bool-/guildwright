@@ -1,0 +1,31 @@
+# Secrets - never commit. The agent's settings also deny reading ./secrets/** and .env.
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+
+# Runtime state: the SQLite database holds approvals, the job queue and the audit log.
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Dependencies (npm ci reinstalls them from package-lock.json)
+node_modules/
+*.tsbuildinfo
+
+# Agent scratch (created inside CI, excluded here as belt-and-braces)
+.agent/
+
+# Logs / OS / editor
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json

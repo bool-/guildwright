@@ -6,6 +6,7 @@
  */
 
 import { strict as assert } from 'node:assert';
+import { createHash } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -28,17 +29,24 @@ function fakeZod(root: string, version: string): void {
   writeJson(join(root, 'node_modules', 'zod', 'package.json'), { name: 'zod', version, main: 'index.js' });
 }
 
-/** An installed engine at `version`: its package.json and the three gate files the fake GitHub serves. */
+/**
+ * An installed engine at `version`: its package.json, and a `template/` holding the three gate
+ * files the fake GitHub serves with the `MANIFEST.json` that records them, which is where the
+ * gate check reads its reference digests.
+ */
 function engineAt(dir: string, version: string): string {
   writeJson(join(dir, 'package.json'), { name: ENGINE_NAME, version, peerDependencies: { zod: '4.5.4' } });
+  const files: Record<string, string> = {};
   for (const [path, body] of [
     [WORKFLOW_PATH, ENGINE_FILES.workflow],
     [VERIFIER, ENGINE_FILES.verifier],
     [SETTINGS, ENGINE_FILES.settings],
   ] as const) {
-    mkdirSync(join(dir, ...path.split('/').slice(0, -1)), { recursive: true });
-    writeFileSync(join(dir, ...path.split('/')), body);
+    mkdirSync(join(dir, 'template', ...path.split('/').slice(0, -1)), { recursive: true });
+    writeFileSync(join(dir, 'template', ...path.split('/')), body);
+    files[path] = createHash('sha256').update(body, 'utf8').digest('hex');
   }
+  writeJson(join(dir, 'template', 'MANIFEST.json'), { engineVersion: version, files });
   return dir;
 }
 

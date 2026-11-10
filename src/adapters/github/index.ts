@@ -89,7 +89,7 @@ export {
   createGateCheck,
   gateDriftError,
   githubRequester,
-  readEngineGateFiles,
+  readTemplateGateFiles,
   sha256Hex,
   type GateFile,
   type GithubRequest,
@@ -206,9 +206,8 @@ export interface GithubAdapterInput {
   /** The installed engine's version, for the drift sentence. */
   readonly engineVersion: string;
   /**
-   * The gate files' expected sha256 digests, from `readEngineGateFiles` (the engine's own copies;
-   * PR 1.5 replaces them with `template/MANIFEST.json`), or why there are none. Fail-closed: an
-   * `Err` disables builds.
+   * The gate files' expected sha256 digests, from `readTemplateGateFiles` (the installed engine's
+   * `template/MANIFEST.json`), or why there are none. Fail-closed: an `Err` disables builds.
    */
   readonly gateReference: Result<readonly GateFile[], AppError>;
   /** Transport override, for tests; see `githubOctokitClass`. */

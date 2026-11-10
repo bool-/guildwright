@@ -1,0 +1,9 @@
+# Normalize to LF in the repository. CRLF in a workflow `run:` block breaks
+# Linux runners with `$'\r': command not found`, so this is correctness, not style.
+* text=auto eol=lf
+
+# Never touch binaries
+*.png binary
+*.jpg binary
+*.ico binary
+*.db  binary

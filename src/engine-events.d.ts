@@ -14,4 +14,3 @@
  * `src/` and in `dist/`, where `scripts/build.ts` copies these files byte for byte.
  */
 import './modules/builder/events.js';
-import './modules/tags/events.js';

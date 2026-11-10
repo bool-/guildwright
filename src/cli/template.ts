@@ -2,8 +2,9 @@
  * THE MODULE-REPO TEMPLATE, as the CLI reads it: `init`, `template check`, `template apply`
  * (RFC-001 9.1, 9.4, 9.5, section 10 step 4).
  *
- * THE INTERFACE THE TEMPLATE MUST PROVIDE (PR 1.5 builds the real one; the fixture under
- * `src/testing/fixtures/template/` is the contract's worked example):
+ * THE INTERFACE THE TEMPLATE MUST PROVIDE. The real one is `template/` at the engine's package
+ * root (RFC-001 PR 1.5); the fixture under `src/testing/fixtures/template/` is the smallest tree
+ * that satisfies the same contract, for the tests that need npm to resolve it offline:
  *
  *   <engineRoot>/template/                the whole tree `init` writes, verbatim except below
  *   <engineRoot>/template/MANIFEST.json   { "engineVersion": "<the engine's package.json version>",
@@ -15,59 +16,47 @@
  * inconsistent. A listed path outside `.github/` and `AGENTS.md` is refused too: `apply` must be
  * unable, by construction, to touch `src/`.
  *
- * Three files are NOT copied verbatim by `init`:
+ * The manifest is read and verified by `#adapters/system/template-manifest`, the same parser the
+ * per-dispatch gate-file check uses, so the CLI and the bot cannot disagree about it.
+ *
+ * Four files are NOT copied verbatim by `init`:
  *   - `MANIFEST.json` is engine metadata, never written into a module repo;
  *   - `package.json` is rewritten: `dependencies[<engine name>]`, when the template lists the
  *     engine, is set to the INSTALLED engine's exact version, and `--existing` keeps the repo's
  *     own `name`;
  *   - `package-lock.json` is never copied: it is regenerated against the rewritten
  *     `package.json` (`npm install --package-lock-only --ignore-scripts`), because a copied or a
- *     left-over lockfile out of sync with it makes every `npm ci` in the spec fail.
+ *     left-over lockfile out of sync with it makes every `npm ci` in the spec fail;
+ *   - `gitignore` is written as `.gitignore` (`RENAMED_ON_INIT`): npm never ships a file named
+ *     `.gitignore`, so the template stores it without the dot.
  */
 
-import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, sep } from 'node:path';
 
-import { z } from 'zod';
-
 import { errors, type AppError } from '#core/errors';
 import { Err, Ok, type Result } from '#core/result';
 import { CLI_BIN, type PackageIdentity } from '#core/version';
+import { TEMPLATE_MANIFEST, readTemplateManifest, sha256Hex, type TemplateManifest } from '#adapters/system/template-manifest';
 
 import { EXIT_OK, EXIT_PROBLEM, describeAppError, type CliIo } from './io.ts';
 
-export const TEMPLATE_DIR = 'template';
-export const TEMPLATE_MANIFEST = 'MANIFEST.json';
+export { TEMPLATE_DIR, TEMPLATE_MANIFEST, isGatedPath, sha256Hex } from '#adapters/system/template-manifest';
 
 /** The fix every drift sentence names. */
 export const TEMPLATE_APPLY_FIX = `run npx ${CLI_BIN} template apply and commit`;
 
-const Sha256 = z.string().regex(/^[0-9a-f]{64}$/u);
-const ManifestSchema = z.object({
-  engineVersion: z.string().min(1),
-  files: z.record(z.string(), Sha256),
-});
+/**
+ * Template files stored under another name, because `npm pack` would drop them, and the name
+ * `init` writes them under. npm never ships a `.gitignore` (it reads it as ignore rules for the
+ * directory instead), and a module repository without one commits its `.env` on the first
+ * `git add .`.
+ */
+export const RENAMED_ON_INIT: ReadonlyMap<string, string> = new Map([['gitignore', '.gitignore']]);
 
-/** A gated path: under `.github/`, or `AGENTS.md`. Nothing else may be listed. */
-export function isGatedPath(path: string): boolean {
-  if (path.includes('\\') || path.startsWith('/') || path.split('/').some((seg) => seg === '..' || seg === '.' || seg === '')) return false;
-  return path === 'AGENTS.md' || path.startsWith('.github/');
-}
-
-/** The installed engine's template, verified. */
-export interface Template {
-  /** Absolute `<engineRoot>/template`. */
-  readonly root: string;
-  readonly engineVersion: string;
-  /** Gated path -> sha256, sorted by path. */
-  readonly gated: ReadonlyMap<string, string>;
-}
-
-export function sha256Hex(bytes: Uint8Array): string {
-  return createHash('sha256').update(bytes).digest('hex');
-}
+/** The installed engine's template, verified (`#adapters/system/template-manifest`). */
+export type Template = TemplateManifest;
 
 function templateError(internal: string, nextStep = 'Reinstall the engine (npm ci); if it persists, the engine package is broken and should be reported.'): AppError {
   return errors.config('template', internal, nextStep);
@@ -75,50 +64,17 @@ function templateError(internal: string, nextStep = 'Reinstall the engine (npm c
 
 /** Read and verify `<engineRoot>/template` against its manifest and the engine's own version. */
 export function readTemplate(engineRoot: string, engine: PackageIdentity): Result<Template, AppError> {
-  const root = join(engineRoot, TEMPLATE_DIR);
-  if (!existsSync(root) || !statSync(root).isDirectory()) {
+  const r = readTemplateManifest(engineRoot, engine.version);
+  if (r.ok) return r;
+  if (r.error.kind === 'missing') {
     return Err(
       templateError(
-        `the installed engine (${engine.name}@${engine.version} at ${engineRoot}) ships no ${TEMPLATE_DIR}/ directory, so there is nothing to copy or compare against.`,
+        `the installed engine (${engine.name}@${engine.version} at ${engineRoot}) ships no template/ directory, so there is nothing to copy or compare against.`,
         'Install an engine version that ships the module-repo template (RFC-001 PR 1.5 adds it), then run this again.',
       ),
     );
   }
-  let raw: unknown;
-  try {
-    raw = JSON.parse(readFileSync(join(root, TEMPLATE_MANIFEST), 'utf8'));
-  } catch {
-    return Err(templateError(`${TEMPLATE_DIR}/${TEMPLATE_MANIFEST} is missing or is not JSON in ${engineRoot}.`));
-  }
-  const parsed = ManifestSchema.safeParse(raw);
-  if (!parsed.success) return Err(templateError(`${TEMPLATE_DIR}/${TEMPLATE_MANIFEST} does not have the expected shape: ${z.prettifyError(parsed.error)}`));
-  const manifest = parsed.data;
-  if (manifest.engineVersion !== engine.version) {
-    return Err(
-      templateError(
-        `${TEMPLATE_DIR}/${TEMPLATE_MANIFEST} was written for engine ${manifest.engineVersion}, but the engine is ${engine.version}; its gate digests describe another release.`,
-      ),
-    );
-  }
-  const gated = new Map<string, string>();
-  for (const path of Object.keys(manifest.files).sort()) {
-    const digest = manifest.files[path] ?? '';
-    if (!isGatedPath(path)) {
-      return Err(templateError(`${TEMPLATE_DIR}/${TEMPLATE_MANIFEST} lists ${path}, which is not under .github/ and is not AGENTS.md; template apply may only ever rewrite those.`));
-    }
-    let bytes: Uint8Array;
-    try {
-      bytes = readFileSync(join(root, ...path.split('/')));
-    } catch {
-      return Err(templateError(`${TEMPLATE_DIR}/${TEMPLATE_MANIFEST} lists ${path}, but ${TEMPLATE_DIR}/${path} does not exist.`));
-    }
-    if (sha256Hex(bytes) !== digest) {
-      return Err(templateError(`${TEMPLATE_DIR}/${path} does not match the digest ${TEMPLATE_MANIFEST} records for it; the installed template is inconsistent.`));
-    }
-    gated.set(path, digest);
-  }
-  if (gated.size === 0) return Err(templateError(`${TEMPLATE_DIR}/${TEMPLATE_MANIFEST} lists no gated files.`));
-  return Ok({ root, engineVersion: manifest.engineVersion, gated });
+  return Err(templateError(r.error.reason));
 }
 
 /** Every file under `dir`, as sorted POSIX paths relative to it. */
@@ -347,11 +303,12 @@ export function init(io: CliIo, template: Template, engine: PackageIdentity, opt
       continue;
     }
     const source = readFileSync(join(template.root, ...path.split('/')));
-    const dest = join(target, ...path.split('/'));
+    const destPath = RENAMED_ON_INIT.get(path) ?? path;
+    const dest = join(target, ...destPath.split('/'));
     const before = readOrNull(dest);
     if (before !== null && before.equals(source)) continue;
     writeBytes(dest, source);
-    written.push(before === null ? path : `${path} (replaced)`);
+    written.push(before === null ? destPath : `${destPath} (replaced)`);
   }
   const pkgPath = join(target, 'package.json');
   const pkgBefore = readOrNull(pkgPath);

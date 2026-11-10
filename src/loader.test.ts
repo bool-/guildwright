@@ -117,7 +117,7 @@ test('the real src/modules tree is discovered, and every module imports', async 
   //
   // What is actually worth asserting is that the modules we ship are still here, and that
   // EVERY module present imports cleanly — including ones added later.
-  for (const shipped of ['builder', 'help', 'tags']) {
+  for (const shipped of ['builder', 'help', 'ping']) {
     assert.ok(ids.includes(shipped), `the shipped "${shipped}" module must be discovered`);
   }
   assert.deepEqual(found.value.quarantined, [], 'no module in the tree may fail to import');
@@ -130,7 +130,7 @@ test('the real src/modules tree is discovered, and every module imports', async 
 });
 
 test('a bare absolute path does NOT import on Windows, and pathToFileURL does', { skip: process.platform !== 'win32' }, async () => {
-  const entry = join(defaultModulesDir(), 'tags', 'module.ts');
+  const entry = join(defaultModulesDir(), 'ping', 'module.ts');
 
   // THE BUG THIS FILE EXISTS TO PIN DOWN. If this ever stops rejecting, the loader can be
   // simplified; until then, removing `pathToFileURL` breaks the bot on every Windows machine.

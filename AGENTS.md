@@ -1,7 +1,8 @@
 # AGENTS.md
 
 Rules that are **not** inferable from reading the code. Everything else: read
-`src/core/module.ts`, run `npm run scaffold`, and read `src/modules/tags/` as the worked example.
+`src/core/module.ts`, run `npm run scaffold`, and read `template/src/modules/tags/` as the
+worked example.
 
 This repo is extended by AI agents on purpose — that is what the `builder` module does. So the
 contracts are built to make a wrong contribution *fail to compile* rather than fail in production.
@@ -9,8 +10,8 @@ If you are fighting the types, you are almost always doing something the design 
 
 ## Start here
 
-1. Read exactly two things: `src/core/module.ts` and `src/modules/tags/`. That is enough to write
-   a module. You do **not** need to read `src/adapters/**` — ever.
+1. Read exactly two things: `src/core/module.ts` and `template/src/modules/tags/`. That is enough
+   to write a module. You do **not** need to read `src/adapters/**` — ever.
 2. **Generate a new module; never hand-create the folder.**
 
    ```bash
@@ -19,10 +20,11 @@ If you are fighting the types, you are almost always doing something the design 
 
    What it writes already compiles, already lints and already passes its own test, with every
    mandatory field written out rather than defaulted — so your first `npm run check` measures
-   *your* change instead of your boilerplate. Then edit it, reading `src/modules/tags/` as the
-   worked example of a finished one. The folder name **is** the module id, the SQL table prefix,
-   and half of every `custom_id`. Pass `--db` when the module stores anything: it also writes the
-   `migrations/` folder, without which `migrations: true` quarantines the module at boot.
+   *your* change instead of your boilerplate. Then edit it, reading `template/src/modules/tags/`
+   as the worked example of a finished one. The folder name **is** the module id, the SQL table
+   prefix, and half of every `custom_id`. Pass `--db` when the module stores anything: it also
+   writes the `migrations/` folder, without which `migrations: true` quarantines the module at
+   boot.
 3. Definition of done: `npm run check` passes (typecheck → lint → test), you added a test that
    fails without your change — the `require-test-change` job fails a pull request that touches a
    `.ts` file under `src/` while no `*.test.ts` file in the diff changed, so this one is checked

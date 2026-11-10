@@ -84,7 +84,7 @@ import {
   type DeployableCommand,
 } from '#adapters/discord/client';
 import { attachRouter } from '#adapters/discord/router';
-import { createGithubAdapter, logPreflightWarnings, readEngineGateFiles, resolveGithubAuth } from '#adapters/github/index';
+import { createGithubAdapter, logPreflightWarnings, readTemplateGateFiles, resolveGithubAuth } from '#adapters/github/index';
 import { ensureCoreSchema, openSqlite } from '#adapters/sqlite/db';
 import { readMigrationDir, runCoreMigrations, runMigrations } from '#adapters/sqlite/migrate';
 import { createAccess, fallbacksFromCatalog } from '#adapters/system/access';
@@ -553,7 +553,7 @@ export async function run(env: Readonly<Record<string, string | undefined>> = pr
       ? { requireOwnCredentials: builderRequiresOwnCredentials(cfg.modules) }
       : null,
     engineVersion: build.engine.version,
-    gateReference: readEngineGateFiles(enginePackageRoot(), cfg.github.workflowFile),
+    gateReference: readTemplateGateFiles(enginePackageRoot(), build.engine.version, cfg.github.workflowFile),
   });
   if (!githubAdapter.ok) return failBoot(githubAdapter.error);
   const github = githubAdapter.value;

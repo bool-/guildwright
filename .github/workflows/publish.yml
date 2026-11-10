@@ -1,0 +1,108 @@
+name: publish
+
+# OWNER-RUN RELEASE (RFC-001 4.1, 9.1 "The lockfile", PR 1.5). Publishes the engine to npm with
+# provenance, then proves the module-repo template installs from what was just published, by
+# generating the template's package-lock.json against it - which is the only place that lockfile
+# can come from: it pins the published engine, so it cannot exist before the publish.
+#
+# INERT BY DESIGN until the owner opts in, in three independent ways:
+#   1. `workflow_dispatch` only. No push, tag or schedule trigger: nothing publishes because a
+#      commit landed.
+#   2. Without a repository secret named NPM_TOKEN the job stops at its first step, green, having
+#      published nothing. Adding that secret is the owner's decision, and an operator action.
+#   3. `package.json` is `"private": true` until RFC-001 PR 1.8, and npm refuses to publish a
+#      private package.
+#
+# RELEASE CHECKLIST: bump `version` in package.json, run `npm run build` (it regenerates
+# template/MANIFEST.json, whose `engineVersion` must equal the package version), commit both,
+# merge, then run this workflow from main. `npm run check` below fails if the manifest is stale.
+#
+# Not here yet (PR 1.8): pushing the generated tree, lockfile included, to the template
+# repository so "Use this template" yields it. Until then the generated lockfile is verified
+# (`npm ci` + `npm run check` against the published engine) and discarded.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write # npm provenance: the registry verifies this run built the tarball
+    steps:
+      - name: Stop unless the NPM_TOKEN secret is set
+        id: gate
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$NPM_TOKEN" ]; then
+            echo "::notice::NPM_TOKEN is not set, so nothing was published. Add the repository secret to enable releases."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - if: steps.gate.outputs.enabled == 'true'
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install
+        if: steps.gate.outputs.enabled == 'true'
+        run: npm ci --ignore-scripts
+
+      # The full gate, pack-and-install test included (CI is set on Actions), then the build.
+      # `npm publish` would run them again through `prepack`; running them here first makes a
+      # failure a red step with its own log rather than a failed publish.
+      - name: Check and build
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          npm run check
+          npm run build
+          git diff --exit-code -- template/ || { echo "::error::npm run build changed template/; commit the regenerated files first."; exit 1; }
+
+      - name: Publish with provenance
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public --ignore-scripts
+
+      # THE TEMPLATE LOCKFILE (RFC-001 9.1). `init` writes the template tree pinned to the version
+      # just published and runs `npm install --package-lock-only --ignore-scripts` against the
+      # registry; `npm ci` and `npm run check` then prove the pair installs and is green.
+      - name: Generate and verify the template lockfile against the published engine
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          NAME="$(node -p "require('./package.json').name")"
+          VERSION="$(node -p "require('./package.json').version")"
+          OUT="$RUNNER_TEMP/template-repo"
+          # The registry can take a moment to serve a version it has just accepted.
+          for attempt in 1 2 3 4 5 6; do
+            if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then break; fi
+            sleep 20
+          done
+          npx --yes "$NAME@$VERSION" init "$OUT"
+          cd "$OUT"
+          npm ci --ignore-scripts
+          npm run check
+          npx "$NAME" template check
+          echo "template lockfile generated and verified for $NAME@$VERSION"

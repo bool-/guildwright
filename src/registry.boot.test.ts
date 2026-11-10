@@ -91,7 +91,9 @@ test('the real module tree installs into a registry — i.e. the bot would boot'
   // test; adding a module is a one-line, deliberate edit here.
   assert.deepEqual(
     [...reg.modules.keys()].sort(),
-    ['access', 'admin', 'builder', 'credentials', 'help', 'ping', 'tags'],
+    // `tags` is not here: it moved to the module-repo template (RFC-001 PR 1.5), and is booted
+    // from there only by the pack-and-install test in src/build.test.ts.
+    ['access', 'admin', 'builder', 'credentials', 'help', 'ping'],
     'the shipped module roster changed',
   );
   // `/request new`, not `/request`: the flagship gained three siblings (`list`, `cancel`,

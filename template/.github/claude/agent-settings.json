@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(**/.env)",
+      "Read(./secrets/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.ssh/**)",
+      "Read(~/.npmrc)",
+      "Edit(./.github/**)",
+      "Edit(**/.github/**)",
+      "Bash(curl *)",
+      "Bash(wget *)",
+      "Bash(nc *)",
+      "Bash(env)",
+      "Bash(printenv *)",
+      "Bash(export *)",
+      "Bash(git remote *)",
+      "Bash(git config *)",
+      "Bash(npm publish *)",
+      "Bash(gh secret *)",
+      "Bash(gh workflow *)",
+      "Bash(gh api *)",
+      "WebFetch",
+      "WebSearch",
+      "mcp__*"
+    ],
+    "allow": [
+      "Bash(npm ci)",
+      "Bash(npm test*)",
+      "Bash(npm run *)",
+      "Bash(node *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git status)",
+      "Bash(git diff *)",
+      "Bash(git push -u origin *)"
+    ]
+  }
+}

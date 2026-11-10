@@ -4,6 +4,10 @@
   "private": true,
   "type": "module",
   "description": "A modular Discord bot whose flagship module turns /request into a GitHub issue, gates it behind human approval, and has Claude Code implement it as a pull request.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bool-/guildwright.git"
+  },
   "engines": {
     "node": ">=24.12.0"
   },
@@ -16,9 +20,7 @@
     "tsconfig.module-repo.json",
     "AGENTS.md",
     "README.md",
-    ".github/workflows/agent-implement-request.yml",
-    ".github/scripts/verify_approval.py",
-    ".github/claude/agent-settings.json"
+    "template"
   ],
   "exports": {
     "./core/*": {

@@ -866,7 +866,8 @@ and the decisions a copy tends to inherit silently are visible instead. Nothing 
 editing: the loader finds the folder on the next boot. Drop `--db` if the module stores nothing;
 keep it if it does, because it also writes the `migrations/` folder that `migrations: true`
 requires. Read [`AGENTS.md`](../AGENTS.md) first; it documents the rules that are not inferable
-from the code, and `src/modules/tags/` is the worked example of a finished module.
+from the code, and `template/src/modules/tags/` (in a module repository built from the template,
+`src/modules/tags/`) is the worked example of a finished module.
 
 ### Where a future change will tell you it needs you
 
