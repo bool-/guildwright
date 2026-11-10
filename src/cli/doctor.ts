@@ -35,7 +35,7 @@ import { checkEnginePin, describeGithubAuth, type PackageIdentity } from '#core/
 import {
   PAT_MODE_WARNING,
   createGithubAdapter,
-  readEngineGateFiles,
+  readTemplateGateFiles,
   resolveGithubAuth,
   type GithubRequest,
 } from '#adapters/github/index';
@@ -179,7 +179,7 @@ async function githubChecks(
     allowPublicTargetRepo: cfg.github.allowPublicTargetRepo,
     builder: builderLoads ? { requireOwnCredentials: builderRequiresOwnCredentials(cfg.modules) } : null,
     engineVersion: readPackage(deps.engineRoot).version,
-    gateReference: readEngineGateFiles(deps.engineRoot, cfg.github.workflowFile),
+    gateReference: readTemplateGateFiles(deps.engineRoot, readPackage(deps.engineRoot).version, cfg.github.workflowFile),
     ...(deps.fetch === undefined ? {} : { fetch: deps.fetch }),
     ...(deps.probeRequest === undefined ? {} : { probeRequest: deps.probeRequest }),
   });

@@ -3,8 +3,10 @@
  *
  * WHAT IS BEING PROVEN:
  *
- *  1. THE REFERENCE IS THE ENGINE'S OWN BYTES, and the workflow compared is the one the bot
- *     DISPATCHES (`GITHUB_WORKFLOW_FILE`), so a renamed copy is checked rather than skipped.
+ *  1. THE REFERENCE IS THE INSTALLED ENGINE'S `template/MANIFEST.json` - verified against the
+ *     template's own bytes and the engine version, and equal to the engine's own `.github`
+ *     copies - and the workflow compared is the one the bot DISPATCHES (`GITHUB_WORKFLOW_FILE`),
+ *     so a renamed copy is checked rather than skipped.
  *  2. THE FILES ARE READ AT THE COMMIT THE DISPATCH WOULD RUN, by SHA, not by ref name.
  *  3. THE CACHE RE-READS ONLY WHEN THE REF'S SHA MOVES: one commit read per check otherwise.
  *  4. DRIFT AFTER THE FIRST CHECK IS CAUGHT BY THE NEXT ONE, with no restart.
@@ -12,13 +14,14 @@
  */
 
 import { strict as assert } from 'node:assert';
-import { readFileSync } from 'node:fs';
+import { cpSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
 import { Ok } from '#core/result';
 import { toGitRef, toWorkflowFile, type WorkflowFile } from '#core/ports';
-import { enginePackageRoot } from '#adapters/system/version';
+import { enginePackageRoot, readPackage } from '#adapters/system/version';
+import { tempDir } from '#testing/fixtures/cli-io';
 import { fakeLogger } from '#testing/fakes';
 import {
   AGENT_SETTINGS_PATH,
@@ -26,7 +29,7 @@ import {
   TEMPLATE_APPLY_COMMAND,
   VERIFIER_PATH,
   createGateCheck,
-  readEngineGateFiles,
+  readTemplateGateFiles,
   readinessSentence,
   sha256Hex,
 } from '#adapters/github/gates';
@@ -50,7 +53,7 @@ function wf(name = 'agent-implement-request.yml'): WorkflowFile {
   return r.value;
 }
 
-function check(gh: FakeGithub, reference: ReturnType<typeof readEngineGateFiles> = Ok(engineReference())) {
+function check(gh: FakeGithub, reference: ReturnType<typeof readTemplateGateFiles> = Ok(engineReference())) {
   const ref = toGitRef('main');
   if (!ref.ok) throw new Error('fixture ref is invalid');
   return createGateCheck({
@@ -69,40 +72,74 @@ function check(gh: FakeGithub, reference: ReturnType<typeof readEngineGateFiles>
 // The reference
 // ---------------------------------------------------------------------------------------
 
-test("the reference is the engine package root's own three files, compared at the dispatched workflow path", () => {
+test("the reference is the template manifest's digests, which are the engine's own three files, at the dispatched workflow path", () => {
   const root = enginePackageRoot();
-  const got = readEngineGateFiles(root, wf('renamed-agent.yml'));
+  const got = readTemplateGateFiles(root, readPackage(root).version, wf('renamed-agent.yml'));
   assert.ok(got.ok, got.ok ? '' : readinessSentence(got.error));
   if (!got.ok) return;
   const bytes = (p: string): Buffer => readFileSync(join(root, ...p.split('/')));
   assert.deepEqual(got.value, [
-    // The repository's copy is whatever GITHUB_WORKFLOW_FILE names; the engine's is always this one.
+    // The repository's copy is whatever GITHUB_WORKFLOW_FILE names; the template's is always this one.
     { repoPath: '.github/workflows/renamed-agent.yml', sha256: sha256Hex(bytes(ENGINE_WORKFLOW_PATH)) },
     { repoPath: '.github/scripts/verify_approval.py', sha256: sha256Hex(bytes(VERIFIER_PATH)) },
     { repoPath: '.github/claude/agent-settings.json', sha256: sha256Hex(bytes(AGENT_SETTINGS_PATH)) },
   ]);
 });
 
-test('an engine without its own gate files disables builds rather than trusting the repository', async () => {
-  const missing = readEngineGateFiles(join(enginePackageRoot(), 'no-such-dir'), wf());
-  assert.ok(!missing.ok);
-  if (missing.ok) return;
-  assert.match(
-    missing.error.internal ?? '',
-    /^Builds are disabled: the engine's own copy of \.github\/workflows\/agent-implement-request\.yml is missing/u,
-  );
+/** A copy of the engine's package.json and template/, to damage without touching the repository. */
+function engineCopy(dir: string): string {
+  const root = enginePackageRoot();
+  writeFileSync(join(dir, 'package.json'), readFileSync(join(root, 'package.json')));
+  cpSync(join(root, 'template'), join(dir, 'template'), { recursive: true });
+  return dir;
+}
 
+test('an engine whose template manifest cannot be used disables builds rather than trusting the repository', async (t) => {
+  const { dir, cleanup } = tempDir('gates-engine-');
+  t.after(cleanup);
+  const version = readPackage(enginePackageRoot()).version;
+
+  const none = readTemplateGateFiles(dir, version, wf());
+  assert.ok(!none.ok);
+  if (none.ok) return;
+  assert.match(none.error.internal ?? '', /^Builds are disabled: the engine's template\/MANIFEST\.json cannot be used \(.+ ships no template\/ directory\)/u);
+  assert.equal(none.error.retryable, false);
   const gh = fakeGithub();
-  const verdict = await check(gh, missing).verify();
+  const verdict = await check(gh, none).verify();
   assert.equal(verdict.kind, 'blocked');
   assert.equal(gh.calls.length, 0, 'nothing to compare against, so nothing is asked');
+
+  // Written for another release: its digests describe another release's gates.
+  const copy = engineCopy(dir);
+  const other = readTemplateGateFiles(copy, '9.9.9', wf());
+  assert.ok(!other.ok);
+  assert.match(other.ok ? '' : (other.error.internal ?? ''), /written for engine .+, but the engine is 9\.9\.9/u);
+
+  // A template file that no longer matches its own manifest: the installed engine is inconsistent.
+  writeFileSync(join(copy, 'template', '.github', 'scripts', 'verify_approval.py'), 'print("tampered")\n');
+  const lying = readTemplateGateFiles(copy, version, wf());
+  assert.ok(!lying.ok);
+  assert.match(lying.ok ? '' : (lying.error.internal ?? ''), /template\/\.github\/scripts\/verify_approval\.py does not match the digest/u);
 });
 
-test('the published package carries the three reference files', () => {
-  // An installed engine is a `node_modules` tree; without these in `files` it would have nothing
-  // to compare against and would refuse every build. PR 1.5 replaces them with MANIFEST.json.
+test('a manifest that does not list all three gate files disables builds', (t) => {
+  const { dir, cleanup } = tempDir('gates-engine-');
+  t.after(cleanup);
+  const copy = engineCopy(dir);
+  const manifestPath = join(copy, 'template', 'MANIFEST.json');
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { files: Record<string, string> };
+  delete manifest.files[AGENT_SETTINGS_PATH];
+  writeFileSync(manifestPath, JSON.stringify(manifest));
+  const got = readTemplateGateFiles(copy, readPackage(copy).version, wf());
+  assert.ok(!got.ok);
+  assert.match(got.ok ? '' : (got.error.internal ?? ''), /it does not list \.github\/claude\/agent-settings\.json/u);
+});
+
+test('the published package carries template/, where the reference lives', () => {
+  // An installed engine is a `node_modules` tree; without `template` in `files` it would have
+  // nothing to compare against and would refuse every build.
   const pkg: { files: string[] } = JSON.parse(readFileSync(join(enginePackageRoot(), 'package.json'), 'utf8'));
-  for (const p of [ENGINE_WORKFLOW_PATH, VERIFIER_PATH, AGENT_SETTINGS_PATH]) assert.ok(pkg.files.includes(p), p);
+  assert.ok(pkg.files.includes('template'));
 });
 
 // ---------------------------------------------------------------------------------------

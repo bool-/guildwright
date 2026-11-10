@@ -93,7 +93,7 @@ the outcome by polling, which also means a bot that was offline mid-build recove
 | `/admin jobs` — counts by state, and the oldest running job's age, so "is anything stuck?" has an answer rather than a disclaimer | server managers (`admin.view`) |
 | `/admin audit` — who decided what, which authorization layer allowed it, and which module recorded it; pageable and filterable by action, actor or layer | server managers (`admin.view`) |
 | `/credentials set` · `status` · `clear` | anyone (`credentials.manage`) |
-| `/tag get` · `/tag set` | anyone / server managers |
+| `/tag get` · `/tag set` — not an engine built-in: the worked-example module in the module-repo template (`template/src/modules/tags/`) | anyone / server managers |
 | `/help`, `/status` | anyone |
 
 Approving a build (`builder.approve`) is granted to **nobody** by default, because it spends money.

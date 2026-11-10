@@ -20,21 +20,35 @@
  *     GitHub Actions does) or when `ENGINE_PACK_TEST=1` is set: AGENTS.md promises that
  *     `npm run check` runs offline, and a laptop on a train must still be able to run the gate.
  *     It also skips when npm cannot be found next to this Node.
+ *  3. THE MODULE-REPO TEMPLATE (RFC-001 9, PR 1.5). Offline: the template's gate files are
+ *     byte-identical to the engine's, its AGENTS.md is the engine's with exactly the
+ *     substitutions of `agentsSubstitutions()`, its MANIFEST.json is current, and the tarball
+ *     carries the whole tree. Network-bound, under the same switch as 2: `init` into a temp dir,
+ *     `npm ci` against the packed tarball, `scaffold demo --db`, `npm run check` green, `template
+ *     check` clean through the installed bin, and `doctor --offline` listing `tags` and `demo`
+ *     from MODULE_DIRS beside the six built-ins.
  */
 
 import { strict as assert } from 'node:assert';
 import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, sep } from 'node:path';
 import { after, before, test } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+import { Err, Ok, type Result } from '#core/result';
+import { captureIo } from '#testing/fixtures/cli-io';
+
+import { agentsSubstitutions, engineFacts, syncTemplate, templateAgentsMd, templateManifest } from '../scripts/build.ts';
+import { runCli } from './cli.ts';
+
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const SRC = join(ROOT, 'src');
 const DIST = join(ROOT, 'dist');
+const TEMPLATE = join(ROOT, 'template');
 const FIXTURES = join(SRC, 'testing', 'fixtures');
 const PKG = 'discord-ai-feature-builder';
 
@@ -104,7 +118,9 @@ function tempDir(prefix: string): string {
 
 before(() => {
   // The real npm script's command line, minus npm: `node --conditions=source scripts/build.ts`.
-  const r = spawnSync(process.execPath, ['--conditions=source', join(ROOT, 'scripts', 'build.ts')], {
+  // `--skip-template`: a build REWRITES a stale template/AGENTS.md or MANIFEST.json, and the
+  // template tests below must see what is COMMITTED, not what this build just fixed.
+  const r = spawnSync(process.execPath, ['--conditions=source', join(ROOT, 'scripts', 'build.ts'), '--skip-template'], {
     cwd: ROOT,
     encoding: 'utf8',
     timeout: 180_000,
@@ -251,6 +267,178 @@ test('tsconfig.module-repo.json is this repo tsconfig minus the source condition
 });
 
 // ---------------------------------------------------------------------------------------
+// 3a. The module-repo template, offline (RFC-001 4.3, 9)
+// ---------------------------------------------------------------------------------------
+
+/** The three files the boot digest check reads: byte-equal in the engine and the template. */
+const GATE_FILES = ['.github/workflows/agent-implement-request.yml', '.github/scripts/verify_approval.py', '.github/claude/agent-settings.json'];
+
+test("the template's three gate files are byte-identical to the engine's own", () => {
+  // The engine extends itself with the same workflow and gates a module repo runs. A one-byte
+  // difference would make every module repo that is correct by the template fail the engine's
+  // own checks, or the reverse.
+  for (const path of GATE_FILES) {
+    assert.equal(sha256(join(TEMPLATE, ...path.split('/'))), sha256(join(ROOT, ...path.split('/'))), `template/${path} differs from ${path}`);
+  }
+});
+
+test("template/AGENTS.md is the engine's AGENTS.md with exactly the substitutions applied", () => {
+  const facts = engineFacts();
+  const engine = readFileSync(join(ROOT, 'AGENTS.md'), 'utf8');
+  const committed = readFileSync(join(TEMPLATE, 'AGENTS.md'), 'utf8');
+  assert.equal(committed, templateAgentsMd(engine, facts), 'template/AGENTS.md is stale: run npm run build and commit it');
+  // Each substitution landed, and the engine-only sentences it replaces are gone.
+  for (const sub of agentsSubstitutions(facts)) {
+    assert.ok(committed.includes(sub.replace), `substitution "${sub.why}" is missing from template/AGENTS.md`);
+  }
+  assert.ok(!committed.includes('--conditions=source --test'), 'a module repo runs no source condition');
+  assert.ok(!committed.includes('template/src/modules/tags/'), 'a module repo has the worked example at src/modules/tags/');
+  assert.ok(committed.includes(`npx ${facts.bin} invite-url`));
+  assert.ok(committed.includes(facts.repoUrl), 'a core change is routed to the engine repository');
+});
+
+test('an AGENTS.md edit that moves a substituted sentence fails the build, naming the substitution', () => {
+  const engine = readFileSync(join(ROOT, 'AGENTS.md'), 'utf8').replace('live in `src/core/permissions.ts`.', 'live in the permissions file.');
+  assert.throws(() => templateAgentsMd(engine, engineFacts()), /substitution "3\. the permissions integer" expected 1 occurrence/u);
+});
+
+test('template/MANIFEST.json is current, written for this engine version, and covers exactly .github/** and AGENTS.md', () => {
+  assert.deepEqual(syncTemplate(ROOT, { write: false }), [], 'the template is stale: run npm run build and commit template/AGENTS.md and template/MANIFEST.json');
+  const manifest = readJson(join(TEMPLATE, 'MANIFEST.json')) as { engineVersion: string; files: Record<string, string> };
+  assert.equal(manifest.engineVersion, (readJson(join(ROOT, 'package.json')) as { version: string }).version);
+  const gated = walkTree(TEMPLATE).filter((p) => p.startsWith('.github/') || p === 'AGENTS.md');
+  assert.deepEqual(Object.keys(manifest.files).sort(), gated);
+  for (const [path, digest] of Object.entries(manifest.files)) {
+    assert.equal(sha256(join(TEMPLATE, ...path.split('/'))), digest, `the MANIFEST digest of ${path} does not match its bytes`);
+  }
+});
+
+test('the build writes a stale MANIFEST.json and AGENTS.md, and leaves an up-to-date tree alone', () => {
+  const copy = tempDir('engine-template-');
+  writeFileSync(join(copy, 'package.json'), readFileSync(join(ROOT, 'package.json')));
+  writeFileSync(join(copy, 'AGENTS.md'), readFileSync(join(ROOT, 'AGENTS.md')));
+  cpSync(TEMPLATE, join(copy, 'template'), { recursive: true });
+  writeFileSync(join(copy, 'template', 'AGENTS.md'), 'stale\n');
+  writeFileSync(join(copy, 'template', 'MANIFEST.json'), '{}\n');
+
+  assert.deepEqual(syncTemplate(copy, { write: false }), ['template/AGENTS.md', 'template/MANIFEST.json']);
+  assert.equal(readFileSync(join(copy, 'template', 'MANIFEST.json'), 'utf8'), '{}\n', 'write: false writes nothing');
+  assert.deepEqual(syncTemplate(copy, { write: true }), ['template/AGENTS.md', 'template/MANIFEST.json']);
+  assert.ok(readFileSync(join(copy, 'template', 'AGENTS.md')).equals(readFileSync(join(TEMPLATE, 'AGENTS.md'))));
+  assert.ok(readFileSync(join(copy, 'template', 'MANIFEST.json')).equals(readFileSync(join(TEMPLATE, 'MANIFEST.json'))));
+  assert.deepEqual(syncTemplate(copy, { write: true }), [], 'idempotent');
+  assert.equal(templateManifest(join(copy, 'template'), 'x').includes('"engineVersion": "x"'), true);
+});
+
+test("the template ci.yml is the engine's four jobs, minus the engine-only path, plus template-sync on the same pinned actions", () => {
+  const engine = readFileSync(join(ROOT, '.github', 'workflows', 'ci.yml'), 'utf8');
+  const tpl = readFileSync(join(TEMPLATE, '.github', 'workflows', 'ci.yml'), 'utf8');
+  const jobs = (yaml: string): string[] => [...yaml.matchAll(/^ {2}([a-z-]+):$/gmu)].map((m) => m[1] ?? '');
+  assert.deepEqual(jobs(tpl), [...jobs(engine), 'template-sync']);
+  assert.ok(!tpl.includes('|^src/core/(config|registry)'), 'the privileged-path warning drops src/core: a module repository has none');
+  assert.ok(engine.includes('|^src/core/(config|registry)'), 'sanity: the engine still warns on it');
+  const uses = (yaml: string): Set<string> => new Set([...yaml.matchAll(/uses:\s*(\S+)/gu)].map((m) => m[1] ?? ''));
+  assert.deepEqual(uses(tpl), uses(engine), 'template-sync must pin the same action SHAs as the engine');
+  const sync = tpl.slice(tpl.indexOf('  template-sync:'));
+  assert.match(sync, /run: npm ci --ignore-scripts/u);
+  assert.match(sync, new RegExp(`run: npx ${PKG} template check`, 'u'));
+  // Every engine job body is carried over: the disclosure and test-change gates byte for byte.
+  for (const job of ['require-operator-disclosure', 'require-test-change']) {
+    const body = (yaml: string): string => {
+      const at = yaml.indexOf(`  ${job}:`);
+      // To the next job, or the comment banner that opens one.
+      const next = yaml.slice(at + 3).search(/^ {2}(?:[a-z-]+:$|# -{20})/mu);
+      return next === -1 ? yaml.slice(at) : yaml.slice(at, at + 3 + next);
+    };
+    assert.equal(body(tpl).trimEnd(), body(engine).trimEnd(), `${job} differs between the engine and the template`);
+  }
+});
+
+test('the template names the engine one way: dependency, imports, tsconfig, engine.d.ts, scripts', () => {
+  // The package is renamed in RFC-001 PR 1.8; this makes every place that rename must reach a
+  // red assertion here rather than a module repo that cannot resolve #core/*.
+  const tpl = readJson(join(TEMPLATE, 'package.json')) as {
+    dependencies: Record<string, string>;
+    devDependencies: Record<string, string>;
+    imports: Record<string, string>;
+    scripts: Record<string, string>;
+  };
+  assert.deepEqual(Object.keys(tpl.dependencies).sort(), [PKG, 'zod'].sort());
+  assert.equal(tpl.dependencies[PKG], '<version>', 'init replaces the placeholder with the installed version');
+  assert.equal(tpl.dependencies['zod'], pkg.peerDependencies?.['zod'], 'zod at exactly the engine peer pin, or two copies break every manifest');
+  for (const dev of ['@types/node', 'oxlint', 'typescript']) assert.equal(tpl.devDependencies[dev], pkg.devDependencies?.[dev], dev);
+  assert.deepEqual(tpl.imports, { '#core/*': `${PKG}/core/*`, '#modules/*': './src/modules/*.ts', '#testing/*': `${PKG}/testing/*` });
+  for (const script of ['start', 'scaffold', 'doctor']) assert.equal(tpl.scripts[script], `${PKG} ${script}`);
+  assert.ok(!JSON.stringify(tpl.scripts).includes('--conditions=source'), 'a module repo runs the compiled engine');
+  assert.deepEqual(readJson(join(TEMPLATE, 'tsconfig.json')), { extends: `${PKG}/tsconfig.module-repo.json`, include: ['src/**/*.ts', 'src/**/*.d.ts'] });
+  assert.equal(readFileSync(join(TEMPLATE, 'src', 'engine.d.ts'), 'utf8'), `import '${PKG}/events';\n`);
+  assert.equal(
+    readFileSync(join(TEMPLATE, 'src', 'conventions.test.ts'), 'utf8'),
+    "import { registerConventionTests } from '#testing/conventions';\nregisterConventionTests({ root: process.cwd(), engineContract: true });\n",
+  );
+});
+
+test('the template .env.example documents every variable the engine .env.example does', () => {
+  const vars = (path: string): Set<string> => new Set([...readFileSync(path, 'utf8').matchAll(/^#?\s*([A-Z][A-Z0-9_]+)=/gmu)].map((m) => m[1] ?? ''));
+  const engine = vars(join(ROOT, '.env.example'));
+  const tpl = vars(join(TEMPLATE, '.env.example'));
+  assert.ok(engine.size > 10);
+  assert.deepEqual([...engine].filter((v) => !tpl.has(v)), []);
+  assert.ok(!existsSync(join(TEMPLATE, '.env')), 'the template never carries a .env');
+});
+
+test("the tags migration is byte-identical to the one existing installs recorded in core_migrations", () => {
+  // RFC-001 section 10 step 4: the owner's database has applied this file, and the ledger
+  // refuses to boot when an applied file's checksum moves. This is that checksum.
+  assert.equal(sha256(join(TEMPLATE, 'src', 'modules', 'tags', 'migrations', '0001_init.sql')), '781860656b3c36452cbe4d568c960108f4588b402f0a31adb90cc52bc25f8753');
+  assert.ok(!existsSync(join(SRC, 'modules', 'tags')), 'tags is no longer an engine built-in');
+});
+
+test('publish.yml can only be run by hand, and publishes nothing without an NPM_TOKEN secret', () => {
+  const yaml = readFileSync(join(ROOT, '.github', 'workflows', 'publish.yml'), 'utf8');
+  const on = yaml.slice(yaml.indexOf('\non:'), yaml.indexOf('\npermissions:'));
+  assert.deepEqual([...on.matchAll(/^ {2}([a-z_]+):/gmu)].map((m) => m[1]), ['workflow_dispatch'], 'no push, tag or schedule trigger');
+  const gate = yaml.indexOf('id: gate');
+  assert.ok(gate !== -1 && gate < yaml.indexOf('uses: actions/checkout@'), 'the NPM_TOKEN gate is the first step');
+  // Every step after the gate is conditional on it.
+  const steps = yaml.slice(gate).split(/\n {6}- /u).slice(1);
+  assert.ok(steps.length >= 5);
+  for (const step of steps) assert.match(step, /if: steps\.gate\.outputs\.enabled == 'true'/u, step.split('\n')[0]);
+  assert.match(yaml, /npm publish --provenance/u);
+  assert.match(yaml, /init "\$OUT"[\s\S]*npm ci --ignore-scripts[\s\S]*npm run check/u, 'the template lockfile is generated and proven installable');
+});
+
+/** Every file under `dir` as sorted POSIX paths (no fixture skipping: for template/). */
+function walkTree(dir: string, base: string = dir): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const abs = join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...walkTree(abs, base));
+    else if (entry.isFile()) out.push(relative(base, abs).split(sep).join('/'));
+  }
+  return out.sort();
+}
+
+test('npm pack ships the whole template, dotfiles included, and no lockfile for it', { timeout: 120_000 }, (t) => {
+  // npm never packs a file named `.gitignore`, which is why the template stores `gitignore` and
+  // `init` renames it. Every other dotfile must survive packing, or `init` writes a repo without it.
+  const npmCli = findNpmCli();
+  if (npmCli === null) {
+    t.skip('npm could not be found next to this Node');
+    return;
+  }
+  const r = spawnSync(process.execPath, [npmCli, 'pack', '--dry-run', '--ignore-scripts', '--json'], { cwd: ROOT, encoding: 'utf8', timeout: 120_000 });
+  assert.equal(r.status, 0, output(r));
+  const [manifest] = JSON.parse(r.stdout) as [{ files: { path: string }[] }];
+  const shipped = new Set(manifest.files.map((f) => f.path).filter((p) => p.startsWith('template/')).map((p) => p.slice('template/'.length)));
+  assert.deepEqual([...shipped].sort(), walkTree(TEMPLATE));
+  for (const p of ['gitignore', '.gitattributes', '.editorconfig', '.nvmrc', '.env.example', 'MANIFEST.json', '.github/workflows/ci.yml']) assert.ok(shipped.has(p), p);
+  // RFC-001 9.1 "The lockfile": it pins the PUBLISHED engine, so it cannot exist in the tarball
+  // that publishes it; `init` and publish.yml generate it.
+  assert.ok(!shipped.has('package-lock.json'));
+});
+
+// ---------------------------------------------------------------------------------------
 // 2. Pack and install
 // ---------------------------------------------------------------------------------------
 
@@ -338,6 +526,18 @@ console.log(JSON.stringify({
 }));
 `;
 
+/** `npm pack` once per run, shared by the two pack tests. `--ignore-scripts`: `prepack` is `npm run check`, which would run this file. */
+let packedOnce: { readonly tarball: string; readonly shipped: ReadonlySet<string> } | null = null;
+function packEngine(npmCli: string): { readonly tarball: string; readonly shipped: ReadonlySet<string> } {
+  if (packedOnce !== null) return packedOnce;
+  const packDir = tempDir('engine-pack-');
+  const packed = spawnSync(process.execPath, [npmCli, 'pack', '--ignore-scripts', '--json', '--pack-destination', packDir], { cwd: ROOT, encoding: 'utf8', timeout: 240_000 });
+  assert.equal(packed.status, 0, output(packed));
+  const [manifest] = JSON.parse(packed.stdout) as [{ filename: string; files: { path: string }[] }];
+  packedOnce = { tarball: join(packDir, manifest.filename), shipped: new Set(manifest.files.map((f) => f.path)) };
+  return packedOnce;
+}
+
 test('pack, install into a module repo, typecheck it there, and discover its modules', { timeout: 300_000 }, (t) => {
   // Network-bound, so opt-in: CI always runs it; locally, `ENGINE_PACK_TEST=1 npm test` does.
   if (process.env['CI'] === undefined && process.env['ENGINE_PACK_TEST'] === undefined) {
@@ -352,12 +552,8 @@ test('pack, install into a module repo, typecheck it there, and discover its mod
   const npm = (args: readonly string[], cwd: string): SpawnSyncReturns<string> =>
     spawnSync(process.execPath, [npmCli, ...args], { cwd, encoding: 'utf8', timeout: 240_000 });
 
-  // --- pack. `--ignore-scripts`: `prepack` is `npm run check`, which would run this test. --------
-  const packDir = tempDir('engine-pack-');
-  const packed = npm(['pack', '--ignore-scripts', '--json', '--pack-destination', packDir], ROOT);
-  assert.equal(packed.status, 0, output(packed));
-  const [manifest] = JSON.parse(packed.stdout) as [{ filename: string; files: { path: string }[] }];
-  const shipped = new Set(manifest.files.map((f) => f.path));
+  // --- pack ---------------------------------------------------------------------------------
+  const { tarball, shipped } = packEngine(npmCli);
   for (const path of [
     'package.json',
     'tsconfig.module-repo.json',
@@ -367,11 +563,13 @@ test('pack, install into a module repo, typecheck it there, and discover its mod
     'dist/core/migrations/0001_init.sql',
     'dist/modules/ping/module.js',
     'src/core/module.ts',
+    'template/MANIFEST.json',
+    'template/AGENTS.md',
+    'template/src/modules/tags/module.ts',
   ]) {
     assert.ok(shipped.has(path), `the tarball does not contain ${path}`);
   }
   assert.ok(![...shipped].some((p) => p.startsWith('src/modules/') || p.startsWith('src/adapters/')), 'only src/core ships as source');
-  const tarball = join(packDir, manifest.filename);
 
   // --- a module repo laid out like the template (RFC-001 9.1) ------------------------------
   const repo = tempDir('module-repo-');
@@ -485,4 +683,102 @@ test('pack, install into a module repo, typecheck it there, and discover its mod
   assert.equal(doctor.status, 0, output(doctor));
   const listed = /modules discovered: (.+)/u.exec(doctor.stdout)?.[1]?.split(', ') ?? [];
   for (const id of ['access', 'admin', 'builder', 'credentials', 'help', 'ping', 'demo']) assert.ok(listed.includes(id), `${id}: ${output(doctor)}`);
+});
+
+// ---------------------------------------------------------------------------------------
+// 3b. The template, end to end, against the packed tarball (RFC-001 PR 1.5)
+// ---------------------------------------------------------------------------------------
+
+/** The env `doctor` needs to parse a config: valid shapes, no real credential anywhere. */
+const DOCTOR_ENV = {
+  DISCORD_TOKEN: 'x'.repeat(60),
+  DISCORD_CLIENT_ID: '123456789012345678',
+  DISCORD_OWNER_ID: '223456789012345678',
+  GITHUB_TOKEN: `github_pat_${'C'.repeat(40)}`,
+  GITHUB_OWNER: 'o',
+  GITHUB_REPO: 'r',
+  APPROVAL_HMAC_KEY: 'h'.repeat(48),
+};
+
+test('init the template, npm ci against the packed tarball, scaffold demo --db, and npm run check is green', { timeout: 900_000 }, async (t) => {
+  if (process.env['CI'] === undefined && process.env['ENGINE_PACK_TEST'] === undefined) {
+    t.skip('needs the npm registry; set ENGINE_PACK_TEST=1 to run it locally (CI runs it always)');
+    return;
+  }
+  const npmCli = findNpmCli();
+  if (npmCli === null) {
+    t.skip('npm could not be found next to this Node');
+    return;
+  }
+  // NODE_TEST_CONTEXT marks a process as a child of a running test: inherited, the module repo's
+  // `node --test` would report to THIS run instead of printing, and exit 0 whatever happened.
+  const inherited = Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== 'NODE_TEST_CONTEXT'));
+  const quiet = { ...inherited, npm_config_audit: 'false', npm_config_fund: 'false', npm_config_update_notifier: 'false' };
+  const npm = (args: readonly string[], cwd: string): SpawnSyncReturns<string> =>
+    spawnSync(process.execPath, [npmCli, ...args], { cwd, encoding: 'utf8', timeout: 300_000, env: quiet });
+  const { tarball } = packEngine(npmCli);
+  const version = (readJson(join(ROOT, 'package.json')) as { version: string }).version;
+
+  // --- init, from this checkout's template - the tree the tarball carries (asserted below) ----
+  // The engine is not on the registry, so `init`'s lockfile is generated against the TARBALL:
+  // resolve it once as `file:<tarball>`, then put the exact-version pin back in package.json
+  // and in the lockfile's root entry. The engine's lock entry keeps `resolved: file:...`, so
+  // `npm ci` installs the packed engine while package.json says what a real module repo says.
+  const parent = tempDir('template-init-');
+  const target = join(parent, 'my-bot');
+  const tarballLockfile = (dir: string): Result<void, string> => {
+    const pkgPath = join(dir, 'package.json');
+    const original = readFileSync(pkgPath, 'utf8');
+    const asTarball = JSON.parse(original) as { dependencies: Record<string, string> };
+    assert.equal(asTarball.dependencies[PKG], version, 'init pinned the engine to the installed version');
+    asTarball.dependencies[PKG] = `file:${tarball}`;
+    writeFileSync(pkgPath, JSON.stringify(asTarball, null, 2));
+    const lock = npm(['install', '--package-lock-only', '--ignore-scripts'], dir);
+    writeFileSync(pkgPath, original);
+    if (lock.status !== 0) return Err(output(lock));
+    const lockPath = join(dir, 'package-lock.json');
+    const lockfile = readJson(lockPath) as { packages: Record<string, { dependencies?: Record<string, string> }> };
+    const rootEntry = lockfile.packages[''];
+    if (rootEntry?.dependencies !== undefined) rootEntry.dependencies[PKG] = version;
+    writeFileSync(lockPath, `${JSON.stringify(lockfile, null, 2)}\n`);
+    return Ok(undefined);
+  };
+  const io = captureIo(parent);
+  assert.equal(await runCli(['init', 'my-bot'], io.io, { engineRoot: ROOT, regenerateLockfile: tarballLockfile }), 0, io.all());
+  assert.ok(existsSync(join(target, '.gitignore')) && existsSync(join(target, 'package-lock.json')));
+
+  // --- npm ci, NOT npm install: the lockfile init wrote must be in sync with package.json ------
+  const ci = npm(['ci', '--ignore-scripts'], target);
+  assert.equal(ci.status, 0, `npm ci must succeed in a freshly initialised module repo:\n${output(ci)}`);
+  const installed = join(target, 'node_modules', PKG);
+  assert.equal((readJson(join(installed, 'package.json')) as { version: string }).version, version);
+  assert.ok(
+    readFileSync(join(installed, 'template', 'MANIFEST.json')).equals(readFileSync(join(TEMPLATE, 'MANIFEST.json'))),
+    'the tarball ships the template init was run from',
+  );
+
+  // --- scaffold a second module through the installed bin, then the module repo's own gate ----
+  const scaffolded = npm(['run', 'scaffold', '--', 'demo', '--summary', 'The pack test module.', '--db'], target);
+  assert.equal(scaffolded.status, 0, output(scaffolded));
+  assert.ok(existsSync(join(target, 'src', 'modules', 'demo', 'migrations', '0001_init.sql')));
+
+  const check = npm(['run', 'check'], target);
+  assert.equal(check.status, 0, `npm run check must be green in the module repo (typecheck, lint, tags + demo + conventions with the engine contract):\n${output(check)}`);
+  assert.match(check.stdout, /every gated file matches the installed engine's template/u, 'the engine-contract tests ran');
+  assert.match(check.stdout, /the module installs with exactly its declared ports/u, "the template's tags test ran");
+  assert.match(check.stdout, /greet accepts a normal name and keeps it/u, "the scaffolded demo's test ran");
+  assert.match(check.stdout, /^ℹ fail 0$/mu);
+
+  // --- the installed bin, as `npx <bin>` runs it, with no source condition -------------------
+  const bin = join(installed, (readJson(join(installed, 'package.json')) as { bin: Record<string, string> }).bin[PKG] ?? '');
+  const runBin = (args: readonly string[]): SpawnSyncReturns<string> =>
+    spawnSync(process.execPath, [bin, ...args], { cwd: target, encoding: 'utf8', timeout: 120_000, env: { ...inherited, ...DOCTOR_ENV } });
+
+  const sync = runBin(['template', 'check']);
+  assert.equal(sync.status, 0, `the template-sync job's command must pass on a fresh repo:\n${output(sync)}`);
+
+  const doctor = runBin(['doctor', '--offline']);
+  assert.equal(doctor.status, 0, output(doctor));
+  const listed = /modules discovered: (.+)/u.exec(doctor.stdout)?.[1]?.split(', ') ?? [];
+  assert.deepEqual([...listed].sort(), ['access', 'admin', 'builder', 'credentials', 'demo', 'help', 'ping', 'tags'], output(doctor));
 });
