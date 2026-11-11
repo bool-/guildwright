@@ -40,8 +40,12 @@
 
 import { z } from 'zod';
 import { defineModule } from '#core/module';
-import { CredentialService, credentialRepository } from '#modules/credentials/domain';
+import { CredentialService } from '#modules/credentials/domain';
 import { credentialCommands, credentialForms, present } from '#modules/credentials/present';
+
+/** Repositories for the boot previews only: rendered, never contacted. */
+const MAIN = { key: 'main', fullName: 'acme/bot-modules' } as const;
+const EVENTS = { key: 'events', fullName: 'acme/events-modules' } as const;
 
 export default defineModule({
   id: 'credentials', // MUST equal the folder name
@@ -62,7 +66,9 @@ export default defineModule({
    *
    * `repos` (RFC-001 PR 2.1): `secrets` is now one port PER CONFIGURED REPOSITORY, and `repos`
    * is the read-only list that says which one. It grants no write anywhere: it is how this
-   * module learns WHICH repository's environment a credential goes into.
+   * module learns WHICH repository's environment a credential goes into - since PR 2.3, the
+   * server's own repository (its `/repo use` link, else the default), or in a DM the one named
+   * with `repo:`.
    */
   capabilities: ['secrets', 'audit', 'repos'],
 
@@ -92,13 +98,11 @@ export default defineModule({
   migrations: false,
 
   setup(ctx) {
-    // WHICH REPOSITORY'S ENVIRONMENTS (RFC-001 PR 2.1): the default one, for every command, which
-    // for a one-repository install is the repository it always was. Per-guild and per-DM
-    // resolution (`/credentials set` in a guild seals into that guild's repository) is PR 2.3;
-    // `credentialRepository` is the one function that changes then.
-    const target = credentialRepository(ctx.ports.repos, ctx.ports.secrets);
+    // WHICH REPOSITORY'S ENVIRONMENTS (RFC-001 PR 2.3): decided per command by the service - a
+    // server's own repository, a DM's `repo:` choice, or every one for `status`/`clear` in a DM.
+    // For a one-repository install that is always the one repository, exactly as before.
     // The closure IS the dependency injection - no container, no registration call.
-    const svc = new CredentialService(target.secrets, ctx.ports.audit);
+    const svc = new CredentialService(ctx.ports.repos, ctx.ports.secrets, ctx.ports.audit);
 
     return {
       commands: credentialCommands(svc, ctx.perms),
@@ -109,12 +113,25 @@ export default defineModule({
        * reject fails the deploy instead of failing in front of a user.
        */
       previews: {
-        stored: present.stored('CLAUDE_CODE_OAUTH_TOKEN'),
-        storedApiKey: present.stored('ANTHROPIC_API_KEY'),
-        statusEmpty: present.status({ names: [] }),
-        statusBoth: present.status({ names: ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'] }),
-        cleared: present.cleared(true),
-        nothingToClear: present.cleared(false),
+        stored: present.stored('CLAUDE_CODE_OAUTH_TOKEN', null),
+        storedApiKey: present.stored('ANTHROPIC_API_KEY', null),
+        storedInRepo: present.stored('CLAUDE_CODE_OAUTH_TOKEN', EVENTS),
+        statusEmpty: present.status({ names: [] }, null),
+        statusBoth: present.status({ names: ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'] }, null),
+        statusInRepo: present.status({ names: ['CLAUDE_CODE_OAUTH_TOKEN'] }, EVENTS),
+        statusEach: present.statusEach([
+          { repo: MAIN, names: ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'], problem: null },
+          { repo: EVENTS, names: [], problem: null },
+          { repo: { key: 'ops', fullName: 'acme/ops-modules' }, names: null, problem: 'GitHub is not answering. Try again in a minute.' },
+        ]),
+        cleared: present.cleared(true, null),
+        nothingToClear: present.cleared(false, null),
+        clearedInRepo: present.cleared(true, EVENTS),
+        clearedEach: present.clearedEach([
+          { repo: MAIN, existed: true, problem: null },
+          { repo: EVENTS, existed: false, problem: null },
+          { repo: { key: 'ops', fullName: 'acme/ops-modules' }, existed: null, problem: 'GitHub is not answering. Try again in a minute.' },
+        ]),
       },
 
       /**
@@ -125,8 +142,10 @@ export default defineModule({
        * feature down by itself.
        */
       async health() {
-        if (target.unavailable !== null) return { status: 'down', detail: target.unavailable };
-        return { status: 'ok', detail: 'ready; nothing is stored locally' };
+        // NOT `down` WITHOUT A DEFAULT REPOSITORY (it was, before PR 2.3): a server linked with
+        // `/repo use` stores into its own repository, and a DM names one with `repo:`.
+        const n = svc.keys().length;
+        return { status: 'ok', detail: n > 1 ? `ready for ${n} repositories; nothing is stored locally` : 'ready; nothing is stored locally' };
       },
     };
   },

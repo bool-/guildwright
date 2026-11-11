@@ -1278,11 +1278,19 @@ export default defineModule({
               // byte-identical or the workflow's approval gate rejects every attempt.
               const environmentName = buildEnvironmentName(payer.value);
               // Billing attribution, written before the spend rather than inferred afterwards.
+              // `repo` (RFC-001 8.3): the environment is the one in THIS request's repository -
+              // the row's, never the guild's current link - so the row says which.
               jctx.ports.audit.record({
                 action: 'builder.dispatch.environment',
                 actorId: row.requesterId,
                 guildId: row.guildId,
-                detail: { requestId: p.value.id, environmentName, byo: payer.value !== null, approvalId: approvalId.value },
+                detail: {
+                  requestId: p.value.id,
+                  environmentName,
+                  byo: payer.value !== null,
+                  approvalId: approvalId.value,
+                  repo: repoFullName(gh.repo),
+                },
               });
 
               // The approval MAC binds this dispatch to THIS issue body AND to the environment
