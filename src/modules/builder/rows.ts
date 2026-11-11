@@ -10,7 +10,7 @@
 
 import type { RequestId } from '#core/ids';
 import type { SurfaceRef } from '#core/view';
-import { sql, sqlJoin, type Db, type SqlIdent, type SqlQuery } from '#core/ports/db';
+import { sql, sqlJoin, sqlValues, type Db, type SqlIdent, type SqlQuery } from '#core/ports/db';
 
 // ---------------------------------------------------------------------------------------
 // State machine (section 7.4)
@@ -49,6 +49,13 @@ export interface BuildRow {
   readonly state: BuildState;
   readonly version: number;
   readonly guildId: string;
+  /**
+   * WHICH CONFIGURED REPOSITORY THIS REQUEST LIVES IN (RFC-001 PR 2.2, migration 0005): the key
+   * `ReposPort.resolve(guild)` answered when it was submitted. Every later step re-validates it
+   * through `ReposPort.byKey` and acts there, so re-linking the guild cannot move a poll, a cancel
+   * or a retry - the issue number is only meaningful in the repository it was filed in.
+   */
+  readonly repoKey: string;
   readonly requesterId: string;
   readonly nonce: string;
   readonly fenceNonce: string;
@@ -312,6 +319,26 @@ export interface BuildRepo {
   /** Rows the reconciler must re-adopt after a crash. */
   stuck(before: number, limitRows: number): readonly BuildRow[];
   /**
+   * Every row whose `repo_key` is NOT one of `configuredKeys`, in any state: what the boot
+   * adoption (`planRepoKeyAdoption`) inspects. Empty on every boot of a stable configuration,
+   * because the index on `(repo_key, state)` answers it without walking the table.
+   */
+  unconfigured(configuredKeys: readonly string[]): readonly BuildRow[];
+  /**
+   * Move ONE row to another repository key, guarded on the key it had. Only the boot adoption
+   * calls this, and only on evidence the row itself carries.
+   *
+   * WHY IT TOUCHES NEITHER `version` NOR `updated_at`: it is not a state transition, so it must
+   * not make a concurrent Approve lose its compare-and-set; and `updated_at` is the clock the
+   * expiry sweep and the reconciler read, so re-keying must not buy an unclicked request a second
+   * approval TTL.
+   */
+  rekey(id: RequestId, from: string, to: string): boolean;
+  /** This guild's rows that are not terminal, in any repository - drafts included. */
+  inFlightForGuild(guildId: string): number;
+  /** Rows that are not terminal, per repository key. A key with none is absent. */
+  inFlightByRepo(): ReadonlyMap<string, number>;
+  /**
    * Rows nobody ever clicked: `awaiting_approval` and untouched since `before`.
    *
    * THE GUILD-BRICKING BUG THIS QUERY EXISTS FOR. `expired` was declared in the state union, in
@@ -346,7 +373,7 @@ export interface BuildRepo {
  */
 const selectRow = (t: SqlIdent): SqlQuery => sql`
   SELECT id, state, version,
-         guild_id AS guildId, requester_id AS requesterId,
+         guild_id AS guildId, repo_key AS repoKey, requester_id AS requesterId,
          nonce, fence_nonce AS fenceNonce, title,
          issue_number AS issueNumber, issue_url AS issueUrl,
          run_id AS runId, run_url AS runUrl, pr_url AS prUrl,
@@ -419,9 +446,9 @@ export const buildRepo = (db: Db): BuildRepo => {
       // predicate, which is precisely why the previous version had to check separately.
       db.execute(
         sqlJoin([
-          sql`INSERT INTO ${t} (id, state, version, guild_id, requester_id, nonce, fence_nonce, title,
+          sql`INSERT INTO ${t} (id, state, version, guild_id, repo_key, requester_id, nonce, fence_nonce, title,
                                 dispatch_attempts, retry_count, created_at, updated_at)
-              SELECT ${row.id}, ${row.state}, 1, ${row.guildId}, ${row.requesterId}, ${row.nonce},
+              SELECT ${row.id}, ${row.state}, 1, ${row.guildId}, ${row.repoKey}, ${row.requesterId}, ${row.nonce},
                      ${row.fenceNonce}, ${row.title}, 0, 0, ${at}, ${at}
               WHERE`,
           slotsHeldBy(t, row.guildId),
@@ -540,6 +567,36 @@ export const buildRepo = (db: Db): BuildRepo => {
           sql`WHERE state IN ('dispatching', 'running') AND updated_at < ${before}
               ORDER BY updated_at LIMIT ${limitRows}`,
         ]),
+      ),
+    unconfigured: (configuredKeys) =>
+      db.query<BuildRow>(
+        sqlJoin([
+          selectRow(t),
+          // `configuredKeys` is never empty (a repository set always holds one), so `NOT IN ()`
+          // - which SQLite would accept and answer "every row" - cannot be produced here.
+          sql`WHERE repo_key NOT IN (`,
+          sqlValues(configuredKeys),
+          sql`) ORDER BY created_at`,
+        ]),
+      ),
+    rekey: (id, from, to) =>
+      // The NOT EXISTS keeps "one request per issue per repository" (migration 0005) without a
+      // constraint error: a row whose issue another row in `to` already holds stays where it is,
+      // and is reported as stranded rather than throwing out of `setup`.
+      db.execute(sql`
+        UPDATE ${t} SET repo_key = ${to}
+        WHERE id = ${id} AND repo_key = ${from}
+          AND NOT EXISTS (SELECT 1 FROM ${t} AS other
+                          WHERE other.repo_key = ${to} AND other.issue_number = ${t}.issue_number)`).changes === 1,
+    inFlightForGuild: (guildId) =>
+      db.queryOne<{ readonly n: number }>(sqlJoin([sql`SELECT count(*) AS n FROM ${t} WHERE guild_id = ${guildId} AND`, NOT_TERMINAL]))?.n ?? 0,
+    inFlightByRepo: () =>
+      new Map(
+        db
+          .query<{ readonly repoKey: string; readonly n: number }>(
+            sqlJoin([sql`SELECT repo_key AS repoKey, count(*) AS n FROM ${t} WHERE`, NOT_TERMINAL, sql`GROUP BY repo_key`]),
+          )
+          .map((r) => [r.repoKey, r.n] as const),
       ),
     expiring: (before, limitRows) =>
       db.query<BuildRow>(

@@ -434,18 +434,21 @@ test('REPO SET: several repositories and NO default refuses at the front door wi
   assert.equal(outcome.error.internal, 'This server is not linked to a repository yet, so nothing can be built from it.');
   assert.equal(h.repos.main.issues.created.length + h.repos.events.issues.created.length, 0, 'nothing filed anywhere');
   assert.equal(h.discord.posted.length, 0);
+  // NOT down since guild routing (PR 2.2): a server linked with /repo use still builds, so /status
+  // says how an unlinked server gets a repository instead of declaring the module dead.
   const health = await h.installed.health();
-  assert.equal(health.status, 'down', '/status says builds have nowhere to go');
-  assert.match(health.detail, /"default": true in GITHUB_REPOS_JSON/u);
+  assert.equal(health.status, 'ok');
+  assert.match(health.detail, /no repository is the default, so a server builds only once an operator runs \/repo use in it/u);
 });
 
-test('REPO SET: /status reports the default repository, and each other repository\'s readiness against THAT repository', async () => {
+test('REPO SET: /status reports each repository\'s readiness against THAT repository', async () => {
   const h = twoRepoHarness('main');
   h.repos.events.builds.gateAnswer = Err(errors.config('github.gates', 'Builds are disabled: drift in acme/events-modules.', 'Run template apply.'));
   await h.repos.events.builds.verifyGates();
   const health = await h.installed.health();
-  assert.equal(health.status, 'ok', 'the repository builds land in is ready');
-  assert.match(health.detail, /builds land in main \(acme\/bot-modules\); other repositories: events \(acme\/events-modules\): down - /u);
+  // DEGRADED, not ok, since guild routing (PR 2.2): a server linked to events cannot build.
+  assert.equal(health.status, 'degraded', 'one repository of the set cannot build');
+  assert.match(health.detail, /repositories: main \(acme\/bot-modules, default\): ready, 0 in flight; events \(acme\/events-modules\): down - /u);
 
   // A one-repository install's line carries none of that: unchanged from phase 1.
   const one = harness();

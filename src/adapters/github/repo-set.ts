@@ -38,7 +38,18 @@ import type { AppError } from '#core/errors';
 import type { GithubRepoConfig, Secret } from '#core/config';
 import type { GuildId } from '#core/ids';
 import type { BuildsPort, ClockPort, GithubAuthSummary, IssuesPort, LoggerPort, SecretsPort } from '#core/ports';
-import { createRepoSet, createReposPort, noGuildMapping, repoScoped, type RepoRef, type RepoScoped, type RepoSet, type ReposPort } from '#core/ports/repos';
+import {
+  createRepoSet,
+  createReposPort,
+  noActivity,
+  noGuildMapping,
+  repoScoped,
+  type RepoActivityReport,
+  type RepoRef,
+  type RepoScoped,
+  type RepoSet,
+  type ReposPort,
+} from '#core/ports/repos';
 import { createGithubClient } from '#adapters/github/client';
 import { openGithubInstallation, startGithubApp, type GithubCredentials } from '#adapters/github/app-auth';
 import type { GateFile, GithubRequest } from '#adapters/github/gates';
@@ -65,10 +76,16 @@ export interface GithubRepoSetInput {
   /** Per-repository request seam for the containment probes and the gate check, for tests. */
   readonly probeRequest?: (repo: GithubRepoConfig) => GithubRequest | undefined;
   /**
-   * THE PR 2.2 SEAM: the repository key a guild is mapped to (`repo.target` in `core_settings`),
-   * or null. This PR maps nothing, so every guild resolves to the default repository.
+   * The repository key a guild is linked to (`repo.target` in `core_settings`, written by
+   * `/repo use`), or null. The composition root passes `repoTargetReader(settings)`; left out,
+   * nothing is mapped and every guild resolves to the default repository.
    */
   readonly guildMapping?: (guildId: GuildId) => string | null;
+  /**
+   * What installed modules report about their work per repository (`ModuleHandle.repoActivity`),
+   * late-bound because the modules install after this set exists. Left out: nothing reports.
+   */
+  readonly activity?: () => readonly RepoActivityReport[];
 }
 
 /** One repository of the set, with its adapter. */
@@ -179,7 +196,7 @@ export async function createGithubRepoSet(input: GithubRepoSetInput): Promise<Re
 
   return Ok({
     set,
-    repos: createReposPort(set, input.guildMapping ?? noGuildMapping),
+    repos: createReposPort(set, input.guildMapping ?? noGuildMapping, input.activity ?? noActivity),
     adapters,
     issues: repoScoped(adapters.map((a) => [a.ref, a.adapter.issues] as const)),
     builds: repoScoped(adapters.map((a) => [a.ref, a.adapter.builds] as const)),

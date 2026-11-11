@@ -68,7 +68,8 @@ import {
   removedBuilderKeyWarnings,
   type AppConfig,
 } from '#core/config';
-import type { AdminPort, CatalogPort, PortRegistry, VersionPort } from '#core/ports';
+import type { AdminPort, CatalogPort, PortRegistry, RepoActivityReport, VersionPort } from '#core/ports';
+import { repoTargetReader } from '#core/ports/repos';
 import { describeBuild, describeGithubAuth } from '#core/ports';
 import { checkEnginePin } from '#core/version';
 import type { DocStore } from '#core/ports/db';
@@ -546,6 +547,10 @@ export async function run(env: Readonly<Record<string, string | undefined>> = pr
   // is named before the boot stops (src/adapters/github/repo-set.ts).
   const githubAuth = resolveGithubAuth(cfg.github.auth);
   if (!githubAuth.ok) return failBoot(githubAuth.error);
+  // WHAT INSTALLED MODULES REPORT ABOUT THEIR WORK PER REPOSITORY (RFC-001 PR 2.2), filled in
+  // after (6) install. `ctx.ports.repos.activity()` reads it, so `/repo clear` and `/repo show`
+  // can count a guild's in-flight requests without the `repos` module reading the builder's table.
+  let repoActivity: readonly RepoActivityReport[] = [];
   const githubSet = await createGithubRepoSet({
     auth: githubAuth.value,
     repos: cfg.github.repos,
@@ -566,6 +571,11 @@ export async function run(env: Readonly<Record<string, string | undefined>> = pr
     // dispatch runs them, the daily cap counts them, and its preflight and gate-file check
     // verify them. There is no second copy in MODULES_JSON.
     gateReference: (r) => readTemplateGateFiles(enginePackageRoot(), build.engine.version, r.workflowFile),
+    // GUILD ROUTING (RFC-001 PR 2.2): a guild's `repo.target` setting, written by `/repo use`.
+    // Synchronous - the settings adapter caches per guild - so `resolve` stays safe ahead of a
+    // `showModal`.
+    guildMapping: repoTargetReader(settings),
+    activity: () => repoActivity,
   });
   if (!githubSet.ok) return failBootAll(githubSet.error);
   const github = githubSet.value;
@@ -700,6 +710,10 @@ export async function run(env: Readonly<Record<string, string | undefined>> = pr
   }
   const report = loaded.value;
   catalog = buildCatalog(report);
+  repoActivity = [...report.registry.installed.values()].flatMap((m): RepoActivityReport[] => {
+    const a = m.repoActivity;
+    return a === null ? [] : [{ moduleId: m.manifest.id, inFlightForGuild: (g) => a.inFlightForGuild(g), inRepo: (r) => a.inRepo(r) }];
+  });
 
   if (report.quarantined.length > 0) {
     // Loud on BOTH channels: a quarantine buried in JSON is a quarantine nobody notices.

@@ -638,6 +638,7 @@ export function fakeSettings(): SettingsPort {
   return {
     get: (g, key) => store.get(k(g, key)),
     set: (g, key, value) => void store.set(k(g, key), value),
+    clear: (g, key) => store.delete(k(g, key)),
     all: (g) => {
       const out: Record<string, JsonObject> = {};
       for (const [key, value] of store) if (key.startsWith(`${g}:`)) out[key.slice(g.length + 1)] = value;

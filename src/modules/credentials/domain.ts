@@ -54,7 +54,8 @@ import {
 /**
  * The sentence for a bot with several repositories and no default: there is no repository whose
  * environments a credential could go into. RFC-001 8.1's unmapped refusal, with the next step
- * this version can actually offer (guild routing, `/repo use`, is PR 2.2).
+ * this version can actually offer: credentials do not follow `/repo use` yet (that is PR 2.3), so
+ * marking a default is the only way to give them a repository.
  */
 export function noCredentialRepositoryError(): AppError {
   return errors.config(

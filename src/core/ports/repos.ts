@@ -24,11 +24,17 @@
  *     `ctx.ports.issues.at(repo)`. The ports' own method signatures do not change, so every fake
  *     and every per-method test stays valid (RFC-001 7.4, "Resolved").
  *
- * THE SEAM PR 2.2 FILLS: `resolve(guildId)` is "the guild's mapping, else the default
- * repository, else null". This PR has no mapping store (`repo.target` in `core_settings` and the
- * `/repo use` command are PR 2.2), so `createReposPort` takes the mapping as a function and the
- * composition root passes one that maps nothing. Everything that asks `resolve` today keeps
- * asking it when the mapping arrives.
+ * THE GUILD MAPPING (PR 2.2): `resolve(guildId)` is "the guild's mapping, else the default
+ * repository, else null". The mapping is runtime state, `repo.target` in `core_settings`, written
+ * by the built-in `repos` module's `/repo use` and read through a function the composition root
+ * passes (`repoTargetReader`), so this file never imports the settings adapter.
+ *
+ * WHAT INSTALLED MODULES ARE DOING IN EACH REPOSITORY (PR 2.2): `activity()`. `/repo clear`
+ * refuses while a guild has a request in flight and `/repo show` counts what is in flight in a
+ * repository, but the `repos` module cannot read the builder's table: modules never import each
+ * other, and the `db` port mints only the caller's own tables. So a module that holds work in a
+ * repository reports it through `ModuleHandle.repoActivity`, and the composition root hands the
+ * reports to this port.
  */
 
 import type { Result } from '#core/result';
@@ -36,6 +42,7 @@ import { Err, Ok } from '#core/result';
 import type { AppError } from '#core/errors';
 import { errors } from '#core/errors';
 import type { GuildId } from '#core/ids';
+import type { JsonObject } from '#core/json';
 
 // ---------------------------------------------------------------------------------------
 // RepoKey
@@ -149,18 +156,66 @@ export function createRepoSet(entries: readonly RepoSetEntry[]): Result<RepoSet,
 // ---------------------------------------------------------------------------------------
 
 /**
+ * Where a guild's NEW requests land, and why (RFC-001 7.2, 7.3).
+ *
+ * FOUR ARMS, because each one is a different sentence to a different person:
+ *
+ *  - `mapped`  `/repo use` linked this guild to a configured repository.
+ *  - `default` no link; the set's `"default": true` repository (with one repository, the only one).
+ *  - `stale`   a link to a key the operator has since removed from `GITHUB_REPOS_JSON`. NOT the
+ *              default: which repository a guild's requests land in is the operator's trust
+ *              decision (7.2), so a removed repository must not silently hand the guild to
+ *              another of the operator's repositories. Refused until somebody re-links it.
+ *  - `none`    no link and no default: refused with the unmapped sentence (7.3).
+ */
+export type GuildRepoTarget =
+  | { readonly kind: 'mapped'; readonly repo: RepoRef }
+  | { readonly kind: 'default'; readonly repo: RepoRef }
+  | { readonly kind: 'stale'; readonly key: string }
+  | { readonly kind: 'none' };
+
+/**
+ * What ONE module reports about its work in the repository set, for `/repo show` and the
+ * `/repo clear` refusal. Synchronous and request-free, like every method of this port: a module
+ * answers from its own database, never from GitHub.
+ */
+export interface RepoActivity {
+  /** This guild's work that has not reached a terminal state, in ANY repository. */
+  inFlightForGuild(guildId: GuildId): number;
+  /**
+   * One repository as this module sees it: how much of its work is in flight there (from any
+   * guild), and one short line for a human, e.g. its readiness and caps. No secrets.
+   */
+  inRepo(repo: RepoRef): { readonly inFlight: number; readonly detail: string };
+}
+
+/** One module's `RepoActivity`, named. */
+export interface RepoActivityReport extends RepoActivity {
+  readonly moduleId: string;
+}
+
+/**
  * The configured set, readable by a module that declares `repos` (RFC-001 7.2).
  *
  * Every method is SYNCHRONOUS and makes no request: `ack: 'form'` handlers must not await
  * before `showModal`, and a `/status` render must not spend API budget.
+ *
+ * `target` AND `activity` ARE ADDITIONS TO THE RFC's THREE METHODS (PR 2.2). `target` is
+ * `resolve` with its reason, because "not linked yet" and "linked to a repository that was
+ * removed" need different sentences. `activity` is how `/repo show` and `/repo clear` learn what
+ * is in flight without the `repos` module reading another module's table.
  */
 export interface ReposPort {
   /** The configured set, in configuration order. Never empty. */
   all(): readonly RepoRef[];
-  /** The guild's mapping (PR 2.2), else the default repository, else null. */
+  /** The guild's mapping, else the default repository, else null. A stale mapping is null. */
   resolve(guildId: GuildId): RepoRef | null;
+  /** `resolve`, with the reason: which arm of the routing rule answered. */
+  target(guildId: GuildId): GuildRepoTarget;
   /** Re-validate a persisted key: the ref of this process's set, or null if it is not configured. */
   byKey(key: string): RepoRef | null;
+  /** What every installed module that holds work in a repository reports. Empty before install. */
+  activity(): readonly RepoActivityReport[];
 }
 
 /** Short alias, matching the style of every other port. */
@@ -169,26 +224,84 @@ export type Repos = ReposPort;
 /**
  * Build the port over a minted set.
  *
- * `mapping` is THE SEAM for PR 2.2's `repo.target` guild setting: it returns the KEY a guild is
- * pointed at, or null. A key that is no longer configured falls through to the default rather
- * than to a ref of some other set - the RFC's "a persisted key is re-validated on the way back
- * out". This PR passes `noGuildMapping`.
+ * `mapping` returns the KEY a guild is linked to (`repo.target`), or null. A key that is no
+ * longer configured is `stale`: re-validated on the way back out, and answered with neither a
+ * ref of some other set nor the default (see `GuildRepoTarget`).
+ *
+ * `activity` is late-bound: the port exists before the modules that report through it are
+ * installed, so the composition root passes a function over the installed set.
  */
-export function createReposPort(set: RepoSet, mapping: (guildId: GuildId) => string | null = noGuildMapping): ReposPort {
+export function createReposPort(
+  set: RepoSet,
+  mapping: (guildId: GuildId) => string | null = noGuildMapping,
+  activity: () => readonly RepoActivityReport[] = noActivity,
+): ReposPort {
+  const target = (guildId: GuildId): GuildRepoTarget => {
+    const mapped = mapping(guildId);
+    if (mapped !== null) {
+      const hit = set.byKey(mapped);
+      return hit === null ? { kind: 'stale', key: mapped } : { kind: 'mapped', repo: hit };
+    }
+    return set.default === null ? { kind: 'none' } : { kind: 'default', repo: set.default };
+  };
   return {
     all: () => set.refs,
     resolve: (guildId) => {
-      const mapped = mapping(guildId);
-      const hit = mapped === null ? null : set.byKey(mapped);
-      return hit ?? set.default;
+      const t = target(guildId);
+      return t.kind === 'mapped' || t.kind === 'default' ? t.repo : null;
     },
+    target,
     byKey: (key) => set.byKey(key),
+    activity: () => activity(),
   };
 }
 
-/** No guild is mapped to anything: every guild resolves to the default repository (PR 2.1). */
+/** No guild is mapped to anything: every guild resolves to the default repository. */
 export function noGuildMapping(): string | null {
   return null;
+}
+
+/** Nothing reports activity: the answer before any module is installed, and in tools. */
+export function noActivity(): readonly RepoActivityReport[] {
+  return [];
+}
+
+// ---------------------------------------------------------------------------------------
+// The guild mapping's storage: `repo.target` in `core_settings` (RFC-001 7.2)
+// ---------------------------------------------------------------------------------------
+
+/**
+ * The settings key, spelled ONCE: the `repos` module writes it and the composition root reads it.
+ * Scope `guild`; value `{ "key": "<repository key>" }`.
+ */
+export const REPO_TARGET_SETTING = 'repo.target';
+
+/** The narrowest settings read the mapping needs; `SettingsPort` satisfies it. */
+export interface SettingsReader {
+  get(guildId: GuildId, key: string): JsonObject | undefined;
+}
+
+/**
+ * The stored key, or null. A value that is not `{ key: <repository key shape> }` reads as UNSET,
+ * the rule the settings adapter applies to every unparseable setting, so a hand-edited row is
+ * never half-applied. A well-formed key that is no longer configured is returned as it is:
+ * `ReposPort.target` reports it `stale`, which is a refusal rather than a fallback.
+ */
+export function readRepoTarget(settings: SettingsReader, guildId: GuildId): string | null {
+  const raw = settings.get(guildId, REPO_TARGET_SETTING);
+  if (raw === undefined) return null;
+  const key = raw['key'];
+  return typeof key === 'string' && isRepoKey(key) ? key : null;
+}
+
+/** The value `/repo use` stores. */
+export function repoTargetValue(repo: RepoRef): JsonObject {
+  return { key: repo.key };
+}
+
+/** The mapping function `createReposPort` takes, over the settings port. */
+export function repoTargetReader(settings: SettingsReader): (guildId: GuildId) => string | null {
+  return (guildId) => readRepoTarget(settings, guildId);
 }
 
 // ---------------------------------------------------------------------------------------

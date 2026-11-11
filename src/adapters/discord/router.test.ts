@@ -81,6 +81,14 @@ import {
   type Router,
   type RouterIO,
 } from '#adapters/discord/router';
+import { createAccess, fallbacksFromCatalog } from '#adapters/system/access';
+import { createSettings } from '#adapters/system/settings';
+import { createTestDb } from '#adapters/system/testdb';
+import { silentLogger } from '#adapters/system/logger';
+import { createEventBus } from '#core/events';
+import { toGuildId, type GuildId } from '#core/ids';
+import { REPO_TARGET_SETTING, createRepoSet, createReposPort, repoTargetReader } from '#core/ports/repos';
+import reposModule from '#modules/repos/module';
 
 // ---------------------------------------------------------------------------------------
 // The prefix hook - the product's actual entry point
@@ -2070,3 +2078,74 @@ test('A PROGRESS UPDATE ISSUED WHILE THE WATCHDOG IS ACKNOWLEDGING IS NOT SILENT
   );
   deepStrictEqual(h.logger.lines.filter((l) => l.msg === 'progress update dropped'), []);
 });
+
+// ---------------------------------------------------------------------------------------
+// The REAL `/repo use` (RFC-001 PR 2.2) against the REAL access adapter
+// ---------------------------------------------------------------------------------------
+
+test('/repo use by a server admin WITHOUT the grant is denied before the handler, audited, and changes nothing', async () => {
+  // Everything real but the gateway: the shipped `repos` module, its shipped fallbacks read
+  // through `fallbacksFromCatalog`, the access adapter and the settings row it would write.
+  // `repos.manage` falls back to `nobody`, so Manage Server is NOT enough; the operator is.
+  const clock = fakeClock(START);
+  const trace = tracer(clock);
+  const db = createTestDb();
+  const logger = silentLogger();
+  const settings = createSettings({ db, clock, logger });
+  const set = createRepoSet([
+    { key: 'main', owner: 'acme', repo: 'bot-modules', isDefault: true },
+    { key: 'events', owner: 'acme', repo: 'events-modules', isDefault: false },
+  ]);
+  ok(set.ok);
+  if (!set.ok) return;
+  const repos = createReposPort(set.value, repoTargetReader(settings));
+  const moduleAudit = fakeAudit();
+  const installed = reposModule.install({ ports: { settings, audit: moduleAudit, repos }, rawConfig: {}, bus: createEventBus(() => undefined), logger: fakeRecordingLogger() });
+  ok(installed.ok);
+  if (!installed.ok) return;
+  const spec = installed.value.commands.find((c) => c.name === 'repo use');
+  ok(spec !== undefined);
+  if (spec === undefined) return;
+
+  const declared = Object.entries(reposModule.manifest.permissions).map(([key, decl]) => ({
+    moduleId: 'repos',
+    key,
+    permKey: `repos.${key}`,
+    summary: decl.summary,
+    fallback: decl.fallback,
+  }));
+  const access = createAccess({
+    db,
+    clock,
+    logger,
+    settings,
+    fallbacks: fallbacksFromCatalog({ modules: () => [], commands: () => [], permissions: () => declared, health: async () => [] }),
+  });
+  const h = harness({ registry: registryOf({ commands: [['repo use', { moduleId: 'repos', spec }]] }), clock, access });
+
+  const MANAGE_GUILD = 1n << 5n;
+  const denied = commandInteraction(trace, { name: 'repo use', createdTimestamp: clock.now(), memberPermissions: MANAGE_GUILD, strings: { key: 'events' } });
+  h.deliver(denied);
+  await until(() => denied.answers.length > 0, 'the refusal');
+  const refusal = JSON.stringify(denied.answers);
+  ok(refusal.includes('You need `repos.manage`.'), refusal);
+  strictEqual(settings.get(toGuild(GUILD_ID), REPO_TARGET_SETTING), undefined, 'the handler never ran: no link written');
+  strictEqual(moduleAudit.entries.length, 0, 'and nothing was audited as a change');
+  const row = h.audit.entries.at(-1);
+  strictEqual(row?.detail['denied'], 'repos.manage', 'the denial IS audited, by the router');
+  strictEqual(row?.decisionLayer, 'L3-deny');
+  strictEqual(row?.actorId, USER_ID);
+
+  // The operator (DISCORD_OWNER_ID, layer L0) is let through, and the link lands.
+  const allowed = commandInteraction(trace, { name: 'repo use', createdTimestamp: clock.now(), userId: OWNER_ID, strings: { key: 'events' } });
+  h.deliver(allowed);
+  await until(() => allowed.answers.some((a) => a.method === 'editReply'), 'the answer');
+  deepStrictEqual(settings.get(toGuild(GUILD_ID), REPO_TARGET_SETTING), { key: 'events' });
+  strictEqual(moduleAudit.entries.at(-1)?.action, 'repos.use');
+});
+
+function toGuild(raw: string): GuildId {
+  const g = toGuildId(raw);
+  if (!g.ok) throw new Error('fixture');
+  return g.value;
+}

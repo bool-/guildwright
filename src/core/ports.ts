@@ -64,8 +64,19 @@ export {
   userEnvironmentName,
 } from '#core/ports/secrets';
 export type { DiscordPermission } from '#core/permissions';
-export type { RepoKey, RepoRef, RepoScoped, RepoSet, RepoSetEntry, Repos, ReposPort } from '#core/ports/repos';
-export { DEFAULT_REPO_KEY, REPO_KEY_PATTERN, isRepoKey, repoFullName } from '#core/ports/repos';
+export type {
+  GuildRepoTarget,
+  RepoActivity,
+  RepoActivityReport,
+  RepoKey,
+  RepoRef,
+  RepoScoped,
+  RepoSet,
+  RepoSetEntry,
+  Repos,
+  ReposPort,
+} from '#core/ports/repos';
+export { DEFAULT_REPO_KEY, REPO_KEY_PATTERN, REPO_TARGET_SETTING, isRepoKey, readRepoTarget, repoFullName, repoTargetValue } from '#core/ports/repos';
 
 // ---------------------------------------------------------------------------------------
 // Clock
@@ -816,6 +827,14 @@ export interface SettingsPort {
   get(guildId: GuildId, key: string): JsonObject | undefined;
   set(guildId: GuildId, key: string, value: JsonObject): void;
   all(guildId: GuildId): Readonly<Record<string, JsonObject>>;
+  /**
+   * Remove one key. `false` when it was not set.
+   *
+   * ON THE PORT SINCE RFC-001 PR 2.2: `/repo clear` has to REMOVE the guild's mapping, and a
+   * tombstone value written through `set` would be a second spelling of "unset" that every reader
+   * has to know about. The adapter always had it; modules could not reach it.
+   */
+  clear(guildId: GuildId, key: string): boolean;
 }
 
 // ---------------------------------------------------------------------------------------

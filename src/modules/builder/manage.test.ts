@@ -74,6 +74,7 @@ function seedForOther(h: Harness, issueNumber: number, requesterId = OTHER): str
       state: 'draft',
       version: 1,
       guildId: GUILD,
+      repoKey: 'default',
       requesterId,
       nonce: newCardNonce(),
       fenceNonce: newFenceNonce(),

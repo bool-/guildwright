@@ -7,6 +7,7 @@
  */
 
 import { strict as assert } from 'node:assert';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
 import { claimEngine, ENGINE_KEY, ENGINE_PACKAGE } from './main.ts';
@@ -70,4 +71,18 @@ test('globalThis is the default registry', () => {
   } finally {
     Reflect.deleteProperty(globalThis, ENGINE_KEY);
   }
+});
+
+/**
+ * GUILD ROUTING IS WIRED (RFC-001 PR 2.2). Booting `run()` needs Discord and GitHub, so this is
+ * read off the source, like `retry.test.ts` reads the builder's: without these three lines
+ * `/repo use` would write a setting nothing reads, and `/repo clear` would never see a request in
+ * flight. What each line DOES is tested against the real adapters in
+ * `src/modules/repos/module.test.ts`; this pins that the composition root still says it.
+ */
+test('the composition root wires the repo.target mapping and every module\'s repoActivity into the repository set', () => {
+  const code = readFileSync(new URL('./main.ts', import.meta.url), 'utf8');
+  assert.match(code, /guildMapping: repoTargetReader\(settings\)/u, 'resolve(guild) must read the setting /repo use writes');
+  assert.match(code, /activity: \(\) => repoActivity/u, 'activity() must be late-bound to the installed modules');
+  assert.match(code, /repoActivity = \[\.\.\.report\.registry\.installed\.values\(\)\]/u, 'and filled from them after install');
 });
