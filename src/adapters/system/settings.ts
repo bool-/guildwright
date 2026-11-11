@@ -19,7 +19,7 @@
 
 import type { JsonObject } from '#core/json';
 import type { GuildId } from '#core/ids';
-import type { ClockPort, DbPort, LoggerPort, SettingsPort } from '#core/ports';
+import { REPO_TARGET_SETTING, type ClockPort, type DbPort, type LoggerPort, type SettingsPort } from '#core/ports';
 import { sql } from '#core/sql';
 import { CORE_TABLES } from '#adapters/system/schema';
 import { jsonCol, textCol, type Row } from '#adapters/system/rows';
@@ -28,8 +28,6 @@ import { jsonCol, textCol, type Row } from '#adapters/system/rows';
 export interface SettingsStore extends SettingsPort {
   /** Drop one guild's cache, or every guild's when called with no argument. */
   invalidate(guildId?: GuildId): void;
-  /** Remove one key. `false` when it was not set. */
-  clear(guildId: GuildId, key: string): boolean;
 }
 
 export interface SettingsDeps {
@@ -120,6 +118,12 @@ export const SETTING_KEYS = {
   selfApprove: 'access.self_approve',
   /** The guild owner, recorded by the Discord adapter, for the `guild-admin` fallback. */
   guildOwner: 'guild.owner',
+  /**
+   * Which configured repository this guild's requests land in (RFC-001 7.2). Spelled in core
+   * (`REPO_TARGET_SETTING`) because the `repos` module writes it and a module cannot import this
+   * file; read through core's `readRepoTarget` too.
+   */
+  repoTarget: REPO_TARGET_SETTING,
 } as const;
 
 /**

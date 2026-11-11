@@ -34,7 +34,7 @@ import type { JsonObject } from '#core/json';
 import type { PermissionDecls, PermissionRef, PermsFor } from '#core/policy';
 import { permissionRef } from '#core/policy';
 import type { AppEvents, EventBus, EventName, EventSource, Unsubscribe } from '#core/events';
-import type { Backoff, Capability, HealthReport, LiteralCaps, LoggerPort, PortRegistry, PortsFor } from '#core/ports';
+import type { Backoff, Capability, HealthReport, LiteralCaps, LoggerPort, PortRegistry, PortsFor, RepoActivity } from '#core/ports';
 import { portsFor } from '#core/ports';
 import type { DiscordPermission } from '#core/permissions';
 import { tablePrefixFor } from '#core/sql';
@@ -171,6 +171,17 @@ export interface ModuleHandle<C extends readonly Capability[], PK extends string
    */
   onShutdown?(): Promise<void>;
   health(): Promise<HealthReport>;
+  /**
+   * WORK THIS MODULE HOLDS IN THE REPOSITORY SET (RFC-001 PR 2.2), for `ctx.ports.repos.activity()`.
+   *
+   * WHY IT IS PART OF THE CONTRACT: `/repo clear` refuses while a guild has a request in flight,
+   * and `/repo show` counts what is in flight in a repository. The module that owns `/repo`
+   * cannot read the table that knows - modules never import each other, and `db` mints only the
+   * caller's own tables - so the module that holds the work reports it. Synchronous and
+   * request-free, like the port that relays it. Leave it out when the module files nothing into
+   * a repository.
+   */
+  readonly repoActivity?: RepoActivity;
 }
 
 /** The literal object a contributor writes. Every field is required. */
@@ -258,6 +269,8 @@ export interface InstalledModule {
   readonly previews: Readonly<Record<string, View>>;
   readonly reconcile: (() => Promise<void>) | null;
   readonly onShutdown: (() => Promise<void>) | null;
+  /** `ModuleHandle.repoActivity`, or null. */
+  readonly repoActivity: RepoActivity | null;
   health(): Promise<HealthReport>;
 }
 
@@ -415,6 +428,7 @@ export function defineModule<
         previews: handle.previews ?? {},
         reconcile: handle.reconcile?.bind(handle) ?? null,
         onShutdown: handle.onShutdown?.bind(handle) ?? null,
+        repoActivity: handle.repoActivity ?? null,
         async health(): Promise<HealthReport> {
           try {
             return await handle.health();

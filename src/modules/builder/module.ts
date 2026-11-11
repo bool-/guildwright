@@ -75,6 +75,7 @@ import {
   type ClockPort,
   type DiscordPort,
   type LoggerPort,
+  type BuildReadiness,
   type PrRef,
   type RepoRef,
 } from '#core/ports';
@@ -129,10 +130,11 @@ import {
   githubForDefault,
   githubForGuild,
   githubForRow,
-  noBuildRepositoryError,
+  planRepoKeyAdoption,
   readAgentDailyRunCap,
   type DailyCapReading,
   type GithubScopes,
+  type RepoKeyAdoption,
 } from '#modules/builder/ports';
 
 /**
@@ -151,6 +153,14 @@ export {
   reopenIssue,
   requestRunCancellation,
 } from '#modules/builder/ports';
+export {
+  issueRepositoryOf,
+  noBuildRepositoryError,
+  planRepoKeyAdoption,
+  requestRepositoryGoneError,
+  staleRepositoryLinkError,
+} from '#modules/builder/ports';
+export type { RepoKeyAdoption } from '#modules/builder/ports';
 export type {
   CancelsRuns,
   DailyCapReading,
@@ -640,6 +650,13 @@ export default defineModule({
     const repo = buildRepo(ctx.ports.db);
     const cfg = ctx.config;
 
+    // ROWS ON A REPOSITORY KEY THIS SET DOES NOT CONFIGURE (RFC-001 PR 2.2), settled once per
+    // boot, before any job or click can act on one: re-keyed where the row's own issue URL says
+    // which configured repository it lives in, and otherwise left alone and reported. See
+    // `planRepoKeyAdoption` for why "the default repository" is never the guess. Synchronous, and
+    // a no-op on every boot of an unchanged configuration.
+    reportRepoKeyAdoption(ctx.logger, ctx.ports.audit, adoptRepoKeys(repo, ctx.ports.repos.all()));
+
     /**
      * WHAT THE BOOT CHECK FOUND OUT ABOUT THE REPOSITORY'S OWN CAP.
      *
@@ -869,6 +886,9 @@ export default defineModule({
                 state: 'draft',
                 version: 1,
                 guildId,
+                // WHERE IT LIVES FROM NOW ON (RFC-001 7.3): the repository resolved above, persisted
+                // so that re-linking this guild later cannot move this request anywhere else.
+                repoKey: gh.repo.key,
                 requesterId: sub.actor.userId,
                 nonce: cardNonce,
                 fenceNonce,
@@ -1751,18 +1771,21 @@ export default defineModule({
         // everything below is irrelevant. `readiness()` makes no request: this runs on every
         // `/status`, and a health check must not spend the API budget of what it reports on.
         //
-        // PER REPOSITORY (RFC-001 PR 2.1): the status is the DEFAULT repository's, because in
-        // this version that is where every build lands; with several repositories configured,
-        // the others' readiness is appended so a drifted gate in one is visible, scoped to it.
-        const primary = githubForDefault(ctx.ports);
-        if (primary === null) {
-          const none = noBuildRepositoryError();
-          return { status: 'down', detail: `${none.internal ?? ''} ${none.nextStep}`.trim() };
+        // PER REPOSITORY (RFC-001 PR 2.2). With guild routing a build can land in ANY configured
+        // repository, so the status is down only when NONE of them can build, degraded when some
+        // cannot (or a request is stranded on a key the set no longer has), and every repository
+        // gets its own line - its readiness and what is in flight there - when there are several.
+        // A one-repository install's line is unchanged from phase 1.
+        const refs = ctx.ports.repos.all();
+        const entries = refs.map((r) => ({ repo: r, ready: readinessIn(ctx.ports, r) }));
+        const stranded = strandedDetail(repo.unconfigured(refs.map((r) => r.key)).filter((r) => !isTerminalState(r.state)));
+        const repositories = repositoriesDetail(entries, repo.inFlightByRepo());
+        const down = entries.filter((e) => e.ready.status === 'down');
+        if (down.length === entries.length) {
+          const only = entries.length === 1 ? entries[0] : undefined;
+          const why = only !== undefined && only.ready.status === 'down' ? only.ready.detail : 'builds are disabled in every repository';
+          return { status: 'down', detail: `${why}${repositories}${stranded}` };
         }
-        if (!primary.ok) return { status: 'down', detail: primary.error.nextStep };
-        const others = otherRepositoriesDetail(ctx.ports, primary.value.repo);
-        const ready = primary.value.builds.readiness();
-        if (ready.status === 'down') return { status: 'down', detail: `${ready.detail}${others}` };
 
         // THREE NUMBERS, ALL OTHERWISE INVISIBLE. "Who is paying" is the first thing an operator
         // wants confirmed after flipping `requireOwnCredentials`. The TTL is the setting that
@@ -1773,16 +1796,35 @@ export default defineModule({
           ? 'every requester funds their own build'
           : `builds fall back to the shared ${SHARED_BUILD_ENVIRONMENT} environment`;
         return {
-          status: 'ok',
+          status: down.length > 0 || stranded !== '' ? 'degraded' : 'ok',
           detail:
             `ready; ${funding}; unapproved requests expire after ${String(ttlHours(cfg.approvalTtlMs))}h; ` +
             // THE FOURTH NUMBER, AND WHETHER IT IS THE SAME NUMBER THE REPOSITORY BELIEVES.
             // Reporting the bot's cap alone was a half-truth: the workflow enforces its own, and
             // when the two drifted the product's answer to "how many runs a day?" was confidently
-            // wrong in a way only a failed build would reveal.
+            // wrong in a way only a failed build would reveal. (Compared against the DEFAULT
+            // repository's variable; per-repository caps and drift are PR 2.4.)
             `up to ${String(cfg.dailyRunCap)} agent runs per UTC day (${capAgreementDetail(capAgreement)})` +
-            others,
+            repositories +
+            stranded,
         };
+      },
+
+      // WHAT `/repo show` AND `/repo clear` LEARN FROM THIS MODULE (RFC-001 PR 2.2), through
+      // `ctx.ports.repos.activity()`: the `repos` module cannot read this table, so the module
+      // that owns it answers. Both reads are one indexed count; neither reaches GitHub.
+      repoActivity: {
+        inFlightForGuild: (guildId) => repo.inFlightForGuild(guildId),
+        inRepo: (r) => {
+          const ready = readinessIn(ctx.ports, r);
+          return {
+            inFlight: repo.inFlightByRepo().get(r.key) ?? 0,
+            detail:
+              (ready.status === 'ready' ? 'builds ready' : `builds disabled - ${ready.detail}`) +
+              `; up to ${String(cfg.dailyRunCap)} agent runs per UTC day` +
+              (r.isDefault ? ` (${capAgreementDetail(capAgreement)})` : ''),
+          };
+        },
       },
     };
   },
@@ -1792,23 +1834,96 @@ export default defineModule({
 // Small helpers kept below the manifest so the manifest reads top to bottom
 // ---------------------------------------------------------------------------------------
 
+/** One repository's build readiness, as last established. No request. */
+function readinessIn(ports: GithubScopes<unknown, Pick<BuildsPort, 'readiness'>>, r: RepoRef): BuildReadiness {
+  const builds = ports.builds.at(r);
+  return builds.ok ? builds.value.readiness() : { status: 'down', detail: 'no GitHub adapter is configured for it' };
+}
+
 /**
- * `/status`'s note on the repositories builds do NOT land in yet (RFC-001 PR 2.1): each one's
- * readiness, so drift or a transient probe failure in one repository of the set is reported
- * against THAT repository. Empty for a one-repository set, so its `/status` line is unchanged.
- * No request: `readiness()` reads the last answer.
+ * `/status`, per repository (RFC-001 PR 2.2): each configured repository's readiness and how many
+ * requests are in flight in it, so drift or a transient probe failure in one repository of the
+ * set is reported against THAT repository. Empty for a one-repository set, so its line is
+ * unchanged from phase 1. No request: `readiness()` reads the last answer.
  */
-export function otherRepositoriesDetail(ports: GithubScopes<unknown, Pick<BuildsPort, 'readiness'>>, primary: RepoRef): string {
-  const others = ports.repos.all().filter((r) => r !== primary);
-  if (others.length === 0) return '';
-  const parts = others.map((r) => {
-    const name = `${r.key} (${repoFullName(r)})`;
-    const builds = ports.builds.at(r);
-    if (!builds.ok) return `${name}: unavailable`;
-    const ready = builds.value.readiness();
-    return ready.status === 'ready' ? `${name}: ready` : `${name}: down - ${ready.detail}`;
+export function repositoriesDetail(
+  entries: readonly { readonly repo: RepoRef; readonly ready: BuildReadiness }[],
+  inFlight: ReadonlyMap<string, number>,
+): string {
+  if (entries.length <= 1) return '';
+  const parts = entries.map(({ repo: r, ready }) => {
+    const name = `${r.key} (${repoFullName(r)}${r.isDefault ? ', default' : ''})`;
+    const state = ready.status === 'ready' ? 'ready' : `down - ${ready.detail}`;
+    return `${name}: ${state}, ${String(inFlight.get(r.key) ?? 0)} in flight`;
   });
-  return `; builds land in ${primary.key} (${repoFullName(primary)}); other repositories: ${parts.join('; ')}`;
+  const noDefault = entries.some((e) => e.repo.isDefault)
+    ? ''
+    : '; no repository is the default, so a server builds only once an operator runs /repo use in it';
+  return `; repositories: ${parts.join('; ')}${noDefault}`;
+}
+
+/**
+ * `/status`'s note on requests in flight on a repository key the set no longer configures - the
+ * rows the boot adoption had no evidence to move (`planRepoKeyAdoption`). Empty when there are
+ * none, which is every boot of a stable configuration.
+ */
+export function strandedDetail(rows: readonly Pick<BuildRow, 'repoKey'>[]): string {
+  if (rows.length === 0) return '';
+  const keys = [...new Set(rows.map((r) => r.repoKey))].sort();
+  return (
+    `; ${String(rows.length)} request(s) in flight are filed in repositories this bot is no longer configured for (${keys.join(', ')}), ` +
+    'and every later step refuses them: add the key back to GITHUB_REPOS_JSON, or cancel them with /request cancel'
+  );
+}
+
+/**
+ * Apply `planRepoKeyAdoption` to the table: re-key what the evidence places, report the rest.
+ * Each move is guarded on the key the row had, so a second boot (or a second process) racing
+ * this one changes nothing twice.
+ */
+export function adoptRepoKeys(repo: BuildRepo, refs: readonly RepoRef[]): RepoKeyAdoption {
+  const plan = planRepoKeyAdoption(repo.unconfigured(refs.map((r) => r.key)), refs);
+  const adopted = plan.adopted.filter((a) => {
+    const id = toRequestId(a.id);
+    return id.ok && repo.rekey(id.value, a.from, a.to);
+  });
+  return { adopted, stranded: plan.stranded };
+}
+
+/** How many stranded request ids a boot log line names before it says "and N more". */
+const STRANDED_NAMED = 10;
+
+/**
+ * Say what the boot adoption did, ONCE: an info line and an audit row for the rows it moved, a
+ * warning and an audit row naming the requests it could not place. Silent when both are empty.
+ */
+export function reportRepoKeyAdoption(logger: LoggerPort, audit: AuditPort, adoption: RepoKeyAdoption): void {
+  if (adoption.adopted.length > 0) {
+    const moves = [...new Set(adoption.adopted.map((a) => `${a.from}->${a.to}`))].sort();
+    logger.info('requests re-keyed to the repository their issue lives in', { count: adoption.adopted.length, moves: moves.join(',') });
+    audit.record({
+      action: 'builder.repo_key.adopted',
+      actorId: SYSTEM_ACTOR,
+      guildId: null,
+      detail: { count: adoption.adopted.length, moves, requestIds: adoption.adopted.slice(0, STRANDED_NAMED).map((a) => a.id) },
+    });
+  }
+  const live = adoption.stranded.filter((s) => !isTerminalState(s.state));
+  if (live.length > 0) {
+    const keys = [...new Set(live.map((s) => s.repoKey))].sort();
+    const named = live.slice(0, STRANDED_NAMED).map((s) => s.id);
+    const more = live.length > named.length ? ` and ${String(live.length - named.length)} more` : '';
+    logger.warn(
+      `requests in flight are filed in repositories this bot is no longer configured for; every later step refuses them until the key is back in GITHUB_REPOS_JSON or they are cancelled: ${named.join(', ')}${more}`,
+      { count: live.length, keys: keys.join(',') },
+    );
+    audit.record({
+      action: 'builder.repo_key.stranded',
+      actorId: SYSTEM_ACTOR,
+      guildId: null,
+      detail: { count: live.length, keys, requestIds: named },
+    });
+  }
 }
 
 /** WHY exported: the reconciler test asserts the number a stuck row is compared against. */
@@ -1944,6 +2059,7 @@ function previewRow(state: BuildRow['state'], issueNumber: number): BuildRow {
     state,
     version: 1,
     guildId: '222222222222222222',
+    repoKey: 'default',
     requesterId: PREVIEW_USER,
     nonce: newCardNonce(),
     fenceNonce: newFenceNonce(),

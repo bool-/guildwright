@@ -203,7 +203,7 @@ async function githubChecks(
     if (dflt === null) {
       add(
         'warn',
-        'no repository in GITHUB_REPOS_JSON is marked "default": true, and guild routing (/repo use) is not available in this version, so /request new and /credentials have no repository to act on. Mark one entry "default": true.',
+        'no repository in GITHUB_REPOS_JSON is marked "default": true, so a server can build only after an operator runs /repo use in it, and /credentials has no repository to act on in any server. Mark one entry "default": true.',
       );
     }
   }

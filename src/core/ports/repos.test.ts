@@ -6,8 +6,10 @@
  *  - `RepoScoped.at` hands back the port of THE ref it was given, and refuses a ref minted by a
  *    different set even when every field is equal: routing is by identity, so a module that
  *    assembled a look-alike reaches nothing.
- *  - `resolve` is the RFC's "mapping, else the default, else null", with the mapping as the PR 2.2
- *    seam: a mapped key that is no longer configured falls back rather than reaching another set.
+ *  - `resolve` is the RFC's "mapping, else the default, else null". A mapped key that is no longer
+ *    configured is `stale` and resolves to NOTHING (PR 2.2): not another set's ref, and not the
+ *    default either, because the default is another of the operator's trust domains.
+ *  - `activity()` is late-bound: it reports what modules installed after the port was built.
  *  - `byKey` re-validates a persisted key against THIS process's set.
  *  - The `repos` capability narrows `ctx.ports` at compile time (TS2339, AGENTS.md rule 6, proved
  *    by the `@ts-expect-error` lines, which `npm run typecheck` fails if they stop being errors)
@@ -23,7 +25,13 @@ import { defineModule } from '#core/module';
 import { createEventBus } from '#core/events';
 import { ALL_CAPABILITIES, portsFor, type RepoRef, type ReposPort } from '#core/ports';
 import { toGuildId, type GuildId } from '#core/ids';
-import { createRepoSet, createReposPort, repoScoped, type RepoSet } from '#core/ports/repos';
+import {
+  createRepoSet,
+  createReposPort,
+  repoScoped,
+  type RepoActivityReport,
+  type RepoSet,
+} from '#core/ports/repos';
 import { fakeLogger, fakePorts, fakePortsOnly } from '#testing/fakes';
 
 function minted(entries: Parameters<typeof createRepoSet>[0]): RepoSet {
@@ -86,13 +94,27 @@ test('resolve: the guild mapping, else the default repository, else null', () =>
   assert.equal(port.resolve(guild('100000000000000001')), set.default, 'no mapping in PR 2.1: the default');
   assert.equal(port.resolve(guild('100000000000000001'))?.key, 'main');
 
-  // THE PR 2.2 SEAM: a mapping function. A mapped key wins; an unconfigured one falls back.
+  // The mapping (PR 2.2). A mapped key wins; an unconfigured one is STALE and resolves to nothing.
   const mapped = createReposPort(set, (g) => (g === '100000000000000002' ? 'events' : g === '100000000000000003' ? 'gone' : null));
   assert.equal(mapped.resolve(guild('100000000000000002'))?.key, 'events');
-  assert.equal(mapped.resolve(guild('100000000000000003'))?.key, 'main', 'a persisted key no longer configured is re-validated, not trusted');
+  assert.equal(mapped.resolve(guild('100000000000000003')), null, 'a removed repository does not silently hand the guild to the default');
+  assert.deepEqual(mapped.target(guild('100000000000000003')), { kind: 'stale', key: 'gone' });
+  assert.equal(mapped.target(guild('100000000000000002')).kind, 'mapped');
+  assert.equal(mapped.target(guild('100000000000000001')).kind, 'default');
 
   const noDefault = createReposPort(minted([{ ...TWO[0], isDefault: false }, TWO[1]]));
   assert.equal(noDefault.resolve(guild('100000000000000001')), null, 'several repositories and no default: nothing to resolve to');
+  assert.deepEqual(noDefault.target(guild('100000000000000001')), { kind: 'none' });
+});
+
+test('activity() is late-bound: it reports whatever the composition root installed after the port was built', () => {
+  const set = minted(TWO);
+  let reports: readonly RepoActivityReport[] = [];
+  const port = createReposPort(set, undefined, () => reports);
+  assert.deepEqual(port.activity(), [], 'before install, nothing reports');
+  reports = [{ moduleId: 'builder', inFlightForGuild: () => 2, inRepo: () => ({ inFlight: 1, detail: 'ready' }) }];
+  assert.equal(port.activity().length, 1);
+  assert.equal(port.activity()[0]?.inFlightForGuild(guild('100000000000000001')), 2);
 });
 
 test('byKey re-validates a key against THIS set; all() is the set in configuration order', () => {

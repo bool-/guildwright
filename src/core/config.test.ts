@@ -254,7 +254,7 @@ test('GITHUB_REPOS_JSON: a one-entry set that says nothing about default IS the 
   assert.ok(cfg.ok, cfg.ok ? '' : cfg.error.internal ?? '');
   if (!cfg.ok) return;
   assert.equal(cfg.value.github.repos[0]?.isDefault, true);
-  // Several entries and no `default`: valid (guild routing is PR 2.2), and none is the default.
+  // Several entries and no `default`: valid (servers are linked with /repo use), and none is the default.
   const many = loadConfig({ ...NO_REPO, GITHUB_REPOS_JSON: '{"a":{"owner":"acme","repo":"x"},"b":{"owner":"acme","repo":"y"}}' });
   assert.ok(many.ok);
   if (!many.ok) return;

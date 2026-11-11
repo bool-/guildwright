@@ -71,6 +71,7 @@ function seed(repo: ReturnType<typeof buildRepo>, id: RequestId, guildId = '2222
     state: 'draft',
     version: 1,
     guildId,
+    repoKey: 'default',
     requesterId: '111111111111111111',
     nonce: newCardNonce(),
     fenceNonce: newFenceNonce(),

@@ -37,10 +37,12 @@ import { isJsonObject } from '#core/json';
 import type { Result } from '#core/result';
 import { Err, Ok } from '#core/result';
 import type { BuildsPort, IssuesPort, RepoRef, RepoScoped, ReposPort } from '#core/ports';
-import { toGuildId, type GuildId } from '#core/ids';
+import { DEFAULT_REPO_KEY, repoFullName } from '#core/ports';
+import type { GuildId } from '#core/ids';
+import type { BuildState } from '#modules/builder/rows';
 
 // ---------------------------------------------------------------------------------------
-// Which repository (RFC-001 PR 2.1)
+// Which repository (RFC-001 PR 2.1 and PR 2.2)
 // ---------------------------------------------------------------------------------------
 
 /**
@@ -49,7 +51,7 @@ import { toGuildId, type GuildId } from '#core/ids';
  * shapes so a call site that needs only `close` can say so (`history.ts`).
  */
 export interface GithubScopes<I, B> {
-  readonly repos: Pick<ReposPort, 'resolve' | 'all'>;
+  readonly repos: Pick<ReposPort, 'target' | 'byKey' | 'all'>;
   readonly issues: RepoScoped<I>;
   readonly builds: RepoScoped<B>;
 }
@@ -62,16 +64,44 @@ export interface RepoGithub<I, B> {
 }
 
 /**
- * The refusal for a guild with no repository (RFC-001 7.3's sentence). With one repository this
- * is unreachable - the shim's only repository is the default. With several and no
- * `"default": true`, nothing can be built until one is marked; the next step says how in THIS
- * version, because `/repo use` (guild routing) arrives with PR 2.2.
+ * The refusal for a guild with no repository: no `/repo use` link and no default (RFC-001 7.3's
+ * sentence, verbatim). With one repository this is unreachable - the shim's only repository is
+ * the default.
  */
 export function noBuildRepositoryError(): AppError {
   return errors.config(
     'repos.unmapped',
     'This server is not linked to a repository yet, so nothing can be built from it.',
-    'Ask the bot operator to mark one repository "default": true in GITHUB_REPOS_JSON.',
+    'Ask the bot operator to run /repo use in this server.',
+  );
+}
+
+/**
+ * The refusal for a guild linked to a repository the operator has since REMOVED from the set.
+ *
+ * NOT a fallback to the default repository: which repository a server builds in is the
+ * operator's trust decision (RFC-001 7.2), so a removed one must not silently hand the server to
+ * another of the operator's repositories.
+ */
+export function staleRepositoryLinkError(key: string): AppError {
+  return errors.config(
+    'repos.stale_link',
+    `This server is linked to the repository ${key}, which this bot is no longer configured for, so nothing can be built from it.`,
+    `Ask the bot operator to run /repo use in this server, or to add ${key} back to GITHUB_REPOS_JSON.`,
+  );
+}
+
+/**
+ * The refusal for a REQUEST whose persisted repository is no longer configured (RFC-001 7.3:
+ * "retry ... refuses if the row's repo is no longer configured"). Every later step of such a
+ * request refuses with it rather than acting anywhere else - an issue number means a different
+ * issue in every repository.
+ */
+export function requestRepositoryGoneError(key: string): AppError {
+  return errors.config(
+    'repos.request_repo_gone',
+    `This request was filed in the repository ${key}, which this bot is no longer configured for.`,
+    `Ask the bot operator to add ${key} back to GITHUB_REPOS_JSON, or open a new request with /request new.`,
   );
 }
 
@@ -87,38 +117,121 @@ function scopeTo<I, B>(ports: GithubScopes<I, B>, repo: RepoRef): Result<RepoGit
 /**
  * THE FRONT DOOR'S REPOSITORY: where a NEW request from this guild is filed and built
  * (RFC-001 7.3: the guild's mapping, else the default repository, else refuse - nothing filed).
- * `ReposPort.resolve` is synchronous, so this is safe ahead of a `showModal` too.
+ * `ReposPort.target` is synchronous, so this is safe ahead of a `showModal` too.
  */
 export function githubForGuild<I, B>(ports: GithubScopes<I, B>, guildId: GuildId): Result<RepoGithub<I, B>, AppError> {
-  const repo = ports.repos.resolve(guildId);
-  return repo === null ? Err(noBuildRepositoryError()) : scopeTo(ports, repo);
+  const target = ports.repos.target(guildId);
+  switch (target.kind) {
+    case 'mapped':
+    case 'default':
+      return scopeTo(ports, target.repo);
+    case 'stale':
+      return Err(staleRepositoryLinkError(target.key));
+    case 'none':
+      return Err(noBuildRepositoryError());
+    default: {
+      const exhaustive: never = target;
+      void exhaustive;
+      return Err(noBuildRepositoryError());
+    }
+  }
 }
 
 /**
  * THE REPOSITORY AN EXISTING ROW LIVES IN: every later step of a request (approve, dispatch,
  * poll, reject, cancel, retry, expire) calls `.at()` once, here.
  *
- * THE SEAM PR 2.2 FILLS. The row carries no repository key yet - `repo_key` is PR 2.2's
- * migration `0005_repo_key.sql`, which also makes a mapping change mid-build unable to move a
- * poll - so today this resolves the row's GUILD exactly as the front door did. That is the same
- * answer for the row's whole life, because in this version nothing can change it while the
- * process runs: there is no guild mapping, and the set and its default are static config.
- * PR 2.2 replaces the body with `repos.byKey(row.repoKey)` and keeps every caller.
+ * THE ROW'S OWN KEY, never the guild's current mapping (RFC-001 7.3). `/repo use` mid-build
+ * therefore cannot move a poll, and `/request retry` re-resolves THIS key against the set as it
+ * is now - refusing, rather than guessing, when the operator has removed it.
  */
-export function githubForRow<I, B>(ports: GithubScopes<I, B>, row: { readonly guildId: string }): Result<RepoGithub<I, B>, AppError> {
-  const guildId = toGuildId(row.guildId);
-  if (!guildId.ok) return guildId;
-  return githubForGuild(ports, guildId.value);
+export function githubForRow<I, B>(ports: GithubScopes<I, B>, row: { readonly repoKey: string }): Result<RepoGithub<I, B>, AppError> {
+  const repo = ports.repos.byKey(row.repoKey);
+  return repo === null ? Err(requestRepositoryGoneError(row.repoKey)) : scopeTo(ports, repo);
 }
 
 /**
- * The repository `/status` and the boot cap check report on: the DEFAULT one, which in this
- * version is the only repository a build can land in. `null` with no default. Per-repository
- * caps and drift reporting across the set are PR 2.4.
+ * The repository the boot cap check compares against: the DEFAULT one. `null` with no default.
+ * Per-repository caps and drift reporting across the set are PR 2.4.
  */
 export function githubForDefault<I, B>(ports: GithubScopes<I, B>): Result<RepoGithub<I, B>, AppError> | null {
   const repo = ports.repos.all().find((r) => r.isDefault) ?? null;
   return repo === null ? null : scopeTo(ports, repo);
+}
+
+// ---------------------------------------------------------------------------------------
+// Rows whose repository key is not configured: the boot adoption (RFC-001 PR 2.2)
+// ---------------------------------------------------------------------------------------
+
+/**
+ * THE DECISION THE RFC LEFT OPEN, and the rule that settles it.
+ *
+ * Migration 0005 gives every existing row `repo_key = 'default'`, which is right for the
+ * single-repository shim (it names its repository `default`) and wrong for an install whose
+ * `GITHUB_REPOS_JSON` has no key `default` - including the operator who moves from the shim to
+ * `GITHUB_REPOS_JSON` under a key like `main`. Left alone, those rows would be STRANDED: every
+ * later step refuses them (`requestRepositoryGoneError`).
+ *
+ * THE RULE: a row whose key is not configured is re-keyed ONLY ON EVIDENCE THE ROW CARRIES.
+ *
+ *  1. Its issue URL names a configured repository (owner/repo, compared case-insensitively, as
+ *     GitHub does) - so it moves to the repository its issue really is in. This settles the shim
+ *     move, a 2.1 install that already used GITHUB_REPOS_JSON, and a key renamed in the JSON.
+ *  2. It has NO issue URL (a submission mid-flight, or a row older than migration 0002), its key
+ *     is `default`, and the set has a default repository - which is where the previous version
+ *     acted on every row, so this changes nothing about where it lives.
+ *
+ * EVERYTHING ELSE IS LEFT EXACTLY AS IT IS - an issue URL naming a repository that is not
+ * configured any more, or no evidence at all - and reported (boot log, audit, `/status`). It is
+ * NOT re-keyed to "the default", because an issue number means a different issue in every
+ * repository: approving, closing or reopening `#42` somewhere else is the one outcome worse than
+ * refusing. And it does not refuse the boot either: nothing a stranded row can do spends money
+ * (the dispatch pass fails it, finishing it and returning its slot), an unclicked one still
+ * expires, and `/request cancel` still works on it - which a quarantined builder could not offer.
+ */
+export interface RepoKeyAdoption {
+  readonly adopted: readonly {
+    readonly id: string;
+    readonly from: string;
+    readonly to: string;
+    readonly evidence: 'issue-url' | 'default-repository';
+  }[];
+  /** Rows left on a key this set does not configure. Their every later step refuses. */
+  readonly stranded: readonly { readonly id: string; readonly repoKey: string; readonly state: BuildState }[];
+}
+
+/** `owner/repo` out of a GitHub issue URL, lowercased, or null. */
+export function issueRepositoryOf(issueUrl: string): string | null {
+  const m = /^https:\/\/[^/]+\/([^/]+)\/([^/]+)\/issues\/\d+\/?$/u.exec(issueUrl);
+  return m === null ? null : `${m[1] ?? ''}/${m[2] ?? ''}`.toLowerCase();
+}
+
+/** Pure: decide, for every row on an unconfigured key, where (if anywhere) the evidence puts it. */
+export function planRepoKeyAdoption(
+  rows: readonly { readonly id: string; readonly repoKey: string; readonly issueUrl: string | null; readonly state: BuildState }[],
+  refs: readonly RepoRef[],
+): RepoKeyAdoption {
+  const configured = new Set<string>(refs.map((r) => r.key));
+  const byName = new Map(refs.map((r) => [repoFullName(r).toLowerCase(), r] as const));
+  const dflt = refs.find((r) => r.isDefault) ?? null;
+  const adopted: RepoKeyAdoption['adopted'][number][] = [];
+  const stranded: RepoKeyAdoption['stranded'][number][] = [];
+  for (const row of rows) {
+    if (configured.has(row.repoKey)) continue;
+    if (row.issueUrl !== null) {
+      const named = issueRepositoryOf(row.issueUrl);
+      const hit = named === null ? undefined : byName.get(named);
+      if (hit !== undefined) adopted.push({ id: row.id, from: row.repoKey, to: hit.key, evidence: 'issue-url' });
+      else stranded.push({ id: row.id, repoKey: row.repoKey, state: row.state });
+      continue;
+    }
+    if (row.repoKey === DEFAULT_REPO_KEY && dflt !== null) {
+      adopted.push({ id: row.id, from: row.repoKey, to: dflt.key, evidence: 'default-repository' });
+      continue;
+    }
+    stranded.push({ id: row.id, repoKey: row.repoKey, state: row.state });
+  }
+  return { adopted, stranded };
 }
 
 // ---------------------------------------------------------------------------------------

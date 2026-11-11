@@ -37,7 +37,7 @@ import type { Args, FormValues } from '#core/args';
 import type { FormHandlerSpec, FormSubmission, Invocation, ProgressHandle } from '#core/module';
 import { Err } from '#core/result';
 import { errors } from '#core/errors';
-import { fakeAccess, fakeAudit, fakeBuilds, fakeClock, fakeDiscord, fakeIssues, fakeJobs, fakeLogger, fakeRepos, fakeScopedByKey, oneRepoPorts, type FakeAudit, type FakeBuilds, type FakeDiscord, type FakeIssues, type FakeJobs } from '#testing/fakes';
+import { fakeAccess, fakeAudit, fakeBuilds, fakeClock, fakeDiscord, fakeIssues, fakeJobs, fakeLogger, fakeRepoSet, fakeRepos, fakeScopedByKey, oneRepoPorts, type FakeAudit, type FakeBuilds, type FakeDiscord, type FakeIssues, type FakeJobs } from '#testing/fakes';
 import type { AccessPort } from '#core/ports';
 import type { CommandSpec } from '#core/module';
 
@@ -145,6 +145,11 @@ export function harness(
    * one-repository set the single-repository shim builds.
    */
   repoSet: RepoSet | null = null,
+  /**
+   * The guild mapping (RFC-001 PR 2.2): the repository KEY a guild is linked to with `/repo use`,
+   * or null. Read on every call, so a test can re-link a guild mid-build. Omitted: nothing mapped.
+   */
+  mapping: ((guildId: GuildId) => string | null) | null = null,
 ): Harness {
   const opened = openSqlite(':memory:');
   assert.ok(opened.ok, 'the in-memory database must open');
@@ -188,6 +193,7 @@ export function harness(
 
   const neighbours: Record<string, { issues: FakeIssues; builds: FakeBuilds }> = {};
   let github: ReturnType<typeof oneRepoPorts> = oneRepoPorts({ issues, builds });
+  if (mapping !== null) github = { ...github, repos: fakeRepos(fakeRepoSet(), mapping) };
   if (repoSet !== null) {
     const issuesBy: Record<string, IssuesPort> = {};
     const buildsBy: Record<string, BuildsPort> = {};
@@ -203,7 +209,12 @@ export function harness(
         buildsBy[ref.key] = other.builds;
       }
     }
-    github = { ...github, repos: fakeRepos(repoSet), issues: fakeScopedByKey(repoSet, issuesBy), builds: fakeScopedByKey(repoSet, buildsBy) };
+    github = {
+      ...github,
+      repos: mapping === null ? fakeRepos(repoSet) : fakeRepos(repoSet, mapping),
+      issues: fakeScopedByKey(repoSet, issuesBy),
+      builds: fakeScopedByKey(repoSet, buildsBy),
+    };
   }
 
   const r = builder.install({
@@ -266,7 +277,7 @@ export const SEED_SLOTS = 1_000;
  * and it is the state a crashed submission leaves behind. Two sweeps exist to reclaim it, and
  * neither can be tested without being able to produce one.
  */
-export function seedDraft(repo: BuildRepo, at = NOW, guildId = GUILD, maxConcurrent = SEED_SLOTS): RequestId | null {
+export function seedDraft(repo: BuildRepo, at = NOW, guildId = GUILD, maxConcurrent = SEED_SLOTS, repoKey = 'default'): RequestId | null {
   const id = newRequestId(at);
   return repo.claimSlot(
     {
@@ -274,6 +285,7 @@ export function seedDraft(repo: BuildRepo, at = NOW, guildId = GUILD, maxConcurr
       state: 'draft',
       version: 1,
       guildId,
+      repoKey,
       requesterId: REQUESTER,
       nonce: newCardNonce(),
       fenceNonce: newFenceNonce(),
@@ -293,8 +305,11 @@ export function seedDraft(repo: BuildRepo, at = NOW, guildId = GUILD, maxConcurr
     : null;
 }
 
-/** A request that has been filed and posted, i.e. one waiting for an approver. */
-export function seedAwaiting(repo: BuildRepo, issueNumber: number, at = NOW, guildId = GUILD): RequestId {
+/**
+ * A request that has been filed and posted, i.e. one waiting for an approver. `repoKey` is the
+ * repository it was filed in (RFC-001 PR 2.2); `default` is the single-repository shim's key.
+ */
+export function seedAwaiting(repo: BuildRepo, issueNumber: number, at = NOW, guildId = GUILD, repoKey = 'default'): RequestId {
   const id = newRequestId(at);
   const claimed = repo.claimSlot(
     {
@@ -302,6 +317,7 @@ export function seedAwaiting(repo: BuildRepo, issueNumber: number, at = NOW, gui
       state: 'draft',
       version: 1,
       guildId,
+      repoKey,
       requesterId: REQUESTER,
       nonce: newCardNonce(),
       fenceNonce: newFenceNonce(),
@@ -329,16 +345,16 @@ export function seedAwaiting(repo: BuildRepo, issueNumber: number, at = NOW, gui
  * `dispatching` with no id is the one legacy shape the dispatch pass refuses, so a fixture that
  * omitted it would be testing the refusal rather than the build.
  */
-export function seedRunning(repo: BuildRepo, issueNumber: number, runId: number, at = NOW): RequestId {
-  const id = seedAwaiting(repo, issueNumber, at);
+export function seedRunning(repo: BuildRepo, issueNumber: number, runId: number, at = NOW, repoKey = 'default'): RequestId {
+  const id = seedAwaiting(repo, issueNumber, at, GUILD, repoKey);
   repo.compareAndSet(id, repo.get(id)?.version ?? 0, 'dispatching', at, { approvalId: newApprovalId() });
   repo.recordRun(id, runId, RUN_URL, at);
   return id;
 }
 
 /** ...or approved and not yet dispatched, which is where the attempt counter lives. */
-export function seedDispatching(repo: BuildRepo, issueNumber: number): RequestId {
-  const id = seedAwaiting(repo, issueNumber);
+export function seedDispatching(repo: BuildRepo, issueNumber: number, repoKey = 'default'): RequestId {
+  const id = seedAwaiting(repo, issueNumber, NOW, GUILD, repoKey);
   repo.compareAndSet(id, repo.get(id)?.version ?? 0, 'dispatching', NOW, { approvalId: newApprovalId() });
   return id;
 }
@@ -465,6 +481,8 @@ export function invocation(
     readonly actorId?: string;
     readonly at?: number;
     readonly args?: Readonly<Record<string, string | boolean>>;
+    /** The guild it is typed in. Omitted: `GUILD`. */
+    readonly guild?: string;
   } = {},
 ): Invocation {
   const at = opts.at ?? NOW;
@@ -477,7 +495,7 @@ export function invocation(
       memberPermissions: 0n,
       appPermissions: 0n,
     },
-    space: { guildId: guildId(GUILD), channelId: channelId(CHANNEL) },
+    space: { guildId: guildId(opts.guild ?? GUILD), channelId: channelId(CHANNEL) },
     args: argsOf(opts.args ?? {}),
     progress: progress(),
     at,
@@ -507,11 +525,13 @@ function formValues(fields: Readonly<Record<string, string>>): FormValues {
 export function submission(
   fields: Readonly<Record<string, string>> = { title: 'Add a /ping command', detail: 'It should reply pong.' },
   actorId = REQUESTER,
+  /** The guild it is submitted in. Omitted: `GUILD`. */
+  guild = GUILD,
 ): FormSubmission {
   return {
     id: newRequestId(NOW),
     actor: { userId: userId(actorId), roleIds: [], isAppOwner: false, memberPermissions: 0n, appPermissions: 0n },
-    space: { guildId: guildId(GUILD), channelId: channelId(CHANNEL) },
+    space: { guildId: guildId(guild), channelId: channelId(CHANNEL) },
     ref: { moduleId: 'builder', action: 'request', entityId: newRequestId(NOW), nonce: newCardNonce() },
     fields: formValues(fields),
     progress: progress(),

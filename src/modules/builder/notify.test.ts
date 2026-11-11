@@ -283,6 +283,7 @@ test('a requester id that is not a snowflake costs the ping and nothing else', a
         state: 'draft',
         version: 1,
         guildId: GUILD,
+        repoKey: 'default',
         requesterId: 'not-a-snowflake',
         nonce: newCardNonce(),
         fenceNonce: newFenceNonce(),

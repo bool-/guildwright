@@ -652,7 +652,7 @@ test('pack, install into a module repo, typecheck it there, and discover its mod
   assert.deepEqual(report.quarantined, []);
   // `source` is the loader's display path (relative to the cwd); normalise the separator.
   const byId = new Map(report.discovered.map((m) => [m.id, m.source.split('\\').join('/')]));
-  for (const id of ['access', 'admin', 'builder', 'credentials', 'help', 'ping']) {
+  for (const id of ['access', 'admin', 'builder', 'credentials', 'help', 'ping', 'repos']) {
     const source = byId.get(id);
     assert.ok(source !== undefined, `built-in ${id} was not discovered: ${discovered.stdout}`);
     assert.ok(source.endsWith(`node_modules/${PKG}/dist/modules/${id}/module.js`), source);
@@ -682,7 +682,7 @@ test('pack, install into a module repo, typecheck it there, and discover its mod
   });
   assert.equal(doctor.status, 0, output(doctor));
   const listed = /modules discovered: (.+)/u.exec(doctor.stdout)?.[1]?.split(', ') ?? [];
-  for (const id of ['access', 'admin', 'builder', 'credentials', 'help', 'ping', 'demo']) assert.ok(listed.includes(id), `${id}: ${output(doctor)}`);
+  for (const id of ['access', 'admin', 'builder', 'credentials', 'help', 'ping', 'repos', 'demo']) assert.ok(listed.includes(id), `${id}: ${output(doctor)}`);
 });
 
 // ---------------------------------------------------------------------------------------
@@ -780,5 +780,5 @@ test('init the template, npm ci against the packed tarball, scaffold demo --db, 
   const doctor = runBin(['doctor', '--offline']);
   assert.equal(doctor.status, 0, output(doctor));
   const listed = /modules discovered: (.+)/u.exec(doctor.stdout)?.[1]?.split(', ') ?? [];
-  assert.deepEqual([...listed].sort(), ['access', 'admin', 'builder', 'credentials', 'demo', 'help', 'ping', 'tags'], output(doctor));
+  assert.deepEqual([...listed].sort(), ['access', 'admin', 'builder', 'credentials', 'demo', 'help', 'ping', 'repos', 'tags'], output(doctor));
 });
