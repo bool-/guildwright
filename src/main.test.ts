@@ -10,7 +10,32 @@ import { strict as assert } from 'node:assert';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
-import { claimEngine, ENGINE_KEY, ENGINE_PACKAGE } from './main.ts';
+import { CONFIG_USER_TEXT, errors, userMessage } from '#core/errors';
+
+import { BOOT_CONFIG_HEADLINE, claimEngine, ENGINE_KEY, ENGINE_PACKAGE, formatConfigFailure } from './main.ts';
+
+test('a config refusal at boot is headed for the operator, not with the Discord-user sentence', () => {
+  const failure = formatConfigFailure(errors.config('env', '✖ missing\n  → at DISCORD_TOKEN', 'Set it and restart.'));
+  const headline = failure.split('\n')[1];
+  assert.equal(headline, 'guildwright cannot start: The bot is misconfigured.');
+  assert.equal(BOOT_CONFIG_HEADLINE, 'The bot is misconfigured.');
+  assert.ok(!failure.includes(CONFIG_USER_TEXT), failure);
+  // The specifics and the fix still follow the headline.
+  assert.match(failure, /^ {2}where: env$/mu);
+  assert.match(failure, /^ {4}→ at DISCORD_TOKEN$/mu);
+  assert.match(failure, /^ {2}what to do: Set it and restart\.$/mu);
+  // docs/SETUP.md section 6 quotes this exact line.
+  assert.ok(readFileSync(new URL('../docs/SETUP.md', import.meta.url), 'utf8').includes(`\n${headline}\n`));
+});
+
+test('the Discord user still sees CONFIG_USER_TEXT for a runtime config error', () => {
+  assert.equal(userMessage(errors.config('module.tags', 'hint', 'Fix it.')), CONFIG_USER_TEXT);
+});
+
+test('a non-config refusal keeps its own headline', () => {
+  const failure = formatConfigFailure(errors.upstream('discord', 401, 'Reset the token.', 'An invalid token was provided.'));
+  assert.equal(failure.split('\n')[1], 'guildwright cannot start: Discord rejected that request.');
+});
 
 test('the engine key is the process-wide Symbol.for, so a second copy of main finds it', () => {
   // A module-level `let` in a second copy of this file would be a second variable. Only a

@@ -991,24 +991,28 @@ the host, not in the repository, and is migrated in place, not exported.
 Before you start: `guildwright` must be published at the version you will pin, and you need the
 old bot running from that repository's `main`.
 
-1. **On a branch in the existing repository, delete what the engine now provides.** Whatever of
-   these exist:
+1. **On a branch in the existing repository, delete what the engine now provides.** This is the
+   one delete list (RFC-001 section 10 points here); `--ignore-unmatch` skips whatever your tree
+   never had:
 
    ```bash
    git switch -c move-to-guildwright
-   git rm -r --ignore-unmatch src/core src/adapters src/testing scripts docs \
+   git rm -r --ignore-unmatch src/core src/adapters src/testing src/lib scripts docs test \
      src/main.ts src/loader.ts src/engine-events.d.ts \
      src/main.test.ts src/loader.test.ts src/build.test.ts src/registry.boot.test.ts \
+     src/cli.test.ts src/conventions.test.ts \
      tsconfig.build.json tsconfig.module-repo.json
    git rm -r --ignore-unmatch src/modules/access src/modules/admin src/modules/builder \
      src/modules/credentials src/modules/help src/modules/ping src/modules/repos
    git commit -m "Remove the engine: it is the guildwright package now"
    ```
 
-   Keep `src/modules/tags/` and every module of your own. The built-in folders must go: the
-   engine loads its own `builder` (and the rest) from `node_modules`, and a second module with the
-   same id refuses to start naming both. Do **not** touch any `migrations/*.sql` you keep: their
-   checksums are recorded in the database, and a changed byte stops the boot.
+   The `src/*.test.ts` files are the engine's own tests; `init` in step 2 writes the module
+   repository's `src/conventions.test.ts` in place of the engine's. Keep `src/modules/tags/` and
+   every module of your own. The built-in folders must go: the engine loads its own `builder`
+   (and the rest) from `node_modules`, and a second module with the same id refuses to start
+   naming both. Do **not** touch any `migrations/*.sql` you keep: their checksums are recorded in
+   the database, and a changed byte stops the boot.
 
 2. **Convert the rest with the engine's CLI:**
 
@@ -1025,12 +1029,49 @@ old bot running from that repository's `main`.
    `src/engine.d.ts`, and never writes `.env` or anything under `src/modules/`. `README.md` and
    `AGENTS.md` are replaced by the template's, so save anything of your own from them first.
 
-3. **If the bot runs in Docker, replace the old `Dockerfile`.** The old one ran
-   `node --conditions=source src/main.ts`, which no longer exists. Use the three files in
-   section 9, keeping your own image name. `compose.yaml` needs the `./secrets` mount only if you
-   move to an App key file.
+   **If the lockfile step fails, the conversion is still done.** The lockfile is resolved against
+   the registry, so when `guildwright` at the pinned version is not reachable there (not yet
+   published, or no network), `init` prints `init: could not generate package-lock.json` and
+   exits 1, leaving the converted tree in place and any old lockfile removed. You do not need to
+   run `init` again; once the registry has the version, run:
 
-4. **Prove it:**
+   ```bash
+   npm install --package-lock-only --ignore-scripts
+   ```
+
+3. **If the bot runs in Docker, replace the old `Dockerfile` and `compose.yaml`.** The old
+   `Dockerfile` ran `node --conditions=source src/main.ts`, which no longer exists. Use the files
+   in section 9, keeping your own image name. `compose.yaml` needs the `./secrets` mount only if
+   you move to an App key file. **Merge** section 9's `.dockerignore` into your existing one
+   rather than replacing it: keep the entries your repository already had (`brand/`, `.claude/`,
+   `.vscode/`, `.idea/`, `dist/` and the like) and add section 9's below them.
+
+4. **Bring your module tests along, then prove it.** Two things the deletion in step 1 takes
+   with it:
+
+   - **Module tests that import `#adapters/*` or `#lib/*` no longer resolve.** A module
+     repository's import map has only `#core/*`, `#modules/*` and `#testing/*`, and the engine
+     exports no adapters. The usual case is a test that rendered a reply through
+     `renderView` from `#adapters/discord/render`; assert on the view instead:
+
+     ```ts
+     import { validateView } from '#core/view';
+
+     assert.deepEqual(validateView(outcome.view), [], 'the reply must pass the engine view validator');
+     ```
+
+     `validateView` is the same structural check `renderView` runs first, but it is weaker: it
+     does not build the discord.js payload, so anything discord.js itself would reject while
+     building it is no longer caught by your test. It is still caught at run time, as an error
+     on the card rather than a crash.
+   - **`tags` loses its tests.** Its tests were the engine's, and `init --existing` never writes
+     under `src/modules/`. Copy the template's, written against the same `tags` source:
+
+     ```bash
+     cp node_modules/guildwright/template/src/modules/tags/module.test.ts src/modules/tags/
+     ```
+
+   Then:
 
    ```bash
    npm ci
@@ -1043,9 +1084,14 @@ old bot running from that repository's `main`.
    be green. The pull request's `## Operator action required` section is the list in step 5.
 
 5. **Configure GitHub and `.env`.** Values in `.env` are unchanged. Then either:
-   - **keep the PAT**, and add **Secrets: read** to it (and confirm **Contents: read**): without
-     Secrets the bot now refuses to start, because it checks that the `APPROVAL_HMAC_KEY`
-     repository secret exists; or
+   - **keep the PAT**, and make sure it has both of these:
+     - **Secrets: read.** Without it the bot **refuses to start**: it checks that the
+       `APPROVAL_HMAC_KEY` repository secret exists, and a PAT that cannot read secrets fails
+       that check at boot.
+     - **Contents: read.** Without it the bot starts, but **every build is refused**: the
+       gate-file check cannot read the workflow at `GITHUB_REF`, so builds stay disabled.
+
+     Or
    - **register a GitHub App** (section 4a), install it on this repository only, add
      `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY_FILE`, and **remove** `GITHUB_TOKEN` — both at
      once refuses to start.
@@ -1058,11 +1104,18 @@ old bot running from that repository's `main`.
 
 6. **Cut over.** Take a backup first (section 9) — the first boot on the engine applies the
    builder's migration `0005_repo_key.sql`, so rolling back means restoring it. Then stop the old
-   process (SIGTERM; in-flight jobs finish or checkpoint), merge the branch, pull on the bot host,
-   and either `npm ci --ignore-scripts && npx guildwright doctor && npm start`, or
+   process (SIGTERM; in-flight jobs finish or checkpoint), merge the pull request, pull on the
+   bot host, and either `npm ci --ignore-scripts && npx guildwright doctor && npm start`, or
    `docker compose up -d --build`. The core and the builder's earlier migrations are byte-identical
    copies, so their checksums match; durable jobs are recovered and in-flight requests keep
    polling. Downtime is the restart.
+
+   **Merge the pull request before you restart the bot on the engine, never after.** The engine
+   compares the gate files at `GITHUB_REF` with its own template, and the old `main`'s
+   `agent-implement-request.yml` is not the template's (its prompt text changed in RFC-001
+   PR 1.8; `verify_approval.py` and `agent-settings.json` are unchanged). Started against the
+   old `main`, the bot runs but the gate-file check disables every build until the pull request
+   lands.
 
 7. **Discord: nothing.** Same application, same token, same invite. Commands are redeployed only
    if their definitions changed. New permission keys `repos.manage` (fallback `nobody`) and
@@ -1083,6 +1136,11 @@ old bot running from that repository's `main`.
 Boot verifies the GitHub half of the configuration before reporting ready, so an expired token or
 a renamed workflow fails in one second with the variable named, rather than hours later as a
 user's build "timing out". `npx guildwright doctor` runs the same checks without starting.
+
+**On a PAT, two permissions are the usual cause, and they fail differently.** A PAT without
+**Secrets: read** stops the bot at boot (fatal, below). A PAT without **Contents: read** lets the
+bot start, and then **every build is refused**, because the gate-file check cannot read the
+workflow. Grant both (section 4b).
 
 What is **fatal** (the process exits 1, naming what to fix):
 
@@ -1110,6 +1168,7 @@ What only **warns** (the bot starts; builds may be off until it passes, and `/st
   takes `/help` down with it. The unverified check is re-run at the next `/request new` or
   dispatch.
 - **`404` on the ref.** Resolving a ref needs **Contents: read**; the warning names both causes.
+  Without Contents the bot starts, but every build is refused until it is granted.
 - **The workflow is disabled**, or **Issues are switched off**. Both are fixable on the
   repository's settings pages without a restart.
 - **`GITHUB_TOKEN` expires within 14 days.**
