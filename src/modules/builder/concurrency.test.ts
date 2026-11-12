@@ -30,28 +30,38 @@ import { test } from 'node:test';
 
 import { Err } from '#core/result';
 import { errors, userMessage } from '#core/errors';
-import type { Outcome } from '#core/module';
-import { newApprovalId, newRequestId } from '#core/ids';
-import { DRAFT_STALE_MS, concurrencyError, slotsUsed } from '#modules/builder/module';
+import type { ClickInvocation, Outcome } from '#core/module';
+import { newApprovalId, newCardNonce, newRequestId, toCardNonce, type RequestId } from '#core/ids';
+import { DRAFT_STALE_MS, concurrencyError, repoConcurrencyError, slotsUsed } from '#modules/builder/module';
 import { readFileSync, readdirSync } from 'node:fs';
 import type { DbPort, SqlQuery } from '#core/ports/db';
 import { openSqlite } from '#adapters/sqlite/db';
-import { buildRepo, type NewBuildRow } from '#modules/builder/rows';
+import { buildRepo, type BuildRepo, type NewBuildRow } from '#modules/builder/rows';
+import { fakeRepoSet } from '#testing/fakes';
 
 /** Where the builder's own migrations live, for the bare-database test at the end. */
 const BUILDER_MIGRATIONS = 'src/modules/builder/migrations';
 import {
+  CHANNEL,
   GUILD,
   NOW,
   REQUESTER,
   SEED_SLOTS,
+  SURFACE,
+  approveSeeded,
+  channelId,
+  commandOf,
+  guildId,
   harness,
+  invocation,
+  progress,
   requestForm,
   runtime,
   seedAwaiting,
   seedDraft,
   seedRunning,
   submission,
+  userId,
   type Harness,
 } from '#modules/builder/harness.test';
 
@@ -290,7 +300,7 @@ test('RE-ARMING A REQUEST CLAIMS ITS SLOT IN THE SAME STATEMENT, and says which 
     // The guild's single slot, held by something else.
     seedAwaiting(h.repo, 43);
     assert.equal(
-      h.repo.reopenForDispatch({ id: row.id, expectVersion: row.version, guildId: GUILD, at: NOW, maxConcurrent: 1, approvalId: newApprovalId() }),
+      h.repo.reopenForDispatch({ id: row.id, expectVersion: row.version, guildId: GUILD, at: NOW, maxConcurrent: 1, repoKey: 'default', maxConcurrentPerRepo: 9, approvalId: newApprovalId() }),
       'full',
       'the cap is enforced by the statement that re-arms the row, not by a read before it',
     );
@@ -298,11 +308,11 @@ test('RE-ARMING A REQUEST CLAIMS ITS SLOT IN THE SAME STATEMENT, and says which 
 
     // With room, a STALE version is a different answer entirely.
     assert.equal(
-      h.repo.reopenForDispatch({ id: row.id, expectVersion: row.version + 99, guildId: GUILD, at: NOW, maxConcurrent: 9, approvalId: newApprovalId() }),
+      h.repo.reopenForDispatch({ id: row.id, expectVersion: row.version + 99, guildId: GUILD, at: NOW, maxConcurrent: 9, repoKey: 'default', maxConcurrentPerRepo: 9, approvalId: newApprovalId() }),
       'lost',
     );
     assert.equal(
-      h.repo.reopenForDispatch({ id: row.id, expectVersion: row.version, guildId: GUILD, at: NOW, maxConcurrent: 9, approvalId: newApprovalId() }),
+      h.repo.reopenForDispatch({ id: row.id, expectVersion: row.version, guildId: GUILD, at: NOW, maxConcurrent: 9, repoKey: 'default', maxConcurrentPerRepo: 9, approvalId: newApprovalId() }),
       'claimed',
     );
     assert.equal(h.repo.get(failed)?.state, 'dispatching');
@@ -543,6 +553,309 @@ test('THE CLAIM HAS NO OBSERVABLE MOMENT BETWEEN COUNTING AND WRITING for a comp
     );
     assert.equal(turns, 0, 'and there was no separate read for a competitor to be let in at');
     assert.equal(claimed, true, 'with nobody actually competing, the claim still succeeds');
+  } finally {
+    handle.close();
+  }
+});
+
+// ---------------------------------------------------------------------------------------
+// THE PER-REPOSITORY DISPATCH CAP (RFC-001 7.5, PR 2.4)
+//
+// The workflow's `concurrency: agent-implement` group keeps one running run and ONE pending one,
+// and GitHub silently cancels the older pending run when a third queues. The per-guild cap never
+// bounded that: two servers on one repository could dispatch four. `maxConcurrentPerRepo` counts
+// `dispatching`/`running` per repository and is claimed in the same statement that dispatches - the
+// Approve click (`approveForDispatch`) and `/request retry` (`reopenForDispatch`) - so it has the
+// same two properties the guild cap has: the loser of a race is refused, and there is no separate
+// read for a competitor to be let in at.
+// ---------------------------------------------------------------------------------------
+
+/** A second server, on the SAME repository as `GUILD` unless a test says otherwise. */
+const OTHER_GUILD = '999999999999999999';
+const APPROVER = '555555555555555555';
+
+/** Two repositories: `main` (the default, served by `h.builds`) and `events`. */
+function twoRepos() {
+  return fakeRepoSet([
+    { key: 'main', owner: 'acme', repo: 'bot-modules', isDefault: true },
+    { key: 'events', owner: 'acme', repo: 'events-modules', isDefault: false },
+  ]);
+}
+
+/** A click on a request's Approve button, carrying the card nonce the row holds. */
+function approveClick(h: Harness, id: RequestId): ClickInvocation {
+  const nonce = toCardNonce(h.repo.get(id)?.nonce ?? '');
+  return {
+    id: newRequestId(NOW),
+    actor: { userId: userId(APPROVER), roleIds: [], isAppOwner: false, memberPermissions: 0n, appPermissions: 0n },
+    space: { guildId: guildId(h.repo.get(id)?.guildId ?? GUILD), channelId: channelId(CHANNEL) },
+    ref: { moduleId: 'builder', action: 'approve', entityId: id, nonce: nonce.ok ? nonce.value : newCardNonce() },
+    surface: SURFACE,
+    progress: progress(),
+    at: NOW,
+  };
+}
+
+function approve(h: Harness, id: RequestId): Promise<Outcome> {
+  const action = h.installed.actions.find((a) => a.name === 'approve');
+  assert.ok(action !== undefined, 'the builder must declare an approve action');
+  if (action === undefined) throw new Error('unreachable');
+  return action.handle(approveClick(h, id));
+}
+
+function building(repo: BuildRepo, key: string): number {
+  return repo.buildingByRepo().get(key) ?? 0;
+}
+
+test('TWO APPROVALS AT ONCE ON ONE REPOSITORY CANNOT BOTH TAKE ITS LAST DISPATCH SLOT - while another repository still has room', async () => {
+  // Two servers routed to `main`, one approver clicking both cards together. Before this, both were
+  // dispatched; with `main` holding one build already, that is three in a group that keeps two.
+  const h = harness({ maxConcurrentPerRepo: 2 }, {}, {}, twoRepos());
+  try {
+    seedRunning(h.repo, 10, 70, NOW, 'main');
+    const a = seedAwaiting(h.repo, 11, NOW, GUILD, 'main');
+    const b = seedAwaiting(h.repo, 12, NOW, OTHER_GUILD, 'main');
+    const elsewhere = seedAwaiting(h.repo, 13, NOW, OTHER_GUILD, 'events');
+
+    const both = await Promise.all([approve(h, a), approve(h, b)]);
+    assert.equal(both.filter((o) => o.kind === 'handoff').length, 1, 'exactly one approval may dispatch');
+    assert.equal(both.filter((o) => o.kind === 'fail').length, 1, 'and the other is REFUSED, not queued into a cancel');
+    assert.equal(building(h.repo, 'main'), 2, 'THE CAP: two dispatched in main, not three');
+
+    const refused = both.find((o) => o.kind === 'fail');
+    const said = refused?.kind === 'fail' ? userMessage(refused.error) : '';
+    assert.match(said, /acme\/bot-modules already has 2 builds running or about to start/u, 'it names the repository, whose builds may be in another server');
+    assert.match(said, /nothing was approved and nothing was spent/u);
+    const loser = [a, b].find((id) => h.repo.get(id)?.state === 'awaiting_approval');
+    assert.ok(loser !== undefined, 'the refused request is still waiting, with its card live, for a second click');
+    assert.equal(h.repo.get(loser)?.approvalId, null, 'and holds no approval id');
+
+    // A DIFFERENT repository is not touched by main's cap.
+    assert.equal((await approve(h, elsewhere)).kind, 'handoff', 'events still has room');
+    assert.equal(building(h.repo, 'events'), 1);
+  } finally {
+    h.close();
+  }
+});
+
+test('the per-guild AND the per-repository limits both apply, each where it belongs', async () => {
+  // Two servers on one repository, guild cap 2 each, repository cap 2. Each server may FILE two
+  // (the guild cap, counted at submission); only two may DISPATCH across both (the repository cap,
+  // counted at approval). Neither cap stands in for the other.
+  const h = harness({ maxConcurrentPerGuild: 2, maxConcurrentPerRepo: 2 }, {}, {}, twoRepos());
+  try {
+    const a1 = seedAwaiting(h.repo, 1, NOW, GUILD, 'main');
+    const a2 = seedAwaiting(h.repo, 2, NOW, GUILD, 'main');
+    const b1 = seedAwaiting(h.repo, 3, NOW, OTHER_GUILD, 'main');
+
+    // The guild cap still bites at the front door: GUILD holds two.
+    const third = await requestForm(h).handle(submission({ title: 'Third', detail: 'One too many.' }));
+    assert.equal(third.kind, 'fail');
+    assert.equal(third.kind === 'fail' ? third.error.code : '', 'conflict.concurrency_waiting', 'the GUILD refusal, not the repository one');
+
+    // The repository cap bites at approval, across servers.
+    assert.equal((await approve(h, a1)).kind, 'handoff');
+    assert.equal((await approve(h, b1)).kind, 'handoff', 'the other server takes the second slot in main');
+    const blocked = await approve(h, a2);
+    assert.equal(blocked.kind, 'fail', 'GUILD is within its own cap - it is the REPOSITORY that is full');
+    assert.equal(blocked.kind === 'fail' ? blocked.error.code : '', 'conflict.repo_concurrency');
+
+    // And a slot comes back when a build ends.
+    assert.ok(h.repo.finish(a1, 'done', NOW));
+    assert.equal((await approve(h, a2)).kind, 'handoff', 'one finished, so the next approval dispatches');
+  } finally {
+    h.close();
+  }
+});
+
+test('/request retry faces the repository cap too, and says it is the repository rather than the server', async () => {
+  const h = harness({ maxConcurrentPerGuild: 5, maxConcurrentPerRepo: 1 }, {}, {}, twoRepos());
+  try {
+    const failed = seedRunning(h.repo, 42, 77, NOW, 'main');
+    assert.ok(h.repo.finish(failed, 'failed', NOW));
+    seedRunning(h.repo, 43, 78, NOW, 'main'); // the only dispatch slot in main
+
+    const refused = await commandOf(h, 'request retry').handle(invocation({ args: { id: failed } }));
+    assert.equal(refused.kind, 'fail');
+    if (refused.kind !== 'fail') return;
+    assert.equal(refused.error.code, 'conflict.repo_concurrency', 'the server has room; the repository does not');
+    assert.match(userMessage(refused.error), /acme\/bot-modules already has 1 build running or about to start/u);
+    assert.equal(h.repo.get(failed)?.state, 'failed', 'and nothing moved');
+  } finally {
+    h.close();
+  }
+});
+
+test('the repository claim answers with the reason: claimed, repo-full, lost - and full when it is the guild', () => {
+  const h = harness();
+  try {
+    const held = seedAwaiting(h.repo, 1);
+    approveSeeded(h.repo, held);
+    const next = seedAwaiting(h.repo, 2);
+    const row = h.repo.get(next);
+    assert.ok(row !== undefined);
+    if (row === undefined) throw new Error('unreachable');
+    const claim = { id: next, expectVersion: row.version, repoKey: 'default', at: NOW, approvalId: newApprovalId() };
+
+    assert.equal(h.repo.approveForDispatch({ ...claim, maxConcurrentPerRepo: 1 }), 'repo-full', 'the cap is in the statement');
+    assert.equal(h.repo.get(next)?.state, 'awaiting_approval', 'nothing moved');
+    assert.equal(h.repo.approveForDispatch({ ...claim, expectVersion: row.version + 9, maxConcurrentPerRepo: 9 }), 'lost');
+    assert.equal(
+      h.repo.approveForDispatch({ ...claim, repoKey: 'elsewhere', maxConcurrentPerRepo: 9 }),
+      'lost',
+      'a claim against another repository count changes nothing',
+    );
+    assert.equal(h.repo.approveForDispatch({ ...claim, maxConcurrentPerRepo: 2 }), 'claimed');
+
+    // The retry door: guild full is reported as the guild, repository full as the repository.
+    h.repo.finish(next, 'failed', NOW);
+    const failed = h.repo.get(next);
+    assert.ok(failed !== undefined);
+    if (failed === undefined) throw new Error('unreachable');
+    const reopen = { id: next, expectVersion: failed.version, guildId: GUILD, at: NOW, repoKey: 'default', approvalId: newApprovalId() };
+    assert.equal(h.repo.reopenForDispatch({ ...reopen, maxConcurrent: 1, maxConcurrentPerRepo: 9 }), 'full');
+    assert.equal(h.repo.reopenForDispatch({ ...reopen, maxConcurrent: 9, maxConcurrentPerRepo: 1 }), 'repo-full');
+    assert.equal(h.repo.get(next)?.state, 'failed');
+    assert.equal(h.repo.reopenForDispatch({ ...reopen, maxConcurrent: 9, maxConcurrentPerRepo: 2 }), 'claimed');
+  } finally {
+    h.close();
+  }
+});
+
+test('ONE SERVER ON ONE REPOSITORY AT THE DEFAULTS is never refused by the repository cap', async () => {
+  // The phase-1 shape. The guild cap (2, counting unapproved requests too) already keeps dispatched
+  // builds at two or fewer, so the new cap must never be the thing that says no here.
+  const h = harness();
+  try {
+    const a = seedAwaiting(h.repo, 1);
+    const b = seedAwaiting(h.repo, 2);
+    assert.equal((await approve(h, a)).kind, 'handoff');
+    assert.equal((await approve(h, b)).kind, 'handoff', 'both of the guild slots dispatch');
+    assert.equal(building(h.repo, 'default'), 2);
+  } finally {
+    h.close();
+  }
+});
+
+test('the repository refusal names the repository and the cap, and says nothing was spent', () => {
+  const said = userMessage(repoConcurrencyError('acme/bot-modules', 2, 2));
+  assert.match(said, /acme\/bot-modules already has 2 builds running or about to start, which is as many as it takes at once \(2\)/u);
+  assert.match(said, /nothing was spent/u);
+  assert.match(said, /Try again when one of them finishes/u);
+});
+
+/** A bare in-memory database with the builder's migrations, for the competing-writer tests. */
+function bareBuilderDb() {
+  const opened = openSqlite(':memory:');
+  assert.ok(opened.ok);
+  if (!opened.ok) throw new Error('unreachable');
+  for (const file of readdirSync(BUILDER_MIGRATIONS)
+    .filter((f) => f.endsWith('.sql'))
+    .sort((a, b) => a.localeCompare(b))) {
+    opened.value.connection.exec(readFileSync(`${BUILDER_MIGRATIONS}/${file}`, 'utf8'));
+  }
+  return opened.value;
+}
+
+/**
+ * A competitor that approves ONE other request in repository `main` the first time it is let in -
+ * another approver, on another server's card, at the worst possible moment.
+ */
+function competingApprover(competitor: BuildRepo) {
+  const state = { turns: 0, seeded: 0 };
+  const letAnotherApproverIn = (): void => {
+    if (state.turns > 0) return;
+    state.turns += 1;
+    state.seeded += 1;
+    const theirs = seedAwaiting(competitor, 900 + state.seeded, NOW, OTHER_GUILD, 'main');
+    competitor.approveForDispatch({
+      id: theirs,
+      expectVersion: competitor.get(theirs)?.version ?? 0,
+      repoKey: 'main',
+      at: NOW,
+      maxConcurrentPerRepo: 1,
+      approvalId: newApprovalId(),
+    });
+  };
+  return { state, letAnotherApproverIn };
+}
+
+test('THE APPROVE CLAIM HAS NO OBSERVABLE MOMENT BETWEEN COUNTING A REPOSITORY AND WRITING for a competitor to use', () => {
+  // The guild test above, over the repository claim: the same wrapper, the same mutant. A
+  // `building(repo) < cap` read followed by an unguarded UPDATE passes every behavioural test in
+  // this file (the database is synchronous) and fails this one, with the number the product would
+  // have got wrong: two dispatched against a cap of one.
+  const handle = bareBuilderDb();
+  try {
+    const plain = handle.moduleDb('builder');
+    const competitor = buildRepo(plain);
+    const { state, letAnotherApproverIn } = competingApprover(competitor);
+    const raced = buildRepo(interleavingDb(plain, letAnotherApproverIn));
+
+    // THE CONTROL: a read the implementation really performs fires the hook.
+    raced.buildingByRepo();
+    assert.equal(state.turns, 1, 'the injector must actually work, or this whole test is vacuous');
+    assert.equal(building(competitor, 'main'), 1, 'and the competitor really took the slot');
+    for (const r of competitor.stuck(NOW + 1, 10)) competitor.finish(r.id, 'done', NOW);
+    assert.equal(building(competitor, 'main'), 0, 'reset to an empty repository');
+    state.turns = 0;
+
+    const mine = seedAwaiting(competitor, 1, NOW, GUILD, 'main');
+    const claimed = raced.approveForDispatch({
+      id: mine,
+      expectVersion: competitor.get(mine)?.version ?? 0,
+      repoKey: 'main',
+      at: NOW,
+      maxConcurrentPerRepo: 1,
+      approvalId: newApprovalId(),
+    });
+
+    assert.equal(
+      building(competitor, 'main'),
+      1,
+      'THE CAP. One dispatch slot, one dispatched build, however the two approvers interleaved. Two here ' +
+        'is a third run queued into a concurrency group that cancels it',
+    );
+    assert.equal(state.turns, 0, 'and there was no separate read for a competitor to be let in at');
+    assert.equal(claimed, 'claimed', 'with nobody actually competing, the claim still succeeds');
+  } finally {
+    handle.close();
+  }
+});
+
+test('THE RETRY CLAIM counts the repository inside the same statement too', () => {
+  const handle = bareBuilderDb();
+  try {
+    const plain = handle.moduleDb('builder');
+    const competitor = buildRepo(plain);
+    const { state, letAnotherApproverIn } = competingApprover(competitor);
+    const raced = buildRepo(interleavingDb(plain, letAnotherApproverIn));
+
+    // The control, again, so silence below means something.
+    raced.buildingByRepo();
+    assert.equal(state.turns, 1, 'the injector works');
+    for (const r of competitor.stuck(NOW + 1, 10)) competitor.finish(r.id, 'done', NOW);
+    state.turns = 0;
+
+    const mine = seedAwaiting(competitor, 1, NOW, GUILD, 'main');
+    approveSeeded(competitor, mine, NOW, 'main');
+    assert.ok(competitor.finish(mine, 'failed', NOW));
+    assert.equal(building(competitor, 'main'), 0);
+
+    const claimed = raced.reopenForDispatch({
+      id: mine,
+      expectVersion: competitor.get(mine)?.version ?? 0,
+      guildId: GUILD,
+      at: NOW,
+      maxConcurrent: SEED_SLOTS,
+      repoKey: 'main',
+      maxConcurrentPerRepo: 1,
+      approvalId: newApprovalId(),
+    });
+
+    assert.equal(building(competitor, 'main'), 1, 'one dispatch slot, one dispatched build');
+    assert.equal(state.turns, 0, 'no separate read');
+    assert.equal(claimed, 'claimed');
   } finally {
     handle.close();
   }

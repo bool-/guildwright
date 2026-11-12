@@ -68,6 +68,7 @@ import {
   approveButton,
   cancelledCard,
   concurrencyError,
+  repoConcurrencyError,
   listCard,
   rejectButton,
   retryingCard,
@@ -81,6 +82,7 @@ import {
 } from '#modules/builder/cards';
 import {
   githubForRow,
+  repositoryLabel,
   reopenIssue,
   requestRunCancellation,
   type CancelsRuns,
@@ -125,6 +127,8 @@ export interface HistoryConfig {
   readonly historyLimit: number;
   readonly maxRetries: number;
   readonly maxConcurrentPerGuild: number;
+  /** RFC-001 7.5: a retry that dispatches also takes one of its repository's dispatch slots. */
+  readonly maxConcurrentPerRepo: number;
   readonly approvalTtlMs: number;
   readonly buildDeadlineMs: number;
   readonly requireOwnCredentials: boolean;
@@ -577,13 +581,17 @@ async function redispatch(
     guildId: row.guildId,
     at: inv.at,
     maxConcurrent: deps.cfg.maxConcurrentPerGuild,
+    // AND THE REPOSITORY'S DISPATCH SLOT (RFC-001 7.5), in the same statement: the ROW's
+    // repository, which is where this build will dispatch whatever the guild is linked to now.
+    repoKey: row.repoKey,
+    maxConcurrentPerRepo: deps.cfg.maxConcurrentPerRepo,
     // A FRESH APPROVAL. The workflow consumed the previous id (or refused it), so a retry that
     // re-sent it would be refused as a replay. A retry is a new spend and gets a new id,
     // written inside the same guarded UPDATE that re-arms the row.
     approvalId: newApprovalId(),
   });
   if (claimed !== 'claimed') {
-    return { kind: 'fail', error: claimRefusal(deps, row.guildId, claimed, 'how it is getting on') };
+    return { kind: 'fail', error: claimRefusal(deps, row, claimed, 'how it is getting on') };
   }
   const attempt = row.retryCount + 1;
   const surface = await placeCard(deps, inv, row, retryingCard(issueNumber, attempt, storedUrl(row.issueUrl)));
@@ -658,7 +666,7 @@ async function reArmForApproval(
     nonce,
   });
   if (claimed !== 'claimed') {
-    return { kind: 'fail', error: claimRefusal(deps, row.guildId, claimed, 'where it is') };
+    return { kind: 'fail', error: claimRefusal(deps, row, claimed, 'where it is') };
   }
 
   // REOPEN THE ISSUE, because expiry CLOSED it `not_planned`.
@@ -775,15 +783,18 @@ function reopenedIssueLine(reopened: IssueReopenReport): SafeMarkdown {
  * not happen is the same shape of dead end as the concurrency message this codebase already
  * rewrote once.
  */
-function claimRefusal(deps: HistoryDeps, guildId: string, claim: SlotClaim, look: string): AppError {
-  return claim === 'full'
-    ? concurrencyError(deps.repo.activeCounts(guildId), deps.cfg.approvalTtlMs)
-    : errors.conflict(
-        'cas',
-        'Someone else retried that a moment before you did.',
-        `Run /request list to see ${look}.`,
-        'cas',
-      );
+function claimRefusal(deps: HistoryDeps, row: BuildRow, claim: SlotClaim, look: string): AppError {
+  if (claim === 'full') return concurrencyError(deps.repo.activeCounts(row.guildId), deps.cfg.approvalTtlMs);
+  // RFC-001 7.5: the server has room, the REPOSITORY does not - often because of builds from
+  // another server, which is why the sentence names the repository rather than "here".
+  if (claim === 'repo-full') {
+    return repoConcurrencyError(
+      repositoryLabel(deps.ports, row.repoKey),
+      deps.repo.buildingByRepo().get(row.repoKey) ?? 0,
+      deps.cfg.maxConcurrentPerRepo,
+    );
+  }
+  return errors.conflict('cas', 'Someone else retried that a moment before you did.', `Run /request list to see ${look}.`, 'cas');
 }
 
 // ---------------------------------------------------------------------------------------

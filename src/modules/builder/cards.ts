@@ -833,6 +833,27 @@ export function dailyCapExhaustedError(used: number, cap: number, waitMs: number
 }
 
 /**
+ * THE REPOSITORY IS AT ITS DISPATCH CAP (RFC-001 7.5, `maxConcurrentPerRepo`).
+ *
+ * Said to whoever clicked Approve or ran `/request retry` when the request's REPOSITORY already
+ * has as many builds dispatched as its workflow's concurrency group can hold. It names the
+ * repository, because with several servers on one repository the builds holding the slots are
+ * often not in the reader's server at all - "wait for yours to finish" would send them looking for
+ * builds they cannot see. Nothing was approved or spent, and the card is still live.
+ *
+ * WHY EXPORTED: the wording is part of the fix, so a test pins it.
+ */
+export function repoConcurrencyError(repository: string, building: number, cap: number): AppError {
+  const held = building === 1 ? '1 build' : `${String(building)} builds`;
+  return errors.conflict(
+    'repo_concurrency',
+    `${repository} already has ${held} running or about to start, which is as many as it takes at once (${String(cap)}), so nothing was approved and nothing was spent.`,
+    'Try again when one of them finishes - a build usually takes five to thirty minutes. This request is unchanged in the meantime.',
+    'repo-full',
+  );
+}
+
+/**
  * THE REFUSAL THAT TELLS THE READER WHICH PROBLEM THEY HAVE.
  *
  * One sentence used to cover both: "Too many builds are already in flight here. Wait for one to

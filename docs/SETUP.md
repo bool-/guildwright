@@ -631,6 +631,97 @@ Two things worth knowing before you run it:
 
 ---
 
+## 7. Building in several repositories (optional)
+
+**Skip this section if the bot builds in one repository.** `GITHUB_OWNER`/`GITHUB_REPO` define a
+one-repository set, nothing here changes for it, and `/status` reads exactly as before.
+
+One bot can serve several Discord servers that build into **different** repositories — say your
+own server builds into `acme/bot-modules` and a friend's server into `acme/events-modules`. Every
+repository is one *you* configured; the bot never reaches a repository that is not listed.
+
+### Configure the set
+
+Replace the single-repository lines in `.env` with one line of JSON. When `GITHUB_REPOS_JSON` is
+set, **delete** `GITHUB_OWNER`, `GITHUB_REPO`, `GITHUB_REF`, `GITHUB_WORKFLOW_FILE` and
+`GITHUB_APP_INSTALLATION_ID` — the bot refuses to start with both, so there is only one source.
+
+```
+GITHUB_REPOS_JSON={"main":{"owner":"acme","repo":"bot-modules","default":true},"events":{"owner":"acme","repo":"events-modules"}}
+```
+
+- The keys (`main`, `events`) are short names you choose: a lowercase letter, then lowercase
+  letters, digits or dashes. They are what `/repo use` and `/credentials set repo:` take.
+- `ref` and `workflowFile` default to `main` and `agent-implement-request.yml`, per entry.
+  `installationId` is optional and App-only; leave it out and the bot looks it up.
+- **At most one** entry is `"default": true`: where a server builds until you link it elsewhere.
+  With no default, a server builds nothing until you run `/repo use` in it.
+
+Moving an existing one-repository install onto `GITHUB_REPOS_JSON` under a key such as `main` is
+safe: requests already filed are re-keyed at boot to the repository their issue really lives in.
+
+### Prepare every repository
+
+Each listed repository passes **every** boot check on its own, so each one needs:
+
+1. **The GitHub App installed on it** (or the token granted on it, in PAT mode) with the step 3
+   permissions. With an App on an organisation, one installation can cover several repositories.
+2. **The `APPROVAL_HMAC_KEY` repository secret**, with the **same** value as the bot's `.env`.
+3. **The Claude GitHub App** installed on it.
+4. **The template `.github` files** (`agent-implement-request.yml`, `verify_approval.py`,
+   `agent-settings.json`), byte-identical to the engine's. A drifted copy disables builds in that
+   repository only; `/status` says which.
+5. Optionally, the **`AGENT_DAILY_RUN_CAP`** variable, set to the same value as
+   `modules.builder.dailyRunCap` — see "What it costs to run". It is read per repository.
+
+### Point each server at its repository: `/repo`
+
+| Command | Who | What it does |
+|---|---|---|
+| `/repo use key:<key>` | operator only by default (`repos.manage`, fallback `nobody`) | Links this server to one configured repository. New requests from the server are filed and built there. |
+| `/repo show` | server admins by default (`repos.view`) | The link, the repository's health, how many of its builds are dispatched against `maxConcurrentPerRepo`, today's runs against the daily cap, and whether its `AGENT_DAILY_RUN_CAP` agrees. |
+| `/repo clear` | `repos.manage` | Removes the link (the server falls back to the default repository, if any). Refused while the server has a request in flight. |
+
+Run `/repo use` in each server that should not build in the default repository. **A request stays
+in the repository it was filed in:** re-linking a server mid-build does not move a build, a
+cancel or a retry.
+
+### Credentials are per repository
+
+A credential lives in a GitHub environment, and environments belong to one repository. So
+**every user runs `/credentials set` once per repository they build in**:
+
+- in a server, `/credentials set` stores into **that server's** repository (the modal names it);
+- in a DM with the bot, `/credentials set repo:<key>` stores into the repository you name;
+- `/credentials status` in a DM lists every repository, and `/credentials clear everywhere:True`
+  clears all of them.
+
+Somebody in two servers on two repositories therefore sets their credential twice, and each
+confirmation says where it went. Nothing is copied into a repository you have not built in.
+
+### Caps, per repository
+
+| Setting | Scope | Default | What it bounds |
+|---|---|---|---|
+| `maxConcurrentPerGuild` | each server | 2 | Requests one server holds at once, including ones waiting for an approver. Counted when a request is filed. |
+| `maxConcurrentPerRepo` | each repository | 2 | Builds **dispatched** in one repository at once, from every server routed there. Counted when Approve is clicked or `/request retry` re-dispatches. |
+| `dailyRunCap` | each repository | 4 | Agent runs per UTC day, counted in that repository. |
+
+**Why `maxConcurrentPerRepo` exists.** The workflow's concurrency group keeps one running build
+and **one** pending one; GitHub silently cancels the older pending run when a third is queued. So
+two servers sharing a repository could each approve a build and have one of them cancelled with no
+explanation. Past the cap, the Approve click is refused instead — naming the repository and saying
+nothing was spent — and the card stays live, so the approver clicks again when a build finishes.
+With one server on one repository at the defaults the server cap already keeps dispatched builds
+at two, so this never refuses anything there. Raise it only if you have changed the workflow's
+concurrency to admit more:
+
+```
+MODULES_JSON={"builder":{"maxConcurrentPerRepo":2}}
+```
+
+---
+
 ## Troubleshooting
 
 **The bot now refuses to start on a bad GitHub configuration — and says which variable.**
@@ -949,6 +1040,13 @@ than a per-call fact. It needs the optional **Variables: read** permission from 
 it `/status` says "the repository cap could not be read" and nothing else changes, because the
 workflow's cap is the authority and a bot stopped by an optional permission would be worse than a
 bot that cannot check.
+
+**With several repositories** (section 7), every number above is **per repository**: each
+repository's runs are counted on their own, each has its own `AGENT_DAILY_RUN_CAP` variable, and
+the bot's single `modules.builder.dailyRunCap` is compared against each of them at boot. `/status`
+gives every repository its own line — its daily count as last read, and its own drift comparison —
+and the `builder.daily_cap_drift` audit row names the repository whose variable disagrees. Set the
+variable to the same value in every repository; the bot has one number, not one per repository.
 
 > **The lever that makes this a non-issue:** the repo the agent builds *into* does not have to be
 > private. On a public repo, GitHub-hosted Actions minutes are unlimited and free, and the cap

@@ -32,6 +32,7 @@ import {
   msUntilUtcDayEnd,
   startOfUtcDay,
 } from '#modules/builder/module';
+import { fakeRepoSet } from '#testing/fakes';
 import type { BuildsOverrides, Harness } from '#modules/builder/harness.test';
 import {
   HOUR,
@@ -507,6 +508,151 @@ test('OUT OF DISPATCH ATTEMPTS is terminal: the row fails and the job does not r
     assert.equal(isRetryable(outcome.error), false, 'the runner must dead-letter it now, not back off');
     assert.equal(h.dispatched.length, 0, 'no fourth dispatch');
     assert.equal(h.repo.get(id)?.state, 'failed', 'so /request retry accepts it and the slot is released');
+  } finally {
+    h.close();
+  }
+});
+
+// ---------------------------------------------------------------------------------------
+// PER REPOSITORY (RFC-001 7.5, PR 2.4)
+//
+// Actions minutes belong to the repository owner, and every repository has its own
+// `AGENT_DAILY_RUN_CAP`. So the bot's one `dailyRunCap` is applied to each repository separately -
+// counted with THAT repository's runs - and compared against THAT repository's variable. Before
+// this, only the default repository's variable was ever read, and a repository with no default in
+// the set was never compared at all.
+// ---------------------------------------------------------------------------------------
+
+/** `main` (the default, served by `h.builds`) and `events` (`h.neighbours.events`). */
+function twoRepos(defaultKey: 'main' | null = 'main') {
+  return fakeRepoSet([
+    { key: 'main', owner: 'acme', repo: 'bot-modules', isDefault: defaultKey === 'main' },
+    { key: 'events', owner: 'acme', repo: 'events-modules', isDefault: false },
+  ]);
+}
+
+function eventsOf(h: Harness): Harness['neighbours'][string] {
+  const events = h.neighbours['events'];
+  assert.ok(events !== undefined, 'fixture: the events repository');
+  if (events === undefined) throw new Error('unreachable');
+  return events;
+}
+
+test('THE DAILY CAP IS COUNTED PER REPOSITORY: main at its cap queues, events under it dispatches', async () => {
+  const h = harness({ dailyRunCap: 4 }, {}, {}, twoRepos());
+  try {
+    const events = eventsOf(h);
+    h.builds.runsToday = 4;
+    events.builds.runsToday = 1;
+
+    const inMain = seedDispatching(h.repo, 42, 'main');
+    const inEvents = seedDispatching(h.repo, 43, 'events');
+
+    const queued = await h.build.run(payloadFor(inMain, 42), runtime());
+    assert.equal(queued.kind, 'retry', 'main has spent its four runs today');
+    assert.equal(h.dispatched.length, 0);
+
+    const ran = await h.build.run(payloadFor(inEvents, 43), runtime());
+    assert.deepEqual(ran, { kind: 'retry', afterMs: 15_000, why: 'dispatched; polling' }, "main's runs do not count against events");
+    assert.equal(events.builds.dispatched.length, 1);
+
+    const capped = h.audit.entries.filter((e) => e.action === 'builder.daily_cap');
+    assert.equal(capped.length, 1, 'one repository was at its cap, not two');
+    assert.equal(capped[0]?.detail['repo'], 'acme/bot-modules', 'and the audit row says WHICH repository');
+  } finally {
+    h.close();
+  }
+});
+
+test('/status and /repo show carry each repository\'s runs today, as last counted, and only for today', async () => {
+  const set = twoRepos();
+  const h = harness({ dailyRunCap: 4 }, {}, {}, set);
+  try {
+    const events = eventsOf(h);
+    events.builds.runsToday = 3;
+    await h.build.run(payloadFor(seedDispatching(h.repo, 43, 'events'), 43), runtime());
+
+    const health = await h.installed.health();
+    assert.match(health.detail, /events \(acme\/events-modules\): ready, 1 in flight, 1 of 2 builds dispatched, 3 of 4 agent runs used today/u);
+    assert.match(health.detail, /main \(acme\/bot-modules, default\): ready, 0 in flight, 0 of 2 builds dispatched, up to 4 agent runs per UTC day/u, 'main was never counted, and nothing is invented for it');
+
+    const ref = set.byKey('events');
+    assert.ok(ref !== null);
+    const activity = h.installed.repoActivity;
+    assert.ok(activity !== null);
+    assert.match(activity.inRepo(ref).detail, /^builds ready; 1 of 2 builds dispatched; 3 of 4 agent runs used today \(/u);
+
+    // Tomorrow, yesterday's count is not today's.
+    h.setNow(NOW + DAY);
+    assert.match(activity.inRepo(ref).detail, /; up to 4 agent runs per UTC day \(/u);
+  } finally {
+    h.close();
+  }
+});
+
+test('DRIFT IS REPORTED PER REPOSITORY: each AGENT_DAILY_RUN_CAP against the bot, named by repository', async () => {
+  const set = twoRepos();
+  const h = harness({ dailyRunCap: 4 }, {}, {}, set);
+  try {
+    h.builds.variables.set(AGENT_DAILY_RUN_CAP, '4');
+    eventsOf(h).builds.variables.set(AGENT_DAILY_RUN_CAP, '2');
+    await h.installed.reconcile?.();
+
+    const health = await h.installed.health();
+    assert.match(health.detail, /up to 4 agent runs per UTC day and 2 builds at once in each repository/u);
+    assert.match(health.detail, /main \(acme\/bot-modules, default\): [^;]*\(AGENT_DAILY_RUN_CAP agrees\)/u, 'main agrees');
+    assert.match(
+      health.detail,
+      /events \(acme\/events-modules\): [^;]*WARNING: this bot allows 4 but the workflow allows 2/u,
+      'events does not, and the warning is on the events line - it was never read before',
+    );
+
+    const drift = h.audit.entries.filter((e) => e.action === 'builder.daily_cap_drift');
+    assert.equal(drift.length, 1, 'one repository drifted, one audit row');
+    assert.equal(drift[0]?.detail['repo'], 'acme/events-modules', 'naming the repository whose variable to raise');
+    assert.equal(drift[0]?.detail['repository'], 2);
+
+    const activity = h.installed.repoActivity;
+    const ref = set.byKey('events');
+    assert.ok(activity !== null && ref !== null);
+    assert.match(activity.inRepo(ref).detail, /WARNING: this bot allows 4 but the workflow allows 2/u, '/repo show says it for that repository too');
+  } finally {
+    h.close();
+  }
+});
+
+test('with NO default repository the caps are still compared, for every repository', async () => {
+  // Before: "compared against the default repository's variable", so a set without a default was
+  // never checked at all.
+  const h = harness({ dailyRunCap: 4 }, {}, {}, twoRepos(null));
+  try {
+    // With no default, every repository of the set is a neighbour - including main.
+    h.neighbours['main']?.builds.variables.set(AGENT_DAILY_RUN_CAP, '9');
+    eventsOf(h).builds.variables.set(AGENT_DAILY_RUN_CAP, '4');
+    await h.installed.reconcile?.();
+    const health = await h.installed.health();
+    assert.match(health.detail, /main \(acme\/bot-modules\): [^;]*this bot allows 4 but the workflow allows 9/u);
+    assert.match(health.detail, /events \(acme\/events-modules\): [^;]*AGENT_DAILY_RUN_CAP agrees/u);
+    assert.doesNotMatch(health.detail, /has not been read/u);
+  } finally {
+    h.close();
+  }
+});
+
+test('A ONE-REPOSITORY /status IS WORD FOR WORD THE PHASE-1 TEXT, before and after a build is counted', async () => {
+  // A regression pin rather than a new behaviour: the per-repository lines and the runs-used count
+  // are for sets of several repositories, and a one-repository install must read exactly as before.
+  const h = capHarness(4, '4');
+  try {
+    await h.installed.reconcile?.();
+    const phase1 =
+      'ready; every requester funds their own build; unapproved requests expire after 48h; ' +
+      'up to 4 agent runs per UTC day (AGENT_DAILY_RUN_CAP agrees)';
+    assert.deepEqual(await h.installed.health(), { status: 'ok', detail: phase1 });
+
+    h.builds.runsToday = 2;
+    await h.build.run(payloadFor(seedDispatching(h.repo, 42), 42), runtime());
+    assert.deepEqual(await h.installed.health(), { status: 'ok', detail: phase1 }, 'a counted day changes nothing in the one-repository line');
   } finally {
     h.close();
   }
