@@ -324,3 +324,72 @@ test('repoActivity: what /repo clear and /repo show read - in flight per guild a
     h.close();
   }
 });
+
+// ---------------------------------------------------------------------------------------
+// WHO PAYS, PER REPOSITORY (RFC-001 PR 2.3, section 8.1): credentials are per user PER
+// REPOSITORY, so the payer check reads the requester's environment in the REQUEST's repository
+// - the row's `repo_key` at dispatch, the guild's resolved repository at the front door - and
+// never the guild's current link for a row that already exists.
+// ---------------------------------------------------------------------------------------
+
+test('PAYER READS THE ROW\'S REPOSITORY: a credential only in events pays for an events build after the guild moved to main', async () => {
+  const l = links({ [GUILD]: 'main' });
+  const h = harness({}, {}, {}, twoRepos(), l.mapping);
+  try {
+    const events = h.neighbours['events'];
+    assert.ok(events !== undefined);
+    // The requester stored a credential in events (where this request was filed) and nothing in
+    // main (where the guild is linked NOW). With the gate on, main would refuse.
+    h.builds.environments.delete(`user-${REQUESTER}`);
+    const id = seedDispatching(h.repo, 42, 'events');
+
+    const outcome = await h.build.run(payloadFor(id, 42), runtime());
+    assert.equal(outcome.kind, 'retry', 'dispatched; now polling');
+    assert.equal(events.builds.dispatched.length, 1, 'paid for and dispatched in the row\'s repository');
+    assert.equal(h.dispatched.length, 0);
+
+    const row = h.audit.entries.find((e) => e.action === 'builder.dispatch.environment');
+    assert.ok(row !== undefined, 'billing attribution is written before the spend');
+    assert.equal(row.detail['environmentName'], `user-${REQUESTER}`);
+    assert.equal(row.detail['byo'], true);
+    assert.equal(row.detail['repo'], 'acme/events-modules', 'and it names the repository whose environment pays (RFC-001 8.3)');
+  } finally {
+    h.close();
+  }
+});
+
+test('PAYER READS THE ROW\'S REPOSITORY: a credential only in the guild\'s CURRENT repository does not pay for a build filed elsewhere', async () => {
+  const l = links({ [GUILD]: 'main' });
+  const h = harness({}, {}, {}, twoRepos(), l.mapping);
+  try {
+    const events = h.neighbours['events'];
+    assert.ok(events !== undefined);
+    // The opposite: stored in main (the guild's link now), nothing in events (the row's).
+    events.builds.environments.delete(`user-${REQUESTER}`);
+    const id = seedDispatching(h.repo, 42, 'events');
+
+    const outcome = await h.build.run(payloadFor(id, 42), runtime());
+    assert.equal(outcome.kind, 'failed', 'refused, not paid for from another repository');
+    assert.equal(outcome.kind === 'failed' ? outcome.error.code : '', 'conflict.own_credentials_required');
+    assert.equal(events.builds.dispatched.length + h.dispatched.length, 0, 'nothing dispatched anywhere');
+  } finally {
+    h.close();
+  }
+});
+
+test('FRONT DOOR: a guild linked to events is refused when the requester\'s only credential is in main', async () => {
+  const l = links({ [GUILD]: 'events' });
+  const h = harness({}, {}, {}, twoRepos(), l.mapping);
+  try {
+    const events = h.neighbours['events'];
+    assert.ok(events !== undefined);
+    events.builds.environments.delete(`user-${REQUESTER}`);
+
+    const out = await requestForm(h).handle(submission());
+    assert.equal(out.kind, 'fail');
+    assert.equal(out.kind === 'fail' ? out.error.code : '', 'conflict.own_credentials_required');
+    assert.equal(events.issues.created.length + h.issues.created.length, 0, 'nothing filed');
+  } finally {
+    h.close();
+  }
+});
