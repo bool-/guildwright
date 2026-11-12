@@ -1,5 +1,7 @@
-# Runs the bot straight from source, exactly as `npm start` does: Node strips the types itself,
-# so there is no build step and no dev dependencies in the image.
+# THE ENGINE CHECKOUT's image: runs the engine straight from source, exactly as `npm start` does
+# here. Node strips the types itself, so there is no build step and no dev dependencies in the
+# image. A module repository runs the INSTALLED engine instead; its Dockerfile is in
+# docs/SETUP.md section 9.
 #
 #   docker compose up -d --build        (see compose.yaml and docs/SETUP.md "Running it long-term")
 #

@@ -1,18 +1,21 @@
 {
-  "name": "discord-ai-feature-builder",
-  "version": "0.1.0",
-  "private": true,
+  "name": "guildwright",
+  "version": "1.0.0",
   "type": "module",
-  "description": "A modular Discord bot whose flagship module turns /request into a GitHub issue, gates it behind human approval, and has Claude Code implement it as a pull request.",
+  "description": "The engine for a modular Discord bot whose flagship module turns /request into a GitHub issue, gates it behind human approval, and has Claude Code implement it as a pull request into your own private module repository.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/bool-/guildwright.git"
+  },
+  "homepage": "https://github.com/bool-/guildwright#readme",
+  "bugs": {
+    "url": "https://github.com/bool-/guildwright/issues"
   },
   "engines": {
     "node": ">=24.12.0"
   },
   "bin": {
-    "discord-ai-feature-builder": "./dist/cli.js"
+    "guildwright": "./dist/cli.js"
   },
   "files": [
     "dist",
@@ -20,6 +23,7 @@
     "tsconfig.module-repo.json",
     "AGENTS.md",
     "README.md",
+    "CHANGELOG.md",
     "template"
   ],
   "exports": {

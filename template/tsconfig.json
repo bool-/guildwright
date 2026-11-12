@@ -1,4 +1,4 @@
 {
-  "extends": "discord-ai-feature-builder/tsconfig.module-repo.json",
+  "extends": "guildwright/tsconfig.module-repo.json",
   "include": ["src/**/*.ts", "src/**/*.d.ts"]
 }

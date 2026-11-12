@@ -6,16 +6,22 @@ unverified is marked **UNVERIFIED** rather than asserted.
 
 ---
 
-## 1. Language and runtime: TypeScript on Node 24, with no build step
+## 1. Language and runtime: TypeScript on Node 24, run without a build where Node allows it
 
 Node 24.16 executes `.ts` files directly via native type stripping — verified by running a typed file
-with zero flags. So the repo ships TypeScript source and runs it as-is:
+with zero flags. So the engine checkout runs its TypeScript source as-is, and so does every module
+repository:
 
 ```
-npm start   ->  node --env-file-if-exists=.env src/main.ts
+engine checkout:    npm start  ->  node --conditions=source --env-file-if-exists=.env src/main.ts
+module repository:  npm start  ->  guildwright start   (the installed engine's dist/cli.js; the repo's
+                                                        own src/modules/**/*.ts run unbuilt)
 ```
 
-`tsc` is a **checker only** (`--noEmit`). There is no `dist/`, no bundler, no loader, no `tsx`.
+`tsc` is a **checker** (`--noEmit`) everywhere a human or an agent edits code. The one exception is
+the published package: Node refuses to strip types under `node_modules`, so the engine ships compiled
+JavaScript. Section 10 is that build step and section 11 the package boundary it creates; neither adds
+a bundler, a loader or `tsx`.
 
 **Consequences you must live with:**
 
@@ -239,4 +245,116 @@ entirely**.
   while the flag is off, rather than running with a hook that can never fire.
 - A branch ruleset requiring one approving review would be ideal, since the agent opens PRs
   directly — but **rulesets need GitHub Pro on a private repo** and return 403 on a free account.
-  See `docs/SETUP.md` for what protects the repo instead.
+  See `docs/SETUP.md` (section 5e) for what protects the repo instead.
+
+## 10. The build step: why the engine ships `dist/`, and exactly what it holds
+
+**Why one exists at all.** Node 24 strips types from any `.ts` file it is asked to run **except one
+under `node_modules`**: importing such a file throws `ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`.
+An engine installed as a dependency is under `node_modules` by definition, so it cannot ship `.ts`
+and be imported. It ships `dist/**/*.js` and `dist/**/*.d.ts` instead, produced by
+`npm run build` (`scripts/build.ts`). A module repository has **no** build step: its
+`src/modules/**/*.ts` is outside `node_modules`, so Node strips it directly, exactly as before.
+
+**Why the emitted JavaScript is the code the tests ran.** Two compiler flags make the build a
+one-line change rather than a second dialect: `erasableSyntaxOnly` guarantees every construct is
+one type stripping can erase, so the emitted JavaScript *is* the stripped source; and
+`rewriteRelativeImportExtensions` turns `./helper.ts` into `./helper.js` on emit. Subpath imports
+(`#core/x`) are left as written and resolve at runtime through the package's own `imports` map.
+
+**The four steps of `scripts/build.ts`**, three of which are things `tsc` does not do:
+
+1. `tsc -p tsconfig.build.json`: JavaScript, declarations, declaration maps and source maps for
+   `src/**`, excluding tests and test fixtures.
+2. Copy every hand-written `src/**/*.d.ts` (each built-in's `events.d.ts`, and
+   `engine-events.d.ts`). `tsc` neither emits nor copies declaration inputs, and without them a
+   module repository's `ctx.bus.on('builder.pr_opened', ...)` names an event that does not exist.
+3. Copy every migration **byte for byte**. The migration ledger checksums file bytes and refuses
+   to boot when an applied file's checksum moves, so a copy that normalised line endings would
+   brick every existing database. `src/build.test.ts` asserts `sha256(dist) === sha256(src)` for
+   each one.
+4. Regenerate the two derived template files: `template/AGENTS.md` (this repository's `AGENTS.md`
+   with a fixed list of substitutions, each of which must match exactly the expected number of
+   times or the build fails naming it) and `template/MANIFEST.json` (the engine version and a
+   sha256 for every file under `template/.github/**` and `template/AGENTS.md`). Both are
+   committed, because the engine checkout's own bot and `template check` read them unbuilt.
+
+**Developing without building.** The engine repository runs its own source through a custom
+resolution condition: every `#core/*`, `#adapters/*`, `#modules/*` and `#testing/*` entry in
+`package.json` `imports` lists `source` (the `.ts` file) before `types` and `default` (the `dist/`
+files), and every `npm run` script passes `--conditions=source`. So `npm start`, `npm test` and
+`tsc --noEmit` in the checkout never touch `dist/`, and a Node without the condition — which is
+what a consumer runs — gets the compiled engine. `src/build.test.ts` builds once and proves both
+halves: a child Node without the condition imports `dist/`, and the package resolves itself by
+name into `dist/`.
+
+**Proven by installing it, not by reading it.** The same test file packs the engine, installs the
+tarball into a temporary module repository laid out from the template, typechecks a module there
+that augments `AppEvents`, subscribes to a built-in's event and declares a two-port tuple, confirms
+a widened tuple still fails, and boots `doctor --offline` from the installed bin to see the
+built-ins discovered as `module.js` beside the repository's own `module.ts`. A second half runs
+`init`, `npm ci` against the tarball, `scaffold demo --db`, `npm run check` and `template check`.
+Both need the npm registry, so CI runs them always and `ENGINE_PACK_TEST=1` runs them locally.
+
+## 11. The package boundary
+
+**What crosses it.** The package `guildwright` publishes exactly these entry points
+(`package.json` `exports`), and nothing else is importable from a module repository:
+
+| Specifier | What it is |
+|---|---|
+| `guildwright/core/*` | The module contract: `module`, `text`, `result`, `errors`, `ports`, `sql`, `view`, `policy`, `ratelimit` and the rest of `src/core`. A module repository reaches it as `#core/*`. |
+| `guildwright/testing/*` | `fakes` (in-memory ports for module tests) and `conventions` (the convention suite a module repository registers in two lines). Reached as `#testing/*`. |
+| `guildwright/events` | Types only: imports every built-in's `events.d.ts`, so `src/engine.d.ts` puts the built-ins' events in the module repository's program. |
+| `guildwright/main`, `guildwright/loader` | The composition root and the multi-root loader, for the CLI and the pack test. |
+| `guildwright/tsconfig.module-repo.json` | The compiler options a module repository's `tsconfig.json` extends. |
+| `guildwright/package.json` | The engine's identity, read by the version pin checks. |
+
+`#adapters/*` is deliberately **not** exported. The CLI and `main.ts` live inside the package and
+resolve adapters through the package's own `imports` map; a module repository's `imports` maps only
+`#core/*`, `#testing/*` and its own `#modules/*`, so `import ... from '#adapters/github/client'` fails
+to resolve at typecheck and at boot, in addition to failing the convention suite's import wall.
+
+**What ships** (`package.json` `files`): `dist/`, `src/core/` **for reading only** (`AGENTS.md` in a
+module repository points the agent at `node_modules/guildwright/src/core/module.ts`, whose
+explanatory comments do not survive declaration emit), `template/`, `tsconfig.module-repo.json`,
+`AGENTS.md`, `README.md` and `CHANGELOG.md`. `src/build.test.ts` asserts that `npm pack --dry-run`
+lists exactly that set, so a file that would leak (a test fixture, `.env.example` at the root,
+`docs/`, `.github/`) or one that would be missing is a red test.
+
+**One copy of each shared thing.** The runtime symbols core relies on — the `UserText` brands, the
+`Ok`/`Err` shapes, the event bus — are one instance only because the engine's own imports and a
+module repository's `#core/*` imports land on the same files under `node_modules/guildwright/dist/`.
+Two guards keep it that way: `run()` registers `Symbol.for('guildwright.engine')` first thing and
+refuses to start if a second copy of the package at a different path already did; and `zod` is a
+**peer dependency** at an exact version, pinned identically by the template, with `doctor` and
+`start` refusing to run when the engine and the module repository resolve two different copies
+(two copies make every `z.ZodType` in a manifest a different type, and every manifest fails to
+typecheck with an unhelpful structural error).
+
+**Declaration merging across the boundary.** `declare module '#core/events'` in a module
+repository's `events.d.ts` resolves, through the template's imports map and the engine's
+`exports`, to `node_modules/guildwright/dist/core/events.d.ts` — the same file the built-ins'
+declarations augment. One file, one interface, every augmentation merges. The capabilities tuple
+survives the same way: `LiteralCaps`, `PortsFor` and `defineModule`'s `const` type parameters are
+purely type-level and survive declaration emit, so `capabilities: ['db','audit']` still types
+`ctx.ports` as exactly `{db, audit}` in a module repository's compile. The honest limit, stated
+because it matters: a module repository can augment `PortRegistry` and typecheck
+`capabilities: ['evil']`. It gets nothing — the runtime list of capabilities is the engine's
+constant, and the module is quarantined at install — but the type level is a review aid for a
+trusted author, not a sandbox.
+
+**Version pinning.** A module repository depends on `guildwright` at an exact version, no caret,
+because the engine's ports are its compile target. The convention suite, `doctor` and `start` all
+check that the pin equals the installed engine, and the per-dispatch gate check compares the
+repository's `.github` files against the installed engine's `template/MANIFEST.json`. Upgrading the
+engine and re-copying the gates is therefore one pull request (`npm install --save-exact`,
+`npx guildwright template apply`, `npm run check`). A change to `PortRegistry`, `ModuleDefinition`,
+the core events, the workflow inputs, the approval MAC or any template file is a **major** version,
+and is recorded under `BREAKING:` in `CHANGELOG.md`.
+
+**One instance, one trust domain.** The boundary is a packaging boundary, not a security one. A
+module is in-process code holding live ports, so merging a module grants it the bot's full
+authority. The design keeps the hosted, multi-tenant shape the hard path: the engine never fetches
+module code over the network, each group registers its own GitHub App, and the bot refuses a public
+target repository. RFC-001 sections 1 and 5 carry the full argument.

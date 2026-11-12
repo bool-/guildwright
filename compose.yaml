@@ -1,5 +1,5 @@
 # One bot, one database. Do not scale this service past 1: two processes on one SQLite file
-# fight over job leases (docs/SETUP.md, "Two bots, one database").
+# fight over job leases (docs/SETUP.md section 9, "One process per database file").
 #
 #   docker compose up -d --build     start, or rebuild after pulling
 #   docker compose logs -f bot       follow the logs
@@ -14,7 +14,7 @@ services:
       context: .
       args:
         GIT_SHA: ${GIT_SHA:-}
-    image: discord-bot:latest
+    image: guildwright:latest
     env_file: .env
     volumes:
       - ./data:/app/data

@@ -66,7 +66,7 @@ export const FIXTURE_TEMPLATE = fileURLToPath(new URL('./template', import.meta.
 export const FIXTURE_ENGINE_VERSION = '0.0.0-fixture';
 
 /** The engine's package name, as the CLI reads it from `<engineRoot>/package.json`. */
-export const ENGINE_NAME = 'discord-ai-feature-builder';
+export const ENGINE_NAME = 'guildwright';
 
 /**
  * A fake installed engine: `<dir>/package.json` at `FIXTURE_ENGINE_VERSION` and `<dir>/template`

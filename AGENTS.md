@@ -1,4 +1,4 @@
-# AGENTS.md
+# AGENTS.md - Guildwright
 
 Rules that are **not** inferable from reading the code. Everything else: read
 `src/core/module.ts`, run `npm run scaffold`, and read `template/src/modules/tags/` as the
@@ -7,6 +7,10 @@ worked example.
 This repo is extended by AI agents on purpose — that is what the `builder` module does. So the
 contracts are built to make a wrong contribution *fail to compile* rather than fail in production.
 If you are fighting the types, you are almost always doing something the design forbids on purpose.
+
+None of that is a sandbox. A module runs inside the bot's process, so merging a module grants it
+the bot's full authority: its Discord token, its GitHub credentials and its database. The
+contracts make a mistake loud; only a reviewer who reads the pull request stops a hostile one.
 
 ## Start here
 

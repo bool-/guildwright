@@ -33,7 +33,7 @@ import helpModule from '#modules/help/module';
 import { harness, invocation, payloadFor, requestForm, runtime, seedDispatching, submission, type Harness } from '#modules/builder/harness.test';
 
 const DRIFT_SENTENCE = (file: string): string =>
-  `Builds are disabled: ${file} in o/r does not match the engine's template (engine 1.7.0). Run npx discord-ai-feature-builder template apply, commit, and restart.`;
+  `Builds are disabled: ${file} in o/r does not match the engine's template (engine 1.7.0). Run npx guildwright template apply, commit, and restart.`;
 
 /** The real adapter, booted against the fake GitHub; `dispatches` counts POSTs that reached the wire. */
 async function realGate(gh: FakeGithub): Promise<{ readonly adapter: GithubAdapter; readonly dispatches: () => number }> {
@@ -235,7 +235,7 @@ const DRIFT_ERROR = {
   code: 'config.github.gates',
   location: 'github.gates',
   userDetail: 'This command is broken on our side. Tell an admin.',
-  nextStep: 'Run npx discord-ai-feature-builder template apply, commit, and restart.',
+  nextStep: 'Run npx guildwright template apply, commit, and restart.',
   internal: 'Builds are disabled: x does not match.',
   retryable: false,
 } as const;

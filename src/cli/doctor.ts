@@ -32,7 +32,7 @@ import { builderRequiresOwnCredentials, loadConfig, moduleConfigSlice, parseModu
 import type { AppError } from '#core/errors';
 import { systemClock } from '#adapters/system/clock';
 import { checkZodSingleCopy, readPackage, readRepoManifest } from '#adapters/system/version';
-import { checkEnginePin, describeGithubAuth, type PackageIdentity } from '#core/version';
+import { BOOT_REFUSAL_PREFIX, checkEnginePin, describeGithubAuth, type PackageIdentity } from '#core/version';
 import {
   PAT_MODE_WARNING,
   readTemplateGateFiles,
@@ -228,7 +228,7 @@ async function githubChecks(
 function report(io: CliIo, findings: readonly Finding[]): number {
   const bad = findings.filter((f) => f.level === 'refuse' || f.level === 'problem');
   for (const f of findings) {
-    if (f.level === 'refuse') io.err(`\n${f.text.startsWith('discord-bot cannot start') ? f.text : `discord-bot cannot start: ${f.text}`}\n`);
+    if (f.level === 'refuse') io.err(`\n${f.text.startsWith(BOOT_REFUSAL_PREFIX) ? f.text : `${BOOT_REFUSAL_PREFIX} ${f.text}`}\n`);
   }
   for (const f of findings) {
     if (f.level === 'problem') io.err(`  problem: ${f.text}\n`);

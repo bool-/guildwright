@@ -190,3 +190,19 @@ test('the prompt still names `npm run check`, and tells the agent it need not in
     'and must tell the agent the toolchain is already there, or it burns turns reinstalling it',
   );
 });
+
+test('the prompt names no engine-only path, because the same bytes run in every module repository', () => {
+  // This workflow is byte-identical in the engine and in every module repository made from the
+  // template (the gate-file digest check refuses a build otherwise), so every path the prompt
+  // names must exist in BOTH. A module repository has no `src/core/`, `src/adapters/` or
+  // `src/main.ts` (the engine is in node_modules), and the worked example is at
+  // `template/src/modules/tags/` in the engine but `src/modules/tags/` in a module repository.
+  // The prompt defers those to AGENTS.md, which the build writes correctly for each.
+  const compose = agent.slice(stepAt(agent, 'Compose the delimited prompt file'));
+  const body = compose.slice(0, compose.indexOf('- name: Implement with Claude Code'));
+  for (const enginePath of ['src/core/', 'src/adapters/', 'src/main.ts', 'src/modules/tags', 'template/']) {
+    assert.ok(!body.includes(enginePath), `the prompt names ${enginePath}, which does not exist in a module repository`);
+  }
+  assert.match(body, /AGENTS\.md names the worked/u, 'the worked example is found through AGENTS.md');
+  assert.match(body, /AGENTS\.md says how to compute it/u, 'and so is the permissions integer');
+});

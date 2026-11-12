@@ -1,6 +1,7 @@
-# discord-ai-feature-builder
+# Guildwright
 
-A modular Discord bot whose flagship module turns a chat message into shipped code:
+The engine for a Discord bot that your group runs itself, whose flagship module turns a chat
+message into shipped code:
 
 ```
 /request new  ->  Title: dark mode for the dashboard
@@ -8,15 +9,32 @@ A modular Discord bot whose flagship module turns a chat message into shipped co
 ```
 
 becomes a GitHub Issue → an Approve/Reject card in Discord → (on approval) an autonomous
-Claude Code run in GitHub Actions → a pull request, with the link posted back to the channel and
-the person who asked @-mentioned on it.
+Claude Code run in GitHub Actions → a pull request into **your own private module repository**,
+with the link posted back to the channel and the person who asked @-mentioned on it.
+
+**One instance, one trust domain.** Guildwright is an npm package (`guildwright`) plus a template.
+A group creates one private module repository from the template, registers its own GitHub App,
+and runs its own bot process from that repository. The bot loads the engine's built-in modules and
+the modules in that repository, and nothing else. Modules are in-process code, so **merging a
+module grants it the bot's full authority**: its Discord token, its GitHub App key and its
+database. There is no hosted bot that runs other people's modules, and there is deliberately no
+way to make one. Several Discord servers, and several repositories you own, may share one bot;
+several groups may not.
 
 **Each requester pays for their own build.** Before `/request new` works you run `/credentials set`
 once and hand the bot your own Anthropic API key or Claude Code OAuth token, which it seals
 straight into a per-user GitHub environment and cannot read back. That applies to the operator
 too; there is no owner bypass.
 
-**[Setup guide](docs/SETUP.md)** · **[Architecture decisions](docs/ARCHITECTURE.md)** · **[Known issues](docs/KNOWN-ISSUES.md)** · **[RFC-001: public core, private module repos](docs/RFC-001-public-core-private-modules.md)** · **[AGENTS.md](AGENTS.md)**
+```bash
+npx guildwright@1.0.0 init my-bot-modules    # or "Use this template" on bool-/guildwright-template
+cd my-bot-modules && npm ci && npm run check  # green before anything is configured
+cp .env.example .env                          # Discord token, GitHub App, APPROVAL_HMAC_KEY
+npx guildwright doctor                        # every configuration problem at once
+npm start
+```
+
+**[Setup guide](docs/SETUP.md)** · **[Changelog](CHANGELOG.md)** · **[Architecture decisions](docs/ARCHITECTURE.md)** · **[Known issues](docs/KNOWN-ISSUES.md)** · **[RFC-001: public core, private module repos](docs/RFC-001-public-core-private-modules.md)** · **[AGENTS.md](AGENTS.md)**
 
 ## Why this exists
 
@@ -93,6 +111,7 @@ the outcome by polling, which also means a bot that was offline mid-build recove
 | `/admin jobs` — counts by state, and the oldest running job's age, so "is anything stuck?" has an answer rather than a disclaimer | server managers (`admin.view`) |
 | `/admin audit` — who decided what, which authorization layer allowed it, and which module recorded it; pageable and filterable by action, actor or layer | server managers (`admin.view`) |
 | `/credentials set` · `status` · `clear` | anyone (`credentials.manage`) |
+| `/repo use` · `show` · `clear` — which of several configured repositories a server builds into | the operator (`repos.manage`) / server managers (`repos.view`) |
 | `/tag get` · `/tag set` — not an engine built-in: the worked-example module in the module-repo template (`template/src/modules/tags/`) | anyone / server managers |
 | `/help`, `/status` | anyone |
 
@@ -101,31 +120,46 @@ Approving a build (`builder.approve`) is granted to **nobody** by default, becau
 
 ## Requirements
 
-- Node.js >= 24.12 (runs TypeScript directly — there is no build step)
-- A Discord application — **no privileged intents required**
-- A GitHub repo the bot may file issues in, with a fine-grained token carrying **Environments** and
-  **Administration** (that is how per-user credentials are stored and read), **Issues** and
-  **Actions** at read-and-write (filing and reopening issues; dispatching, polling and cancelling
-  runs), and optionally **Variables: read** so the bot can warn you when its daily cap and the
-  repository's have drifted apart
+- Node.js >= 24.12. A module repository runs its own TypeScript directly, with no build step; the
+  engine arrives compiled from npm.
+- A Discord application — **no privileged intents required**.
+- A **private** GitHub repository made from the template, and a GitHub App you register yourself
+  and install on that repository only (suggested name: `<your server name> Guildwright`), with
+  Metadata, Pull requests, Contents, Secrets and Variables at read, and Issues, Actions,
+  Environments and Administration at read-and-write. A fine-grained personal access token with the
+  same grants still works, with a warning. The Claude GitHub App installed on the repository runs
+  the agent step.
 - An Anthropic API key or Claude Pro/Max subscription **per person who wants to build** — handed to
   the bot with `/credentials set`, not put in `.env`. The shared `ai-agent` environment funds builds
   only if you set `modules.builder.requireOwnCredentials` to `false`.
 
-## Development
+## Writing modules
+
+In your module repository:
 
 ```bash
-npm install
+npm run scaffold -- my-module --summary "One line about it." --db   # start every new module here
 npm run check          # typecheck + lint + test  (this is the gate)
-npm run dev            # watch mode
-npm run scaffold -- my-module --db      # start every new module here
 ```
-
-There is **no build step**. Node 24 runs the TypeScript directly; `tsc` only typechecks.
 
 A scaffolded module compiles and passes its own test immediately, and nothing outside its folder
 needs editing — the loader finds it on the next boot. That is why `npm run scaffold` is the
 documented starting point for a new module rather than copying a folder: the first `npm run check`
-then measures your change instead of your boilerplate. Read [`AGENTS.md`](AGENTS.md) first: it
-documents the rules that are not inferable from the code, and it is written for AI contributors
-because the flagship module is one.
+then measures your change instead of your boilerplate. Read `AGENTS.md` first: it documents the
+rules that are not inferable from the code, and it is written for AI contributors because the
+flagship module is one.
+
+## Developing the engine
+
+```bash
+git clone https://github.com/bool-/guildwright.git && cd guildwright
+npm ci
+npm run check          # typecheck + lint + test  (this is the gate)
+npm run dev            # watch mode, from source
+npm run build          # dist/ for the package, plus template/AGENTS.md and template/MANIFEST.json
+```
+
+The engine checkout runs its own source under `--conditions=source`; only the published package is
+compiled. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) sections 10 and 11 explain the build step
+and the package boundary, and the template a module repository is made from lives in
+[`template/`](template/).

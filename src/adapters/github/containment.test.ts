@@ -233,7 +233,7 @@ test('ROW: a drifted gate file at boot STARTS the bot, warns with the sync sente
   const b = await boot(gh);
   const warnings = started(b);
   const sentence =
-    "Builds are disabled: .github/scripts/verify_approval.py in o/r does not match the engine's template (engine 1.7.0). Run npx discord-ai-feature-builder template apply, commit, and restart.";
+    "Builds are disabled: .github/scripts/verify_approval.py in o/r does not match the engine's template (engine 1.7.0). Run npx guildwright template apply, commit, and restart.";
   assert.ok(warnings.includes(sentence), 'stderr and the log at boot');
   assert.deepEqual(b.adapter.builds.readiness(), { status: 'down', detail: sentence });
 

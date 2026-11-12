@@ -1,1 +1,1 @@
-import 'discord-ai-feature-builder/events';
+import 'guildwright/events';
