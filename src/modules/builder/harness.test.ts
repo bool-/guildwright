@@ -347,15 +347,31 @@ export function seedAwaiting(repo: BuildRepo, issueNumber: number, at = NOW, gui
  */
 export function seedRunning(repo: BuildRepo, issueNumber: number, runId: number, at = NOW, repoKey = 'default'): RequestId {
   const id = seedAwaiting(repo, issueNumber, at, GUILD, repoKey);
-  repo.compareAndSet(id, repo.get(id)?.version ?? 0, 'dispatching', at, { approvalId: newApprovalId() });
+  approveSeeded(repo, id, at, repoKey);
   repo.recordRun(id, runId, RUN_URL, at);
   return id;
+}
+
+/**
+ * Approve a seeded row the way the Approve click does - `approveForDispatch`, with a fresh
+ * approval id - against a repository cap of `SEED_SLOTS`, so seeding never tests that cap.
+ */
+export function approveSeeded(repo: BuildRepo, id: RequestId, at = NOW, repoKey = 'default'): void {
+  const claimed = repo.approveForDispatch({
+    id,
+    expectVersion: repo.get(id)?.version ?? 0,
+    repoKey,
+    at,
+    maxConcurrentPerRepo: SEED_SLOTS,
+    approvalId: newApprovalId(),
+  });
+  assert.equal(claimed, 'claimed', 'fixture: the seeded request must be approved');
 }
 
 /** ...or approved and not yet dispatched, which is where the attempt counter lives. */
 export function seedDispatching(repo: BuildRepo, issueNumber: number, repoKey = 'default'): RequestId {
   const id = seedAwaiting(repo, issueNumber, NOW, GUILD, repoKey);
-  repo.compareAndSet(id, repo.get(id)?.version ?? 0, 'dispatching', NOW, { approvalId: newApprovalId() });
+  approveSeeded(repo, id, NOW, repoKey);
   return id;
 }
 

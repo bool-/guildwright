@@ -101,6 +101,7 @@ import {
   cancelledCard,
   capWaitingCard,
   concurrencyError,
+  repoConcurrencyError,
   dailyCapExhaustedError,
   draftPrCard,
   expiredCard,
@@ -127,7 +128,7 @@ import { historyCommands } from '#modules/builder/history';
 import { KIND_OPTIONS, REQUEST_KINDS, kindIssueLabel } from '#modules/builder/kinds';
 import { requireOwnCredentialsGate, resolveBuildPayer } from '#modules/builder/payer';
 import {
-  githubForDefault,
+  repositoryLabel,
   githubForGuild,
   githubForRow,
   planRepoKeyAdoption,
@@ -145,8 +146,8 @@ import {
  * here, and the tests should not have to be rewritten to prove behaviour that did not change.
  */
 export { buildDedupeKey, buildRepo, isTerminalState, msUntilUtcDayEnd, slotsUsed, startOfUtcDay } from '#modules/builder/rows';
-export type { ActiveCounts, BuildRepo, BuildRow, BuildState, NewBuildRow, SlotClaim, SlotReopen } from '#modules/builder/rows';
-export { concurrencyError, dailyCapExhaustedError, runFailedError, stateLabel, ttlHours } from '#modules/builder/cards';
+export type { ActiveCounts, BuildRepo, BuildRow, BuildState, DispatchClaim, NewBuildRow, RepoSlot, SlotClaim, SlotReopen } from '#modules/builder/rows';
+export { concurrencyError, dailyCapExhaustedError, repoConcurrencyError, runFailedError, stateLabel, ttlHours } from '#modules/builder/cards';
 export type { CancelledBy, CancelledRun } from '#modules/builder/cards';
 export {
   readAgentDailyRunCap,
@@ -324,13 +325,22 @@ async function checkDailyCap(
     readonly row: BuildRow;
     readonly issueNumber: number;
     readonly surface: SurfaceRef;
+    /** `owner/repo` of the request's repository, for the audit row (RFC-001 PR 2.4). */
+    readonly repository: string;
+    /**
+     * Told every count that was read, so `/status` and `/repo show` can say how much of THIS
+     * repository's day is used without asking GitHub themselves (a health check makes no request).
+     */
+    readonly observe: (day: number, used: number) => void;
   },
 ): Promise<JobOutcome | null> {
   const now = jctx.ports.clock.now();
   // The SAME window the workflow counts: runs created since UTC midnight, for the one workflow
   // file the adapter dispatches. A different boundary would mean the bot and the runner disagree
-  // about what day it is.
+  // about what day it is. PER REPOSITORY (RFC-001 7.5): `builds` is the request's own
+  // repository's port, so another repository's runs never count against this one.
   const used = await builds.runsSince(startOfUtcDay(now));
+  if (used.ok) input.observe(startOfUtcDay(now), used.value);
   if (!used.ok) {
     if (used.error.retryable) return retryAfter(used.error, cfg.pollIntervalMs, 'could not read the daily run count');
     jctx.logger.warn('could not read the daily agent run count; dispatching anyway', {
@@ -349,7 +359,7 @@ async function checkDailyCap(
     action: 'builder.daily_cap',
     actorId: input.row.requesterId,
     guildId: input.row.guildId,
-    detail: { requestId: input.row.id, issueNumber: input.issueNumber, used: used.value, cap: cfg.dailyRunCap, waitMs },
+    detail: { requestId: input.row.id, issueNumber: input.issueNumber, used: used.value, cap: cfg.dailyRunCap, waitMs, repo: input.repository },
   });
 
   // `>=`, matching the runner EXACTLY: `settleRequeue` dead-letters a retry whose landing time is
@@ -557,6 +567,23 @@ export default defineModule({
     requireOwnCredentials: z.boolean().default(true),
     maxConcurrentPerGuild: z.coerce.number().int().positive().default(2),
     /**
+     * HOW MANY BUILDS ONE REPOSITORY MAY HAVE DISPATCHED AT ONCE (RFC-001 7.5). Default 2.
+     *
+     * Counted over `dispatching`/`running` per repository, from every server routed there, and
+     * claimed in the same statement as the Approve click or `/request retry` that dispatches - so
+     * two approvers on two servers cannot both take the last slot. See `approveForDispatch`.
+     *
+     * WHY 2: the workflow's `concurrency: agent-implement` group keeps one running run and ONE
+     * pending one, and GitHub silently cancels the older pending run when a third queues. Two is
+     * what the group admits; above it, a build an approver paid for can vanish as "cancelled".
+     * Raise it only if that repository's workflow concurrency has been changed to admit more.
+     *
+     * It sits ALONGSIDE `maxConcurrentPerGuild`, which still bounds what one server holds
+     * (including unapproved requests). With one server on one repository at the defaults the guild
+     * cap already keeps dispatched builds at 2 or fewer, so this never refuses anything there.
+     */
+    maxConcurrentPerRepo: z.coerce.number().int().positive().default(2),
+    /**
      * HOW LONG AN UNAPPROVED REQUEST HOLDS A CONCURRENCY SLOT. Default 48 hours.
      *
      * WHY THIS NUMBER HAS TO EXIST AT ALL, and it is the worst bug this module has had: a
@@ -666,7 +693,24 @@ export default defineModule({
      * one REST call in the process's lifetime; reading it per health check would put a GitHub
      * round trip inside a command whose whole point is to answer instantly.
      */
-    let capAgreement: CapAgreement = { kind: 'unchecked' };
+    //
+    // PER REPOSITORY (RFC-001 7.5, PR 2.4), keyed by repository key: every configured repository
+    // has its own `AGENT_DAILY_RUN_CAP` variable, and the bot's one `dailyRunCap` is compared
+    // against each. A key that is absent has not been read yet (`unchecked`).
+    const capAgreements = new Map<string, CapAgreement>();
+    const capAgreementOf = (key: string): CapAgreement => capAgreements.get(key) ?? { kind: 'unchecked' };
+
+    /**
+     * THE LAST DAILY RUN COUNT `checkDailyCap` READ, per repository key, with the UTC day it was
+     * for. `/status` and `/repo show` report it rather than asking GitHub - a health check makes
+     * no request - and only for the day it belongs to, so yesterday's number is never shown as
+     * today's.
+     */
+    const runsCounted = new Map<string, { readonly day: number; readonly used: number }>();
+    const runsTodayIn = (key: string): number | null => {
+      const seen = runsCounted.get(key);
+      return seen !== undefined && seen.day === startOfUtcDay(ctx.ports.clock.now()) ? seen.used : null;
+    };
 
     /**
      * STEP 1 - `/request new` opens a modal.
@@ -781,6 +825,7 @@ export default defineModule({
           historyLimit: cfg.historyLimit,
           maxRetries: cfg.maxRetries,
           maxConcurrentPerGuild: cfg.maxConcurrentPerGuild,
+          maxConcurrentPerRepo: cfg.maxConcurrentPerRepo,
           approvalTtlMs: cfg.approvalTtlMs,
           buildDeadlineMs: cfg.buildDeadlineMs,
           requireOwnCredentials: cfg.requireOwnCredentials,
@@ -1041,8 +1086,30 @@ export default defineModule({
             // workflow consumes once and refuses twice, so exactly one row may ever hold it,
             // and the row that holds it must be the one whose click won. Writing it after the
             // CAS would let the loser stamp its id over the winner's row.
+            //
+            // AND THE REPOSITORY'S DISPATCH SLOT IS CLAIMED IN IT TOO (RFC-001 7.5): approving
+            // is what dispatches, so it is what the per-repository cap bounds. A refusal leaves
+            // the row `awaiting_approval` and this card live, so the approver can click again.
             const approvalId = newApprovalId();
-            if (!repo.compareAndSet(id.value, row.version, 'dispatching', click.at, { approvalId })) {
+            const claimed = repo.approveForDispatch({
+              id: id.value,
+              expectVersion: row.version,
+              repoKey: row.repoKey,
+              at: click.at,
+              maxConcurrentPerRepo: cfg.maxConcurrentPerRepo,
+              approvalId,
+            });
+            if (claimed === 'repo-full') {
+              return {
+                kind: 'fail',
+                error: repoConcurrencyError(
+                  repositoryLabel(ctx.ports, row.repoKey),
+                  repo.buildingByRepo().get(row.repoKey) ?? 0,
+                  cfg.maxConcurrentPerRepo,
+                ),
+              };
+            }
+            if (claimed !== 'claimed') {
               return { kind: 'fail', error: errors.conflict('cas', 'Someone approved this a moment before you did.', 'Nothing more to do.') };
             }
 
@@ -1254,6 +1321,8 @@ export default defineModule({
                 row,
                 issueNumber: p.value.issueNumber,
                 surface: surface.value,
+                repository: repoFullName(gh.repo),
+                observe: (day, used) => runsCounted.set(gh.repo.key, { day, used }),
               });
               if (capped !== null) return capped;
 
@@ -1757,13 +1826,16 @@ export default defineModule({
         // is a nice-to-have that reaches the network, and a nice-to-have must never be positioned
         // where it can cost the durability work.
         //
-        // THE DEFAULT REPOSITORY's variable: in this version the only repository a build can land
-        // in. With no default there is nothing to compare, and the check stays `unchecked`.
-        // Per-repository caps and drift reporting are PR 2.4.
-        const primary = githubForDefault(ctx.ports);
-        if (primary !== null && primary.ok) {
-          capAgreement = compareDailyRunCap(await readAgentDailyRunCap(primary.value.builds), cfg.dailyRunCap);
-          reportCapAgreement(ctx.logger, ctx.ports.audit, capAgreement);
+        // EVERY CONFIGURED REPOSITORY'S variable (RFC-001 7.5, PR 2.4): a build can land in any
+        // of them, and each has its own `AGENT_DAILY_RUN_CAP`. Read one after another rather than
+        // all at once - it is one request per repository per boot, and a burst of them buys
+        // nothing. A repository with no adapter stays `unchecked`; nothing here is fatal.
+        for (const r of ctx.ports.repos.all()) {
+          const builds = ctx.ports.builds.at(r);
+          if (!builds.ok) continue;
+          const agreement = compareDailyRunCap(await readAgentDailyRunCap(builds.value), cfg.dailyRunCap);
+          capAgreements.set(r.key, agreement);
+          reportCapAgreement(ctx.logger, ctx.ports.audit, agreement, repoFullName(r));
         }
       },
 
@@ -1787,7 +1859,13 @@ export default defineModule({
         const refs = ctx.ports.repos.all();
         const entries = refs.map((r) => ({ repo: r, ready: readinessIn(ctx.ports, r) }));
         const stranded = strandedDetail(repo.unconfigured(refs.map((r) => r.key)).filter((r) => !isTerminalState(r.state)));
-        const repositories = repositoriesDetail(entries, repo.inFlightByRepo());
+        const repositories = repositoriesDetail(entries, repo.inFlightByRepo(), {
+          building: repo.buildingByRepo(),
+          maxConcurrentPerRepo: cfg.maxConcurrentPerRepo,
+          dailyRunCap: cfg.dailyRunCap,
+          runsToday: runsTodayIn,
+          agreement: capAgreementOf,
+        });
         const down = entries.filter((e) => e.ready.status === 'down');
         if (down.length === entries.length) {
           const only = entries.length === 1 ? entries[0] : undefined;
@@ -1810,9 +1888,14 @@ export default defineModule({
             // THE FOURTH NUMBER, AND WHETHER IT IS THE SAME NUMBER THE REPOSITORY BELIEVES.
             // Reporting the bot's cap alone was a half-truth: the workflow enforces its own, and
             // when the two drifted the product's answer to "how many runs a day?" was confidently
-            // wrong in a way only a failed build would reveal. (Compared against the DEFAULT
-            // repository's variable; per-repository caps and drift are PR 2.4.)
-            `up to ${String(cfg.dailyRunCap)} agent runs per UTC day (${capAgreementDetail(capAgreement)})` +
+            // wrong in a way only a failed build would reveal.
+            //
+            // PER REPOSITORY (RFC-001 7.5, PR 2.4): with several repositories the cap applies to
+            // each one separately and each line below carries its own drift comparison. With one,
+            // this sentence is exactly the phase-1 sentence.
+            (refs.length === 1 && refs[0] !== undefined
+              ? `up to ${String(cfg.dailyRunCap)} agent runs per UTC day (${capAgreementDetail(capAgreementOf(refs[0].key))})`
+              : `up to ${String(cfg.dailyRunCap)} agent runs per UTC day and ${String(cfg.maxConcurrentPerRepo)} builds at once in each repository`) +
             repositories +
             stranded,
         };
@@ -1823,14 +1906,22 @@ export default defineModule({
       // that owns it answers. Both reads are one indexed count; neither reaches GitHub.
       repoActivity: {
         inFlightForGuild: (guildId) => repo.inFlightForGuild(guildId),
+        // PER REPOSITORY (RFC-001 PR 2.4): the line names THIS repository's dispatched builds
+        // against `maxConcurrentPerRepo`, its runs today as last counted, and its own drift
+        // comparison - not the default repository's, which is what it showed before.
         inRepo: (r) => {
           const ready = readinessIn(ctx.ports, r);
           return {
             inFlight: repo.inFlightByRepo().get(r.key) ?? 0,
             detail:
               (ready.status === 'ready' ? 'builds ready' : `builds disabled - ${ready.detail}`) +
-              `; up to ${String(cfg.dailyRunCap)} agent runs per UTC day` +
-              (r.isDefault ? ` (${capAgreementDetail(capAgreement)})` : ''),
+              `; ${repoCapsDetail(r.key, {
+                building: repo.buildingByRepo(),
+                maxConcurrentPerRepo: cfg.maxConcurrentPerRepo,
+                dailyRunCap: cfg.dailyRunCap,
+                runsToday: runsTodayIn,
+                agreement: capAgreementOf,
+              })}`,
           };
         },
       },
@@ -1849,20 +1940,59 @@ function readinessIn(ports: GithubScopes<unknown, Pick<BuildsPort, 'readiness'>>
 }
 
 /**
- * `/status`, per repository (RFC-001 PR 2.2): each configured repository's readiness and how many
- * requests are in flight in it, so drift or a transient probe failure in one repository of the
- * set is reported against THAT repository. Empty for a one-repository set, so its line is
- * unchanged from phase 1. No request: `readiness()` reads the last answer.
+ * What `/status` and `/repo show` say about ONE repository's caps (RFC-001 7.5, PR 2.4). Every
+ * value is already in memory: the dispatched count is one indexed query, the daily count is the
+ * last one `checkDailyCap` read, and the drift comparison is the boot check's answer.
+ */
+export interface RepoCaps {
+  /** `BuildRepo.buildingByRepo()`: rows holding a repository dispatch slot, per key. */
+  readonly building: ReadonlyMap<string, number>;
+  readonly maxConcurrentPerRepo: number;
+  readonly dailyRunCap: number;
+  /** Today's run count as last read for that key, or null when none has been read today. */
+  readonly runsToday: (key: string) => number | null;
+  readonly agreement: (key: string) => CapAgreement;
+}
+
+/**
+ * The caps of one repository as phrases, in order: dispatched builds against the per-repository
+ * cap, then the daily cap with today's count when one is known, and that repository's OWN
+ * `AGENT_DAILY_RUN_CAP` comparison.
+ */
+export function repoCapsParts(key: string, caps: RepoCaps): readonly string[] {
+  const runs = caps.runsToday(key);
+  const daily =
+    runs === null
+      ? `up to ${String(caps.dailyRunCap)} agent runs per UTC day`
+      : `${String(runs)} of ${String(caps.dailyRunCap)} agent runs used today`;
+  return [
+    `${String(caps.building.get(key) ?? 0)} of ${String(caps.maxConcurrentPerRepo)} builds dispatched`,
+    `${daily} (${capAgreementDetail(caps.agreement(key))})`,
+  ];
+}
+
+/** `/repo show`'s sentence for one repository's caps. */
+export function repoCapsDetail(key: string, caps: RepoCaps): string {
+  return repoCapsParts(key, caps).join('; ');
+}
+
+/**
+ * `/status`, per repository (RFC-001 PR 2.2, 2.4): each configured repository's readiness, how
+ * many requests are in flight in it, its dispatched builds against `maxConcurrentPerRepo`, its
+ * daily run count and its own cap drift - so a problem in one repository of the set is reported
+ * against THAT repository. Empty for a one-repository set, so its line is unchanged from phase 1.
+ * No request: `readiness()` reads the last answer.
  */
 export function repositoriesDetail(
   entries: readonly { readonly repo: RepoRef; readonly ready: BuildReadiness }[],
   inFlight: ReadonlyMap<string, number>,
+  caps: RepoCaps,
 ): string {
   if (entries.length <= 1) return '';
   const parts = entries.map(({ repo: r, ready }) => {
     const name = `${r.key} (${repoFullName(r)}${r.isDefault ? ', default' : ''})`;
     const state = ready.status === 'ready' ? 'ready' : `down - ${ready.detail}`;
-    return `${name}: ${state}, ${String(inFlight.get(r.key) ?? 0)} in flight`;
+    return [`${name}: ${state}`, `${String(inFlight.get(r.key) ?? 0)} in flight`, ...repoCapsParts(r.key, caps)].join(', ');
   });
   const noDefault = entries.some((e) => e.repo.isDefault)
     ? ''
@@ -1966,9 +2096,10 @@ export const DRAFT_STALE_MS = 5 * 60_000;
  * back the unexplained "Build failed" that `checkDailyCap` was written to abolish. Everything
  * else is information. Nothing here is fatal - see `compareDailyRunCap`.
  */
-function reportCapAgreement(logger: LoggerPort, audit: AuditPort, agreement: CapAgreement): void {
+function reportCapAgreement(logger: LoggerPort, audit: AuditPort, agreement: CapAgreement, repository: string): void {
   if (agreement.kind === 'bot-higher') {
     logger.warn('the daily agent run caps disagree, and in the direction that wastes runs', {
+      repo: repository,
       bot: agreement.bot,
       repository: agreement.repository,
       source: agreement.source,
@@ -1981,7 +2112,7 @@ function reportCapAgreement(logger: LoggerPort, audit: AuditPort, agreement: Cap
       action: 'builder.daily_cap_drift',
       actorId: SYSTEM_ACTOR,
       guildId: null,
-      detail: { bot: agreement.bot, repository: agreement.repository, source: agreement.source },
+      detail: { repo: repository, bot: agreement.bot, repository: agreement.repository, source: agreement.source },
     });
     return;
   }
@@ -1990,6 +2121,7 @@ function reportCapAgreement(logger: LoggerPort, audit: AuditPort, agreement: Cap
     // there is no cap at which builds start succeeding again. The operator gets the same
     // five-second diagnosis from `/admin audit` after the first mystery failure.
     logger.warn('the AGENT_DAILY_RUN_CAP repository variable is not a whole number', {
+      repo: repository,
       fix: 'set AGENT_DAILY_RUN_CAP to a plain number such as 4, or delete it to use the workflow default',
       consequence: "the workflow's cap step exits 1, so every dispatched build fails in its first seconds",
     });
@@ -1997,12 +2129,13 @@ function reportCapAgreement(logger: LoggerPort, audit: AuditPort, agreement: Cap
       action: 'builder.daily_cap_drift',
       actorId: SYSTEM_ACTOR,
       guildId: null,
-      detail: { problem: 'repository cap is not a whole number' },
+      detail: { repo: repository, problem: 'repository cap is not a whole number' },
     });
     return;
   }
   if (agreement.kind === 'bot-lower') {
     logger.info('the daily agent run caps disagree, but only throughput is affected', {
+      repo: repository,
       bot: agreement.bot,
       repository: agreement.repository,
       source: agreement.source,
@@ -2012,7 +2145,7 @@ function reportCapAgreement(logger: LoggerPort, audit: AuditPort, agreement: Cap
   if (agreement.kind === 'unknown') {
     // A token without `Variables: read` lands here. It must not look like a failure, because
     // the check is an optimisation and the workflow's own cap is the authority.
-    logger.info('could not read the AGENT_DAILY_RUN_CAP repository variable', { why: agreement.why });
+    logger.info('could not read the AGENT_DAILY_RUN_CAP repository variable', { repo: repository, why: agreement.why });
   }
 }
 

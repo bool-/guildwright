@@ -169,7 +169,7 @@ export function slotsUsed(active: ActiveCounts): number {
  * Reporting one as the other sends a reader off to do the wrong thing, which is why the repo
  * answers with a word rather than a boolean.
  */
-export type SlotClaim = 'claimed' | 'full' | 'lost';
+export type SlotClaim = 'claimed' | 'full' | 'repo-full' | 'lost';
 
 /** What a re-arming command must prove before a terminal row may re-enter the active set. */
 export interface SlotReopen {
@@ -179,6 +179,28 @@ export interface SlotReopen {
   readonly guildId: string;
   readonly at: number;
   readonly maxConcurrent: number;
+}
+
+/**
+ * THE PER-REPOSITORY HALF OF A CLAIM (RFC-001 7.5, PR 2.4): which repository the row builds in,
+ * and how many builds that repository may have dispatched at once.
+ *
+ * `repoKey` is the ROW's own key, passed for the same reason `guildId` is - so the counting
+ * subquery stays flat - and also matched in the outer WHERE, so a claim can never be made against
+ * one repository's count for a row that lives in another.
+ */
+export interface RepoSlot {
+  readonly repoKey: string;
+  readonly maxConcurrentPerRepo: number;
+}
+
+/** What the Approve click must prove to move a row from `awaiting_approval` to `dispatching`. */
+export interface DispatchClaim extends RepoSlot {
+  readonly id: RequestId;
+  readonly expectVersion: number;
+  readonly at: number;
+  /** Minted by the click and written in the same statement as the state change. */
+  readonly approvalId: string;
 }
 
 export interface BuildRepo {
@@ -224,18 +246,41 @@ export interface BuildRepo {
   /**
    * Returns false when someone else won the race. NEVER retried (SC-10 check 4).
    *
-   * `approval` is passed by the Approve click and by nothing else. It writes `approval_id` IN
-   * THE SAME STATEMENT as the state change: the id is what the workflow will refuse a second
-   * time, so the one row that owns it must be the one row whose CAS won. Writing it afterwards
-   * would open a window in which the loser of the race stamps its id over the winner's.
+   * NOT THE APPROVE CLICK'S DOOR ANY MORE (RFC-001 PR 2.4): an approval moves a row into the
+   * states a REPOSITORY dispatch slot counts, so it goes through `approveForDispatch`, which claims
+   * that slot in the same statement. This stays for Reject, cancel and expiry, none of which takes
+   * a slot.
    */
-  compareAndSet(
-    id: RequestId,
-    expectVersion: number,
-    next: BuildState,
-    at: number,
-    approval?: { readonly approvalId: string },
-  ): boolean;
+  compareAndSet(id: RequestId, expectVersion: number, next: BuildState, at: number): boolean;
+  /**
+   * THE APPROVE CLICK: compare-and-set the row from `awaiting_approval` to `dispatching`, write
+   * its approval id, AND CLAIM ONE OF ITS REPOSITORY'S DISPATCH SLOTS - in ONE statement.
+   *
+   * THE APPROVAL ID IS IN THE SAME STATEMENT for the reason it always was: the workflow refuses
+   * an id a second time, so the one row that owns it must be the one row whose CAS won. Writing it
+   * afterwards would let the loser of the race stamp its id over the winner's.
+   *
+   * WHY A REPOSITORY CAP AT ALL (RFC-001 7.5): the workflow's `concurrency: agent-implement` group
+   * keeps one running run and ONE pending one, and GitHub silently CANCELS the older pending run
+   * when a newer one queues. The per-guild cap never bounded that - two servers on one repository,
+   * or one server whose `maxConcurrentPerGuild` was raised, could dispatch a third build into the
+   * group and have one cancelled with nobody told why. `maxConcurrentPerRepo` (default 2) is
+   * exactly what the group admits.
+   *
+   * WHY HERE AND NOT AT SUBMISSION: the repository's scarce thing is a DISPATCHED build, not an
+   * unclicked card. Counting `draft`/`awaiting_approval` per repository would let one server's
+   * unapproved requests stop every other server on that repository from even filing - the
+   * guild-bricking bug again, one level up. So the count is over `dispatching`/`running`, and a
+   * row enters those states only through this method and `reopenForDispatch`, which both carry it.
+   *
+   * WHY ONE STATEMENT: the same check-then-act race `claimSlot` closed. Two approvers clicking at
+   * once on two servers' cards must not both take the last slot; the count lives inside the
+   * UPDATE, so the loser changes zero rows.
+   *
+   * `lost`: somebody else moved this row first. `repo-full`: the repository is at its cap, and the
+   * row is still `awaiting_approval` with its card still live.
+   */
+  approveForDispatch(claim: DispatchClaim): SlotClaim;
   recordIssue(id: RequestId, issueNumber: number, issueUrl: string, surface: SurfaceRef, at: number): boolean;
   recordRun(id: RequestId, runId: number, runUrl: string | null, at: number): boolean;
   /** Learn the run log URL later than the run id - the blind-dispatch and poll paths. */
@@ -302,8 +347,11 @@ export interface BuildRepo {
    * back into the active set, which is a third entrance to the concurrency cap and raced with
    * the other two in exactly the same way: `activeCounts` said there was room, and by the time
    * the UPDATE ran there was not.
+   *
+   * BOTH CAPS, ONE STATEMENT (RFC-001 PR 2.4): it goes straight to `dispatching`, so it takes a
+   * repository dispatch slot as well as a guild slot - see `approveForDispatch`.
    */
-  reopenForDispatch(claim: SlotReopen & { readonly approvalId: string }): SlotClaim;
+  reopenForDispatch(claim: SlotReopen & RepoSlot & { readonly approvalId: string }): SlotClaim;
   /**
    * RE-ARM AN EXPIRED REQUEST FOR A SECOND LOOK BY AN APPROVER.
    *
@@ -338,6 +386,11 @@ export interface BuildRepo {
   inFlightForGuild(guildId: string): number;
   /** Rows that are not terminal, per repository key. A key with none is absent. */
   inFlightByRepo(): ReadonlyMap<string, number>;
+  /**
+   * Rows holding a repository DISPATCH slot (`dispatching`/`running`), per repository key: the
+   * number `maxConcurrentPerRepo` is compared against. A key with none is absent.
+   */
+  buildingByRepo(): ReadonlyMap<string, number>;
   /**
    * Rows nobody ever clicked: `awaiting_approval` and untouched since `before`.
    *
@@ -412,16 +465,39 @@ const OCCUPIES_A_SLOT = sql`state IN ('draft', 'awaiting_approval', 'dispatching
 const slotsHeldBy = (t: SqlIdent, guildId: string): SqlQuery =>
   sqlJoin([sql`(SELECT count(*) FROM ${t} WHERE guild_id = ${guildId} AND`, OCCUPIES_A_SLOT, sql`)`]);
 
+/**
+ * THE STATES THAT OCCUPY A REPOSITORY DISPATCH SLOT (RFC-001 7.5): approved and not finished.
+ * Narrower than `OCCUPIES_A_SLOT` on purpose - see `BuildRepo.approveForDispatch`. Unqualified
+ * for the same reason, and answered by the `(repo_key, state)` index migration 0005 created.
+ */
+const HOLDS_A_DISPATCH_SLOT = sql`state IN ('dispatching', 'running')`;
+
+/** `(SELECT count(*) ...)` of one repository's dispatched builds, for a statement's WHERE. */
+const dispatchSlotsHeldIn = (t: SqlIdent, repoKey: string): SqlQuery =>
+  sqlJoin([sql`(SELECT count(*) FROM ${t} WHERE repo_key = ${repoKey} AND`, HOLDS_A_DISPATCH_SLOT, sql`)`]);
+
 export const buildRepo = (db: Db): BuildRepo => {
   const t = db.table('requests');
 
-  /** Shared by both re-arming paths: run the guarded UPDATE, then name the reason it failed. */
-  const reopen = (claim: SlotReopen, statement: SqlQuery): SlotClaim => {
+  /** One repository's dispatched builds: what `maxConcurrentPerRepo` is compared against. */
+  const building = (repoKey: string): number =>
+    db.queryOne<{ readonly n: number }>(
+      sqlJoin([sql`SELECT count(*) AS n FROM ${t} WHERE repo_key = ${repoKey} AND`, HOLDS_A_DISPATCH_SLOT]),
+    )?.n ?? 0;
+
+  /**
+   * Shared by every claiming UPDATE: run it, then name the reason it failed.
+   *
+   * The write already failed, so these reads cannot change the decision - only the WORDING. A
+   * caller told "someone else got there first" when the truth is "your server is full" goes off
+   * and does the wrong thing about it. The guild is named first when both are full: it is the
+   * limit the reader's own server holds.
+   */
+  const settle = (statement: SqlQuery, guild: SlotReopen | null, repoSlot: RepoSlot | null): SlotClaim => {
     if (db.execute(statement).changes === 1) return 'claimed';
-    // The write already failed, so this read cannot change the decision - only the WORDING. A
-    // caller told "someone else got there first" when the truth is "your server is full" goes
-    // off and does the wrong thing about it.
-    return slotsUsed(counts(claim.guildId)) >= claim.maxConcurrent ? 'full' : 'lost';
+    if (guild !== null && slotsUsed(counts(guild.guildId)) >= guild.maxConcurrent) return 'full';
+    if (repoSlot !== null && building(repoSlot.repoKey) >= repoSlot.maxConcurrentPerRepo) return 'repo-full';
+    return 'lost';
   };
 
   const counts = (guildId: string): ActiveCounts =>
@@ -465,20 +541,29 @@ export const buildRepo = (db: Db): BuildRepo => {
         WHERE id IN (SELECT id FROM ${t}
                      WHERE state = 'draft' AND updated_at < ${before}
                      ORDER BY updated_at LIMIT ${limitRows})`).changes,
-    compareAndSet: (id, expectVersion, next, at, approval) =>
-      (approval === undefined
-        ? db.execute(sql`
-            UPDATE ${t} SET state = ${next}, version = version + 1, updated_at = ${at}
-            WHERE id = ${id} AND version = ${expectVersion}`)
-        : // ONE STATEMENT with the state change - see the interface comment. The issued-at
-          // columns are cleared here because they belong to the dispatch attempts of THIS
-          // approval, none of which has happened yet.
-          db.execute(sql`
-            UPDATE ${t} SET state = ${next}, version = version + 1, updated_at = ${at},
-                            approval_id = ${approval.approvalId},
-                            approval_issued_at = NULL, first_dispatch_at = NULL
-            WHERE id = ${id} AND version = ${expectVersion}`)
-      ).changes === 1,
+    compareAndSet: (id, expectVersion, next, at) =>
+      db.execute(sql`
+        UPDATE ${t} SET state = ${next}, version = version + 1, updated_at = ${at}
+        WHERE id = ${id} AND version = ${expectVersion}`).changes === 1,
+    approveForDispatch: (claim) =>
+      settle(
+        sqlJoin([
+          // ONE STATEMENT - see the interface comment. The issued-at columns are cleared because
+          // they belong to the dispatch attempts of THIS approval, none of which has happened yet.
+          sql`UPDATE ${t} SET state = 'dispatching', version = version + 1, updated_at = ${claim.at},
+                              approval_id = ${claim.approvalId},
+                              approval_issued_at = NULL, first_dispatch_at = NULL
+              WHERE id = ${claim.id} AND version = ${claim.expectVersion}
+                AND state = 'awaiting_approval' AND repo_key = ${claim.repoKey}
+                AND`,
+          // The row is `awaiting_approval`, so it is not in its own count: the subquery asks how
+          // many OTHER builds this repository already has dispatched, which is the question.
+          dispatchSlotsHeldIn(t, claim.repoKey),
+          sql`< ${claim.maxConcurrentPerRepo}`,
+        ]),
+        null,
+        claim,
+      ),
     recordIssue: (id, issueNumber, issueUrl, surface, at) =>
       db.execute(sql`
         UPDATE ${t} SET issue_number = ${issueNumber}, issue_url = ${issueUrl},
@@ -526,8 +611,7 @@ export const buildRepo = (db: Db): BuildRepo => {
         ]),
       ).changes === 1,
     reopenForDispatch: (claim) =>
-      reopen(
-        claim,
+      settle(
         sqlJoin([
           // A FRESH approval id: a retry is a new spend, and the workflow has already consumed
           // the old id (or refused it). Re-sending it would be refused as a replay.
@@ -537,16 +621,22 @@ export const buildRepo = (db: Db): BuildRepo => {
                               first_dispatch_at = NULL,
                               retry_count = retry_count + 1, version = version + 1, updated_at = ${claim.at}
               WHERE id = ${claim.id} AND version = ${claim.expectVersion} AND state = 'failed'
+                AND repo_key = ${claim.repoKey}
                 AND`,
           // The row is terminal right now, so it is not in its own count - the subquery is
           // asking about everybody ELSE, which is the question the cap is about.
           slotsHeldBy(t, claim.guildId),
-          sql`< ${claim.maxConcurrent}`,
+          sql`< ${claim.maxConcurrent} AND`,
+          // AND the repository's dispatch slots, in the same predicate: a retry dispatches
+          // straight away, so it faces both caps or it is a door around one of them.
+          dispatchSlotsHeldIn(t, claim.repoKey),
+          sql`< ${claim.maxConcurrentPerRepo}`,
         ]),
+        claim,
+        claim,
       ),
     reopenForApproval: (claim) =>
-      reopen(
-        claim,
+      settle(
         sqlJoin([
           // No approval id: nobody has approved this yet. The Approve click mints one.
           sql`UPDATE ${t} SET state = 'awaiting_approval', nonce = ${claim.nonce},
@@ -559,6 +649,9 @@ export const buildRepo = (db: Db): BuildRepo => {
           slotsHeldBy(t, claim.guildId),
           sql`< ${claim.maxConcurrent}`,
         ]),
+        // Back to `awaiting_approval`, which holds no repository dispatch slot: only the guild's.
+        claim,
+        null,
       ),
     stuck: (before, limitRows) =>
       db.query<BuildRow>(
@@ -595,6 +688,14 @@ export const buildRepo = (db: Db): BuildRepo => {
         db
           .query<{ readonly repoKey: string; readonly n: number }>(
             sqlJoin([sql`SELECT repo_key AS repoKey, count(*) AS n FROM ${t} WHERE`, NOT_TERMINAL, sql`GROUP BY repo_key`]),
+          )
+          .map((r) => [r.repoKey, r.n] as const),
+      ),
+    buildingByRepo: () =>
+      new Map(
+        db
+          .query<{ readonly repoKey: string; readonly n: number }>(
+            sqlJoin([sql`SELECT repo_key AS repoKey, count(*) AS n FROM ${t} WHERE`, HOLDS_A_DISPATCH_SLOT, sql`GROUP BY repo_key`]),
           )
           .map((r) => [r.repoKey, r.n] as const),
       ),

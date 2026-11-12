@@ -350,7 +350,8 @@ wall.
 - ~~**The daily cap is now two numbers with nothing reconciling them.**~~ **FIXED.**
   `modules.builder.dailyRunCap` and the `AGENT_DAILY_RUN_CAP` repository variable both default to
   4, and nothing checked they agreed; the bad direction dispatches builds the workflow then
-  refuses. `reconcile()` now reads the variable once at boot and `/status` reports the comparison,
+  refuses. `reconcile()` now reads the variable once at boot — **in every configured repository**
+  since RFC-001 PR 2.4, each compared against the bot's one number — and `/status` reports the comparison,
   with a warning and an audit row on the bad direction only — warning on the harmless direction is
   how an operator learns to ignore the warning that matters. **Both caps stay**, and the reason is
   in `docs/SETUP.md`: the workflow's is the only bound on a *replayed* dispatch, which never goes
@@ -385,7 +386,8 @@ wall.
 - **The `builder.daily_cap_drift` audit row is written with `guildId: null`**, because a
   repository-wide configuration fact is not a guild's. `/admin audit` scoped to a server will not
   show it; only the unscoped view (a DM, i.e. the application owner) will. Correct, and worth
-  knowing before somebody goes looking for it in a server.
+  knowing before somebody goes looking for it in a server. Since PR 2.4 the row carries `repo`
+  (`owner/repo`), so with several repositories it says whose variable to change.
 - **`releaseStaleDrafts` logs and does not audit.** A reclaimed draft has no user-visible
   consequence and the rows span guilds, so a per-row audit entry looked like noise — but it does
   mean `/admin audit` cannot show that a crash cost a guild a slot for up to five minutes.
@@ -429,6 +431,44 @@ wall.
 
   **Corollary, and the important one:** never pass anything secret as a dispatch input. A
   per-user Anthropic key supplied this way would be printed to every collaborator.
+
+---
+
+## Several repositories (RFC-001 phase 2)
+
+One bot serving servers that build into different repositories (`GITHUB_REPOS_JSON`, `/repo use`,
+credentials per repository, caps per repository — `docs/SETUP.md` section 7).
+
+### Fixed in this phase
+
+| Was | Fix |
+|---|---|
+| **Two servers on one repository could dispatch more builds than its workflow keeps.** The workflow's `concurrency: agent-implement` group holds one running and one pending run and GitHub silently cancels the older pending one when a third queues; `maxConcurrentPerGuild` bounds one server, never the repository | `maxConcurrentPerRepo` (default 2), counted over `dispatching`/`running` per repository and claimed **in the same UPDATE** as the Approve click (`approveForDispatch`) and `/request retry` (`reopenForDispatch`). `concurrency.test.ts` runs the competing-writer `DbPort` wrapper over both claims: a check-then-act version oversubscribes and fails |
+| The daily cap's drift check read only the **default** repository's `AGENT_DAILY_RUN_CAP`; a set with no default was never compared | every configured repository is read at boot; `/status` has a line per repository with its own comparison and its last-read daily count; the audit row names the repository |
+
+### Open — low
+
+- **The repository cap refuses; it does not queue.** Past `maxConcurrentPerRepo` the Approve click
+  is refused (nothing approved, nothing spent, the card stays live) and the approver has to click
+  again later. Nothing tells them when a slot frees. Queuing approved-but-undispatched builds would
+  need a new state between `awaiting_approval` and `dispatching` — a migration and a CHECK change —
+  for a refusal that names the repository and says what to do.
+- **A build waiting for the daily-cap reset holds a repository dispatch slot.** It is `dispatching`
+  until the UTC reset. With the day's runs spent that costs nothing (nothing could start anyway),
+  but the refusal another approver sees says "running or about to start", which is true only in the
+  sense that it will start at midnight UTC.
+- **One bot number, many repository variables.** `modules.builder.dailyRunCap` is a single value
+  applied to every repository; there is no per-repository override. Repositories whose
+  `AGENT_DAILY_RUN_CAP` differ from each other will show drift on at least one line. A per-entry
+  `dailyRunCap` in `GITHUB_REPOS_JSON` would close it; it is a core config change nobody has needed.
+- **The daily count in `/status` and `/repo show` is "as last read".** It is the number the
+  dispatch check last fetched for that repository today, so runs started outside the bot (a manual
+  `workflow_dispatch`) appear only after the next dispatch there; before any dispatch that day the
+  line says the cap rather than a count. A health check makes no GitHub request by design.
+- **`compareAndSet` can still move a row to `dispatching` without the repository cap.** No
+  production path does — Approve and retry go through the two claiming methods — but the method
+  takes any state, and test fixtures use it to build legacy rows with no approval id. Narrowing its
+  `next` type would make the rule structural, at the cost of rewriting those fixtures.
 
 ---
 

@@ -151,12 +151,12 @@ export function githubForRow<I, B>(ports: GithubScopes<I, B>, row: { readonly re
 }
 
 /**
- * The repository the boot cap check compares against: the DEFAULT one. `null` with no default.
- * Per-repository caps and drift reporting across the set are PR 2.4.
+ * `owner/repo` for a row's repository key, for a sentence (the per-repository cap refusal). The
+ * bare key when the set no longer configures it: the sentence must still say something true.
  */
-export function githubForDefault<I, B>(ports: GithubScopes<I, B>): Result<RepoGithub<I, B>, AppError> | null {
-  const repo = ports.repos.all().find((r) => r.isDefault) ?? null;
-  return repo === null ? null : scopeTo(ports, repo);
+export function repositoryLabel(ports: { readonly repos: Pick<ReposPort, 'byKey'> }, key: string): string {
+  const repo = ports.repos.byKey(key);
+  return repo === null ? key : repoFullName(repo);
 }
 
 // ---------------------------------------------------------------------------------------

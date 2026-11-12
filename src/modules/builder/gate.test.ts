@@ -448,7 +448,7 @@ test('REPO SET: /status reports each repository\'s readiness against THAT reposi
   const health = await h.installed.health();
   // DEGRADED, not ok, since guild routing (PR 2.2): a server linked to events cannot build.
   assert.equal(health.status, 'degraded', 'one repository of the set cannot build');
-  assert.match(health.detail, /repositories: main \(acme\/bot-modules, default\): ready, 0 in flight; events \(acme\/events-modules\): down - /u);
+  assert.match(health.detail, /repositories: main \(acme\/bot-modules, default\): ready, 0 in flight, 0 of 2 builds dispatched, [^;]*; events \(acme\/events-modules\): down - /u);
 
   // A one-repository install's line carries none of that: unchanged from phase 1.
   const one = harness();

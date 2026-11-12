@@ -311,7 +311,7 @@ test('the unique index: two live rows cannot share an approval id', () => {
     const b = seedAwaiting(h.repo, 2);
     const held = h.repo.get(a)?.approvalId ?? '';
     assert.throws(
-      () => h.repo.compareAndSet(b, h.repo.get(b)?.version ?? 0, 'dispatching', NOW, { approvalId: held }),
+      () => h.repo.approveForDispatch({ id: b, expectVersion: h.repo.get(b)?.version ?? 0, repoKey: 'default', at: NOW, maxConcurrentPerRepo: 9, approvalId: held }),
       /UNIQUE|constraint/iu,
       'the database refuses, so no code path can make two rows spend one approval',
     );

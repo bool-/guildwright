@@ -143,7 +143,7 @@ test('ROW KEY WINS: re-linking the guild mid-build does not move the poll', asyn
     const row = h.repo.recentForRequester(GUILD, REQUESTER, 1)[0];
     assert.ok(row !== undefined && row.issueNumber !== null);
     assert.equal(row.repoKey, 'events');
-    assert.ok(h.repo.compareAndSet(row.id, row.version, 'dispatching', NOW, { approvalId: newApprovalId() }));
+    assert.equal(h.repo.approveForDispatch({ id: row.id, expectVersion: row.version, repoKey: 'events', at: NOW, maxConcurrentPerRepo: 2, approvalId: newApprovalId() }), 'claimed');
 
     // The operator re-links the guild while the request is being built.
     l.table.set(GUILD, 'main');
@@ -263,7 +263,10 @@ test('/STATUS PER REPOSITORY: each repository\'s readiness and in-flight count; 
     seedAwaiting(h.repo, 3, NOW, GUILD, 'main');
     const ok = await h.installed.health();
     assert.equal(ok.status, 'ok');
-    assert.match(ok.detail, /repositories: main \(acme\/bot-modules, default\): ready, 1 in flight; events \(acme\/events-modules\): ready, 2 in flight/u);
+    assert.match(
+      ok.detail,
+      /repositories: main \(acme\/bot-modules, default\): ready, 1 in flight, 0 of 2 builds dispatched, [^;]*; events \(acme\/events-modules\): ready, 2 in flight, 0 of 2 builds dispatched/u,
+    );
 
     const events = h.neighbours['events'];
     assert.ok(events !== undefined);
@@ -319,7 +322,11 @@ test('repoActivity: what /repo clear and /repo show read - in flight per guild a
     assert.ok(events !== null);
     const seen = activity.inRepo(events);
     assert.equal(seen.inFlight, 1);
-    assert.match(seen.detail, /^builds ready; up to 4 agent runs per UTC day$/u, 'readiness and the cap, for /repo show');
+    assert.match(
+      seen.detail,
+      /^builds ready; 0 of 2 builds dispatched; up to 4 agent runs per UTC day \(the repository cap has not been read\)$/u,
+      'readiness and the caps - this repository\'s own - for /repo show',
+    );
   } finally {
     h.close();
   }
