@@ -86,7 +86,7 @@ export interface LoggerDeps {
   readonly clock?: ClockPort;
   /** Defaults to `process.stdout`. Tests pass an array-backed sink. */
   readonly destination?: pino.DestinationStream;
-  /** Permanent root bindings, e.g. `{ service: 'discord-bot', bootId }`. */
+  /** Permanent root bindings, e.g. `{ service: LOG_SERVICE, bootId }` (`#core/version`). */
   readonly base?: JsonObject;
   /** Extra `redact` paths on top of `DEFAULT_REDACT_PATHS`. */
   readonly redactPaths?: readonly string[];

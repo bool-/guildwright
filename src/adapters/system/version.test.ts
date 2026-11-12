@@ -142,7 +142,7 @@ test('started in the engine checkout, both identities name this repository, and 
   // The real package.json, read off disk - so a rename or a version bump shows up here rather
   // than in a fixture that quietly disagrees with what ships.
   const info = readBuildInfo({}, enginePackageRoot());
-  assert.equal(info.engine.name, 'discord-ai-feature-builder');
+  assert.equal(info.engine.name, 'guildwright');
   assert.match(info.engine.version, /^\d+\.\d+\.\d+/u);
   // In the engine's own checkout the engine and the repo are the same tree (RFC-001 4.3).
   assert.equal(info.repo.name, info.engine.name);
@@ -162,9 +162,9 @@ test('started in a module repository, the engine and the repo are two different 
   writeFileSync(join(git, 'HEAD'), `${OTHER}\n`);
 
   const info = readBuildInfo({}, repoDir);
-  assert.equal(info.engine.name, 'discord-ai-feature-builder', 'the engine is read relative to its own file');
+  assert.equal(info.engine.name, 'guildwright', 'the engine is read relative to its own file');
   assert.deepEqual(info.repo, { name: 'my-bot-modules', version: '0.4.0', gitSha: OTHER });
-  assert.ok(describeBuild(info).startsWith('engine discord-ai-feature-builder@'));
+  assert.ok(describeBuild(info).startsWith('engine guildwright@'));
   assert.ok(describeBuild(info).includes(` · my-bot-modules@0.4.0 (${OTHER.slice(0, 7)})`));
 });
 
@@ -173,7 +173,7 @@ test('a repo directory with no package.json and no .git degrades to the placehol
   mkdirSync(repoDir);
   const info = readBuildInfo({}, repoDir);
   assert.deepEqual(info.repo, UNKNOWN_BUILD.repo);
-  assert.equal(info.engine.name, 'discord-ai-feature-builder');
+  assert.equal(info.engine.name, 'guildwright');
 });
 
 test('an explicit environment sha wins over whatever the working copy says', (t) => {
@@ -188,25 +188,25 @@ test('an explicit environment sha wins over whatever the working copy says', (t)
 // The engine pin (RFC-001 5.4, PR 1.7)
 // ---------------------------------------------------------------------------------------
 
-const ENGINE = { name: 'discord-ai-feature-builder', version: '1.7.0' };
+const ENGINE = { name: 'guildwright', version: '1.7.0' };
 
 test('ROW: a module repo pinning a different engine than is installed refuses to start, with the exact sentence', () => {
-  assert.deepEqual(checkEnginePin({ dependencies: { 'discord-ai-feature-builder': '1.6.2' } }, ENGINE), {
+  assert.deepEqual(checkEnginePin({ dependencies: { 'guildwright': '1.6.2' } }, ENGINE), {
     kind: 'refuse',
-    sentence: 'package.json asks for discord-ai-feature-builder@1.6.2 but 1.7.0 is installed. Run npm ci.',
+    sentence: 'package.json asks for guildwright@1.6.2 but 1.7.0 is installed. Run npm ci.',
   });
 });
 
 test('the matching exact pin, and no pin at all (the engine checkout itself), both start', () => {
-  assert.deepEqual(checkEnginePin({ dependencies: { 'discord-ai-feature-builder': '1.7.0' } }, ENGINE), { kind: 'ok' });
-  assert.deepEqual(checkEnginePin({ name: 'discord-ai-feature-builder', dependencies: { octokit: '5.0.5' } }, ENGINE), { kind: 'ok' });
+  assert.deepEqual(checkEnginePin({ dependencies: { 'guildwright': '1.7.0' } }, ENGINE), { kind: 'ok' });
+  assert.deepEqual(checkEnginePin({ name: 'guildwright', dependencies: { octokit: '5.0.5' } }, ENGINE), { kind: 'ok' });
   assert.deepEqual(checkEnginePin({ name: 'x' }, ENGINE), { kind: 'ok' });
   assert.deepEqual(checkEnginePin(null, ENGINE), { kind: 'ok' }, 'an unreadable package.json is not evidence of a wrong pin');
 });
 
 test('a range, tag, file: or git spec is a WARNING (the convention suite insists on exact), never a refusal', () => {
   for (const spec of ['^1.7.0', '~1.7.0', 'latest', 'file:../engine', 'github:o/engine']) {
-    const verdict = checkEnginePin({ dependencies: { 'discord-ai-feature-builder': spec } }, ENGINE);
+    const verdict = checkEnginePin({ dependencies: { 'guildwright': spec } }, ENGINE);
     assert.equal(verdict.kind, 'warn', spec);
     assert.match(verdict.kind === 'warn' ? verdict.sentence : '', /is not an exact version; pin it to 1\.7\.0/u);
   }
@@ -222,8 +222,8 @@ test('readRepoManifest is best-effort: a missing or broken package.json is null'
   assert.equal(readRepoManifest(dir), null);
   writeFileSync(join(dir, 'package.json'), '{not json');
   assert.equal(readRepoManifest(dir), null);
-  writeFileSync(join(dir, 'package.json'), '{"dependencies":{"discord-ai-feature-builder":"1.0.0"}}');
-  assert.deepEqual(readRepoManifest(dir), { dependencies: { 'discord-ai-feature-builder': '1.0.0' } });
+  writeFileSync(join(dir, 'package.json'), '{"dependencies":{"guildwright":"1.0.0"}}');
+  assert.deepEqual(readRepoManifest(dir), { dependencies: { 'guildwright': '1.0.0' } });
 });
 
 function tempDir(t: TestContext): string {

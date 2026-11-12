@@ -148,7 +148,7 @@ test('template check is clean on a copy of the template and names each drifted f
   writeFileSync(join(repo.dir, 'AGENTS.md'), readFileSync(join(root, 'template', 'AGENTS.md'), 'utf8').replace(/\n/gu, '\r\n'));
   const drifted = captureIo(repo.dir);
   assert.equal(await runCli(['template', 'check'], drifted.io, { engineRoot: root }), 1);
-  assert.match(drifted.stderr(), /\.github\/workflows\/ci\.yml: differs from the engine's copy; run npx discord-ai-feature-builder template apply and commit/u);
+  assert.match(drifted.stderr(), /\.github\/workflows\/ci\.yml: differs from the engine's copy; run npx guildwright template apply and commit/u);
   assert.match(drifted.stderr(), /AGENTS\.md: differs/u, 'CRLF is drift: byte-identical is the property');
 });
 

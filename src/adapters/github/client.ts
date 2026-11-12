@@ -30,6 +30,7 @@ import { describeWait, errors, type AppError } from '#core/errors';
 import { redactSecrets } from '#core/text';
 import type { Secret } from '#core/config';
 import type { LoggerPort } from '#core/ports';
+import { PRODUCT_NAME } from '#core/version';
 
 // ---------------------------------------------------------------------------------------
 // The pinned API version
@@ -51,8 +52,11 @@ import type { LoggerPort } from '#core/ports';
  */
 export const GITHUB_API_VERSION = '2026-03-10';
 
-/** Sent so GitHub can identify the client in abuse reports. Never contains a credential. */
-export const GITHUB_USER_AGENT = 'discord-ai-feature-builder';
+/**
+ * Sent so GitHub can identify the client in abuse reports. Never contains a credential. The
+ * product name, so it agrees with the log `service` field and the boot prefix (`#core/version`).
+ */
+export const GITHUB_USER_AGENT = PRODUCT_NAME;
 
 /**
  * Statuses the bundled retry plugin must never retry.

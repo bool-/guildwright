@@ -107,7 +107,7 @@ test('an EMPTY user environment fails the build instead of silently billing the 
 });
 
 test('an environment holding only APPROVAL_HMAC_KEY cannot pay for anything', async () => {
-  // Exactly the fresh-install state described in docs/SETUP.md step 4b: `ai-agent` exists and
+  // Exactly the fresh-install state described in docs/SETUP.md section 5c: `ai-agent` exists and
   // holds the MAC key, and no build can authenticate. Reporting that as fundable is the one
   // answer that makes the whole pre-flight pointless, so it is pinned here as well as in the
   // adapter's own filter test.

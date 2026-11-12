@@ -437,7 +437,7 @@ wall.
 ## Several repositories (RFC-001 phase 2)
 
 One bot serving servers that build into different repositories (`GITHUB_REPOS_JSON`, `/repo use`,
-credentials per repository, caps per repository — `docs/SETUP.md` section 7).
+credentials per repository, caps per repository — `docs/SETUP.md` section 8).
 
 ### Fixed in this phase
 

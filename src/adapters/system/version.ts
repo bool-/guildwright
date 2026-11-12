@@ -45,7 +45,7 @@ export const SHA_ENV_VARS: readonly string[] = ['GIT_SHA', 'GITHUB_SHA', 'GIT_CO
  *
  * `../../../` from `src/adapters/system/version.ts` in a checkout, and from
  * `dist/adapters/system/version.js` in an installed engine - which is
- * `node_modules/discord-ai-feature-builder/`, holding the engine's `package.json` and no `.git`.
+ * `node_modules/guildwright/`, holding the engine's `package.json` and no `.git`.
  * That is exactly why this root answers only `engine`, and the sha comes from the working
  * directory instead.
  */

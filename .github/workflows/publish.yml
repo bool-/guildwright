@@ -1,25 +1,38 @@
 name: publish
 
-# OWNER-RUN RELEASE (RFC-001 4.1, 9.1 "The lockfile", PR 1.5). Publishes the engine to npm with
-# provenance, then proves the module-repo template installs from what was just published, by
-# generating the template's package-lock.json against it - which is the only place that lockfile
-# can come from: it pins the published engine, so it cannot exist before the publish.
+# OWNER-RUN RELEASE (RFC-001 4.1, 9.1 "The lockfile", PRs 1.5 and 1.8). Publishes the engine to npm
+# with provenance, proves the module-repo template installs from what was just published, and then
+# pushes that generated template - lockfile included - to the template repository, so "Use this
+# template" there yields a repository whose `npm ci` works. The lockfile can only come from here:
+# it pins the published engine, so it cannot exist before the publish.
 #
 # INERT BY DESIGN until the owner opts in, in three independent ways:
 #   1. `workflow_dispatch` only. No push, tag or schedule trigger: nothing publishes because a
 #      commit landed.
 #   2. Without a repository secret named NPM_TOKEN the job stops at its first step, green, having
 #      published nothing. Adding that secret is the owner's decision, and an operator action.
-#   3. `package.json` is `"private": true` until RFC-001 PR 1.8, and npm refuses to publish a
-#      private package.
+#   3. Without a repository secret named TEMPLATE_REPO_TOKEN the template repository is not
+#      touched: the generated tree is still verified, then discarded, and the run says so.
 #
-# RELEASE CHECKLIST: bump `version` in package.json, run `npm run build` (it regenerates
-# template/MANIFEST.json, whose `engineVersion` must equal the package version), commit both,
-# merge, then run this workflow from main. `npm run check` below fails if the manifest is stale.
+# THE SECRETS:
+#   NPM_TOKEN            an npm token that may publish `guildwright` (an automation token, or a
+#                        granular access token with read and write; for the very first publish of
+#                        a name that does not exist yet, a granular token must cover all packages).
+#   TEMPLATE_REPO_TOKEN  a fine-grained GitHub token on the template repository ONLY, with
+#                        Contents: read and write and Workflows: read and write (GitHub refuses a
+#                        push that adds files under .github/workflows/ without the second). It
+#                        pushes one commit to `main` there and nothing else.
+# The template repository is `bool-/guildwright-template`, or the repository variable
+# TEMPLATE_REPOSITORY when set. Create it first (empty is fine) and tick Settings -> "Template
+# repository" on it; this workflow never changes repository settings.
 #
-# Not here yet (PR 1.8): pushing the generated tree, lockfile included, to the template
-# repository so "Use this template" yields it. Until then the generated lockfile is verified
-# (`npm ci` + `npm run check` against the published engine) and discarded.
+# npm provenance is only accepted from a PUBLIC source repository, so the job refuses to start a
+# release from a private one (before anything is built) rather than failing at `npm publish`.
+#
+# RELEASE CHECKLIST: add a `## <version>` entry to CHANGELOG.md, bump `version` in package.json,
+# run `npm run build` (it regenerates template/MANIFEST.json, whose `engineVersion` must equal the
+# package version), commit all three, merge, then run this workflow from main. `npm run check`
+# below fails if the manifest or the changelog is stale.
 
 on:
   workflow_dispatch:
@@ -43,6 +56,7 @@ jobs:
         id: gate
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          TEMPLATE_REPO_TOKEN: ${{ secrets.TEMPLATE_REPO_TOKEN }}
         run: |
           set -euo pipefail
           if [ -z "$NPM_TOKEN" ]; then
@@ -50,6 +64,22 @@ jobs:
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -z "$TEMPLATE_REPO_TOKEN" ]; then
+            echo "template=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "template=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Refuse a release from a private repository (npm provenance needs a public one)
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          REPO_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          set -euo pipefail
+          if [ "$REPO_PRIVATE" != "false" ]; then
+            echo "::error::$GITHUB_REPOSITORY is private (or its visibility is unknown). npm accepts provenance only from a public source repository: make it public, then run this workflow again. Nothing was published."
+            exit 1
           fi
 
       - if: steps.gate.outputs.enabled == 'true'
@@ -87,7 +117,9 @@ jobs:
 
       # THE TEMPLATE LOCKFILE (RFC-001 9.1). `init` writes the template tree pinned to the version
       # just published and runs `npm install --package-lock-only --ignore-scripts` against the
-      # registry; `npm ci` and `npm run check` then prove the pair installs and is green.
+      # registry. The tree is copied aside BEFORE `npm ci`, so the copy holds exactly what `init`
+      # wrote and no node_modules; then `npm ci`, `npm run check` and `template check` prove the
+      # pair installs and is green.
       - name: Generate and verify the template lockfile against the published engine
         if: steps.gate.outputs.enabled == 'true'
         run: |
@@ -95,14 +127,61 @@ jobs:
           NAME="$(node -p "require('./package.json').name")"
           VERSION="$(node -p "require('./package.json').version")"
           OUT="$RUNNER_TEMP/template-repo"
+          TREE="$RUNNER_TEMP/template-tree"
           # The registry can take a moment to serve a version it has just accepted.
           for attempt in 1 2 3 4 5 6; do
             if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then break; fi
             sleep 20
           done
           npx --yes "$NAME@$VERSION" init "$OUT"
+          cp -a "$OUT" "$TREE"
           cd "$OUT"
           npm ci --ignore-scripts
           npm run check
           npx "$NAME" template check
           echo "template lockfile generated and verified for $NAME@$VERSION"
+
+      # THE TEMPLATE REPOSITORY (RFC-001 4.1 B). One commit on `main` whose tree is exactly what
+      # `init` wrote for this version - every file it did not write is removed - so the template
+      # repository cannot drift from `template/`. The token reaches git through GIT_CONFIG_* in
+      # the environment (an Authorization header), never through a URL or a file on disk.
+      - name: Push the generated template to the template repository
+        if: steps.gate.outputs.enabled == 'true' && steps.gate.outputs.template == 'true'
+        env:
+          TEMPLATE_REPO_TOKEN: ${{ secrets.TEMPLATE_REPO_TOKEN }}
+          TEMPLATE_REPOSITORY: ${{ vars.TEMPLATE_REPOSITORY || 'bool-/guildwright-template' }}
+        run: |
+          set -euo pipefail
+          NAME="$(node -p "require('./package.json').name")"
+          VERSION="$(node -p "require('./package.json').version")"
+          TREE="$RUNNER_TEMP/template-tree"
+          WORK="$RUNNER_TEMP/template-push"
+          AUTH="$(printf 'x-access-token:%s' "$TEMPLATE_REPO_TOKEN" | base64 -w0)"
+          echo "::add-mask::$AUTH"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $AUTH"
+          git init -q "$WORK"
+          cd "$WORK"
+          git remote add origin "https://github.com/$TEMPLATE_REPOSITORY.git"
+          if git ls-remote --exit-code --heads origin main >/dev/null; then
+            git fetch -q --depth=1 origin main
+            git checkout -q -B main FETCH_HEAD
+          else
+            git symbolic-ref HEAD refs/heads/main   # an empty repository: the first commit starts main
+          fi
+          git rm -rq --ignore-unmatch .
+          cp -a "$TREE"/. .
+          git add -A
+          if git diff --cached --quiet; then
+            echo "$TEMPLATE_REPOSITORY already holds the template for $NAME@$VERSION; nothing to push."
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "Template for $NAME@$VERSION"
+          git push -q origin main
+          echo "pushed the template for $NAME@$VERSION to $TEMPLATE_REPOSITORY"
+
+      - name: Say that the template repository was not updated
+        if: steps.gate.outputs.enabled == 'true' && steps.gate.outputs.template != 'true'
+        run: echo "::notice::TEMPLATE_REPO_TOKEN is not set, so the template repository was not updated. The generated template was verified and discarded."

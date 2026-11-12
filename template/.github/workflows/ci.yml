@@ -257,7 +257,7 @@ jobs:
   # that introduces the difference - so a drift is a red check here rather
   # than a disabled builder in Discord after the merge.
   #
-  # The fix is always `npx discord-ai-feature-builder template apply`, run by
+  # The fix is always `npx guildwright template apply`, run by
   # a human in the same pull request that bumps the engine version: the agent
   # cannot edit `.github/**`.
   # ------------------------------------------------------------------------
@@ -279,4 +279,4 @@ jobs:
         run: npm ci --ignore-scripts
 
       - name: The copied gate files must match the installed engine's template
-        run: npx discord-ai-feature-builder template check
+        run: npx guildwright template check

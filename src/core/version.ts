@@ -19,14 +19,33 @@
  */
 
 /**
- * The engine's CLI binary name: the `bin` key in `package.json`, and what every operator-facing
- * sentence tells them to run (`npx <CLI_BIN> template apply`, `npx <CLI_BIN> doctor`).
+ * THE PRODUCT NAME (RFC-001 section 12, decision 1): the npm package, its CLI binary, the GitHub
+ * user agent, the `service` field on every log line and the boot refusal prefix all say this.
  *
- * ONE constant, so the product rename (RFC-001 PR 1.8) is one edit: `package.json` `bin` and this
- * string must agree, and `src/cli.test.ts` asserts that they do. Until the rename it is the
- * current package name, which is also what makes `npx <name>` resolve to this binary.
+ * ONE string, because the surfaces are read by different people for the same question - "which
+ * program is this?" - and a log filter, a GitHub audit-log search and an `npx` command that
+ * disagree about the answer send each of them somewhere else. `src/conventions.test.ts` asserts
+ * that every surface agrees with it and with `package.json` `name`.
  */
-export const CLI_BIN = 'discord-ai-feature-builder';
+export const PRODUCT_NAME = 'guildwright';
+
+/**
+ * The engine's CLI binary name: the `bin` key in `package.json`, and what every operator-facing
+ * sentence tells them to run (`npx <CLI_BIN> template apply`, `npx <CLI_BIN> doctor`). It is the
+ * package name too, which is what makes `npx <name>` resolve to this binary; `src/cli.test.ts`
+ * asserts that `package.json` `bin` and this string agree.
+ */
+export const CLI_BIN = PRODUCT_NAME;
+
+/** The `service` field bound to every structured log line. Filter logs on this value. */
+export const LOG_SERVICE = PRODUCT_NAME;
+
+/**
+ * How every refusal to start begins, on stderr, before a logger exists: `guildwright cannot
+ * start: <sentence>`. `formatConfigFailure`, the boot guards in `src/main.ts` and `doctor` all
+ * print it, so an operator greps for one string whichever of them refused.
+ */
+export const BOOT_REFUSAL_PREFIX = `${PRODUCT_NAME} cannot start:`;
 
 /** How many hex characters of a sha a human actually reads. Git's own default. */
 export const SHORT_SHA_LENGTH = 7;
@@ -56,7 +75,7 @@ export interface RepoIdentity extends PackageIdentity {
  * What is running, as data. TWO identities, because after RFC-001 they are two things.
  *
  * `engine` is the package this code lives in - read relative to the code's own file, so from an
- * installed engine it is `node_modules/discord-ai-feature-builder/package.json`, which has a
+ * installed engine it is `node_modules/guildwright/package.json`, which has a
  * version and no `.git`. `repo` is the module repository the bot was started in - read from the
  * working directory, and the one whose commit sha an operator triaging an agent's PR wants. One
  * identity would have to pick: the engine's root reports no sha once installed, and the cwd's
@@ -81,8 +100,8 @@ export interface BuildInfo {
  * a renderer cannot accidentally invent a friendlier-looking placeholder that hides the gap.
  */
 export const UNKNOWN_BUILD: BuildInfo = {
-  engine: { name: 'discord-bot', version: '0.0.0-unknown' },
-  repo: { name: 'discord-bot', version: '0.0.0-unknown', gitSha: null },
+  engine: { name: PRODUCT_NAME, version: '0.0.0-unknown' },
+  repo: { name: PRODUCT_NAME, version: '0.0.0-unknown', gitSha: null },
   node: 'unknown',
 };
 
@@ -94,7 +113,7 @@ export function shortSha(sha: string | null): string | null {
 /**
  * One line, for a log field, a `/status` footer or a bug report.
  *
- * `engine discord-ai-feature-builder@0.1.0 · my-bot-modules@0.3.0 (a1b2c3d) on node v24.16.0`,
+ * `engine guildwright@1.0.0 · my-bot-modules@0.3.0 (a1b2c3d) on node v24.16.0`,
  * and with no sha available `... (no git sha) ...` - the absence is SAID rather than left as a
  * gap, because a missing parenthesis reads as a formatting bug and gets ignored, while
  * "no git sha" reads as the fact it is. The sha sits next to the REPO because that is whose

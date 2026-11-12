@@ -50,10 +50,11 @@ const SRC = join(ROOT, 'src');
 const DIST = join(ROOT, 'dist');
 const TEMPLATE = join(ROOT, 'template');
 const FIXTURES = join(SRC, 'testing', 'fixtures');
-const PKG = 'discord-ai-feature-builder';
+const PKG = 'guildwright';
 
 interface PackageJson {
   readonly name: string;
+  readonly bin: Readonly<Record<string, string>>;
   readonly dependencies?: Readonly<Record<string, string>>;
   readonly devDependencies?: Readonly<Record<string, string>>;
   readonly peerDependencies?: Readonly<Record<string, string>>;
@@ -242,8 +243,23 @@ test('every documented way to start the bot from source passes the source condit
   const docker = startsIn('Dockerfile');
   const setup = startsIn('docs/SETUP.md');
   assert.ok(docker.some((line) => line.startsWith('CMD')), 'the Dockerfile starts the bot with a CMD');
-  assert.ok(setup.some((line) => line.startsWith('ExecStart=')), 'SETUP.md documents a systemd ExecStart');
+  assert.ok(setup.some((line) => line.startsWith('ExecStart=')), 'SETUP.md documents a systemd ExecStart for the engine checkout');
   for (const line of [...docker, ...setup]) assert.match(line, /--conditions=source/u, line);
+});
+
+test('every documented way to start a MODULE REPOSITORY runs the installed bin, with no source condition', () => {
+  // The other half of the rule above: a module repository runs the COMPILED engine, and
+  // `--conditions=source` there would point #core/* inside node_modules at its shipped .ts, which
+  // Node refuses to strip. SETUP.md section 9 gives the Dockerfile CMD and the systemd ExecStart.
+  const bin = `node_modules/${PKG}/${pkg.bin[PKG]?.replace(/^\.\//u, '') ?? ''}`;
+  assert.equal(bin, `node_modules/${PKG}/dist/cli.js`);
+  const lines = readFileSync(join(ROOT, 'docs', 'SETUP.md'), 'utf8')
+    .split('\n')
+    .filter((line) => line.includes(`node_modules/${PKG}/dist/`));
+  assert.ok(lines.includes(`CMD ["node", "${bin}", "start"]`), 'SETUP.md documents the module-repository Dockerfile CMD');
+  assert.ok(lines.includes(`ExecStart=/usr/bin/node ${bin} start`), 'SETUP.md documents the module-repository systemd ExecStart');
+  for (const line of lines) assert.doesNotMatch(line, /--conditions=source/u, line);
+  assert.ok(existsSync(join(ROOT, ...bin.slice(`node_modules/${PKG}/`.length).split('/'))), 'and the build emits that file');
 });
 
 test('zod is a peer dependency at an exact version, and is listed nowhere else', () => {
@@ -363,6 +379,8 @@ test('the template names the engine one way: dependency, imports, tsconfig, engi
     imports: Record<string, string>;
     scripts: Record<string, string>;
   };
+  assert.equal(pkg.name, PKG, 'the engine package is named once, here and in package.json');
+  assert.deepEqual(pkg.bin, { [PKG]: './dist/cli.js' }, 'and its bin is the same name');
   assert.deepEqual(Object.keys(tpl.dependencies).sort(), [PKG, 'zod'].sort());
   assert.equal(tpl.dependencies[PKG], '<version>', 'init replaces the placeholder with the installed version');
   assert.equal(tpl.dependencies['zod'], pkg.peerDependencies?.['zod'], 'zod at exactly the engine peer pin, or two copies break every manifest');
@@ -408,6 +426,44 @@ test('publish.yml can only be run by hand, and publishes nothing without an NPM_
   assert.match(yaml, /init "\$OUT"[\s\S]*npm ci --ignore-scripts[\s\S]*npm run check/u, 'the template lockfile is generated and proven installable');
 });
 
+test('publish.yml pushes exactly the generated template to the template repository, and only with its own token', () => {
+  // RFC-001 4.1 B, the deferral PR 1.5 left: "Use this template" must yield the tree init writes,
+  // lockfile included, or every npm ci in a new module repository fails.
+  const yaml = readFileSync(join(ROOT, '.github', 'workflows', 'publish.yml'), 'utf8');
+  const step = (name: string): string => {
+    const at = yaml.indexOf(`- name: ${name}`);
+    assert.notEqual(at, -1, `publish.yml has no step "${name}"`);
+    const next = yaml.indexOf('\n      - ', at + 1);
+    return next === -1 ? yaml.slice(at) : yaml.slice(at, next);
+  };
+  const gate = step('Stop unless the NPM_TOKEN secret is set');
+  assert.match(gate, /TEMPLATE_REPO_TOKEN: \$\{\{ secrets\.TEMPLATE_REPO_TOKEN \}\}/u);
+  assert.match(gate, /echo "template=false"/u, 'no TEMPLATE_REPO_TOKEN, no push');
+
+  const generate = step('Generate and verify the template lockfile against the published engine');
+  // The pushed tree is copied aside BEFORE npm ci, so it holds what init wrote and no node_modules.
+  assert.ok(generate.indexOf('cp -a "$OUT" "$TREE"') > generate.indexOf('init "$OUT"'));
+  assert.ok(generate.indexOf('cp -a "$OUT" "$TREE"') < generate.indexOf('npm ci --ignore-scripts'));
+
+  const push = step('Push the generated template to the template repository');
+  assert.match(push, /if: steps\.gate\.outputs\.enabled == 'true' && steps\.gate\.outputs\.template == 'true'/u);
+  assert.match(push, /'bool-\/guildwright-template'/u, 'the default template repository');
+  assert.ok(yaml.indexOf('- name: Push the generated template') > yaml.indexOf('- name: Generate and verify the template lockfile'), 'only a verified tree is pushed');
+  assert.ok(push.includes('git rm -rq --ignore-unmatch .') && push.includes('cp -a "$TREE"/. .'), 'the template repository holds exactly the generated tree');
+  assert.ok(!push.includes('git push --force') && !push.includes(' -f '), 'never a force push');
+  assert.ok(!/https:\/\/[^"\s]*@github\.com/u.test(push), 'the token never goes into a URL');
+
+  const privateRepo = step('Refuse a release from a private repository (npm provenance needs a public one)');
+  assert.ok(yaml.indexOf('- name: Refuse a release from a private repository') < yaml.indexOf('- name: Publish with provenance'));
+  assert.match(privateRepo, /REPO_PRIVATE: \$\{\{ github\.event\.repository\.private \}\}/u);
+
+  // No ${{ }} inside any run: block - every value reaches the shell through env:.
+  for (const block of yaml.split(/\n {8}run: /u).slice(1)) {
+    const body = block.split(/\n {6}- /u)[0] ?? '';
+    assert.ok(!body.includes('${{'), `a run: block interpolates an expression: ${body.slice(0, 80)}`);
+  }
+});
+
 /** Every file under `dir` as sorted POSIX paths (no fixture skipping: for template/). */
 function walkTree(dir: string, base: string = dir): string[] {
   const out: string[] = [];
@@ -436,6 +492,46 @@ test('npm pack ships the whole template, dotfiles included, and no lockfile for 
   // RFC-001 9.1 "The lockfile": it pins the PUBLISHED engine, so it cannot exist in the tarball
   // that publishes it; `init` and publish.yml generate it.
   assert.ok(!shipped.has('package-lock.json'));
+});
+
+test('npm pack ships exactly the expected file list: dist, core source, the template and five root files', { timeout: 120_000 }, (t) => {
+  // RFC-001 PR 1.8. The package is public from 1.0.0, so a file that lands in the tarball by
+  // accident (a fixture, docs/, .github/, an .env.example) is published to everyone, and a file
+  // that falls out of it (a template file, a migration) breaks every install. `files` in
+  // package.json is the policy; this is the list it must produce.
+  const npmCli = findNpmCli();
+  if (npmCli === null) {
+    t.skip('npm could not be found next to this Node');
+    return;
+  }
+  const r = spawnSync(process.execPath, [npmCli, 'pack', '--dry-run', '--ignore-scripts', '--json'], { cwd: ROOT, encoding: 'utf8', timeout: 120_000 });
+  assert.equal(r.status, 0, output(r));
+  const [manifest] = JSON.parse(r.stdout) as [{ name: string; version: string; files: { path: string }[] }];
+  assert.equal(manifest.name, PKG);
+  const shipped = manifest.files.map((f) => f.path).sort();
+  const expected = [
+    'AGENTS.md',
+    'CHANGELOG.md',
+    'README.md',
+    'package.json',
+    'tsconfig.module-repo.json',
+    ...walkTree(DIST).map((p) => `dist/${p}`),
+    ...walkTree(join(SRC, 'core')).map((p) => `src/core/${p}`),
+    ...walkTree(TEMPLATE).map((p) => `template/${p}`),
+  ].sort();
+  const missing = expected.filter((p) => !shipped.includes(p));
+  const unexpected = shipped.filter((p) => !expected.includes(p));
+  assert.deepEqual({ missing, unexpected }, { missing: [], unexpected: [] });
+  // The shape of what that means, so a reader of a failure knows what was promised.
+  for (const p of ['dist/cli.js', 'dist/main.js', 'dist/core/module.d.ts', 'dist/engine-events.d.ts', 'src/core/module.ts', 'template/MANIFEST.json']) {
+    assert.ok(shipped.includes(p), p);
+  }
+  for (const prefix of ['src/adapters/', 'src/modules/', 'src/testing/', 'docs/', '.github/', 'scripts/', 'brand/', 'dist/testing/fixtures/']) {
+    assert.ok(!shipped.some((p) => p.startsWith(prefix)), `nothing under ${prefix} ships`);
+  }
+  for (const root of ['.env.example', 'Dockerfile', 'compose.yaml', 'package-lock.json', 'tsconfig.json']) {
+    assert.ok(!shipped.includes(root), `${root} does not ship`);
+  }
 });
 
 // ---------------------------------------------------------------------------------------
@@ -482,7 +578,7 @@ export default defineModule({
   migrations: false,
 
   setup(ctx) {
-    // A built-in's event, typed through 'discord-ai-feature-builder/events' in src/engine.d.ts.
+    // A built-in's event, typed through 'guildwright/events' in src/engine.d.ts.
     const off = ctx.bus.on('builder.pr_opened', (e) => {
       const issue: number = e.issueNumber;
       const url: string = e.prUrl;

@@ -71,7 +71,7 @@ import {
 import type { AdminPort, CatalogPort, PortRegistry, RepoActivityReport, VersionPort } from '#core/ports';
 import { repoTargetReader } from '#core/ports/repos';
 import { describeBuild, describeGithubAuth } from '#core/ports';
-import { checkEnginePin } from '#core/version';
+import { BOOT_REFUSAL_PREFIX, checkEnginePin, LOG_SERVICE, PRODUCT_NAME } from '#core/version';
 import type { DocStore } from '#core/ports/db';
 import { buildCatalog, formatProblems } from '#core/registry';
 
@@ -130,7 +130,7 @@ export const ROUTER_AUDIT_ID = 'router';
 // ---------------------------------------------------------------------------------------
 
 /** The engine's npm package name, as `npm ls` wants it. */
-export const ENGINE_PACKAGE = 'discord-ai-feature-builder';
+export const ENGINE_PACKAGE = PRODUCT_NAME;
 
 /**
  * Where a running engine registers itself. `Symbol.for`, so a second copy of this file - which
@@ -151,7 +151,7 @@ export interface EngineClaim {
  * WHY THIS EXISTS (RFC-001 section 4.3, "Module identity"): every runtime symbol core relies on -
  * the `UserText` brands, the `Ok`/`Err` shapes, the event bus - is one instance only because the
  * engine's own imports and a module repo's `#core/*` imports land on ONE file under
- * `node_modules/discord-ai-feature-builder/dist/`. A nested second copy of the package (some
+ * `node_modules/guildwright/dist/`. A nested second copy of the package (some
  * dependency pulling in another version) breaks that silently: a `UserText` minted by one copy
  * fails the other's brand check, deep inside a handler. Refusing at boot names the two paths and
  * the command that fixes it instead.
@@ -191,7 +191,7 @@ export function formatConfigFailure(error: AppError): string {
   const detail = error.internal ?? 'no further detail was recorded';
   return [
     '',
-    `discord-bot cannot start: ${error.userDetail}`,
+    `${BOOT_REFUSAL_PREFIX} ${error.userDetail}`,
     `  where: ${where}`,
     '',
     ...detail.split('\n').map((line) => `  ${line}`),
@@ -305,21 +305,21 @@ export async function run(env: Readonly<Record<string, string | undefined>> = pr
   const build = readBuildInfo(env);
   const refusal = claimEngine({ version: build.engine.version, path: enginePackageRoot() });
   if (refusal !== null) {
-    say(`\ndiscord-bot cannot start: ${refusal}\n`);
+    say(`\n${BOOT_REFUSAL_PREFIX} ${refusal}\n`);
     return 1;
   }
   // THE ENGINE PIN (RFC-001 5.4): the module repo's package.json must ask for the engine that is
   // installed, because the gate files the digest check compares against are that engine's.
   const pin = checkEnginePin(readRepoManifest(), build.engine);
   if (pin.kind === 'refuse') {
-    say(`\ndiscord-bot cannot start: ${pin.sentence}\n`);
+    say(`\n${BOOT_REFUSAL_PREFIX} ${pin.sentence}\n`);
     return 1;
   }
   if (pin.kind === 'warn') say(`  warning: ${pin.sentence}`);
   // ONE COPY OF ZOD (RFC-001 4.3): `doctor` runs the same check, so the sentence is the same.
   const zodCopies = checkZodSingleCopy(enginePackageRoot());
   if (zodCopies.kind === 'refuse') {
-    say(`\ndiscord-bot cannot start: ${zodCopies.sentence}\n`);
+    say(`\n${BOOT_REFUSAL_PREFIX} ${zodCopies.sentence}\n`);
     return 1;
   }
 
@@ -328,7 +328,7 @@ export async function run(env: Readonly<Record<string, string | undefined>> = pr
   // Registered once, and RE-POINTED at the graceful path once there is something to shut down.
   // Two `process.on` registrations would both fire and race each other to exit.
   let onFatal = (reason: string, cause: unknown): void => {
-    say(`\ndiscord-bot died during boot (${reason}): ${thrownMessage(cause)}`);
+    say(`\n${PRODUCT_NAME} died during boot (${reason}): ${thrownMessage(cause)}`);
     say(thrownStack(cause));
     process.exit(1);
   };
@@ -357,7 +357,7 @@ export async function run(env: Readonly<Record<string, string | undefined>> = pr
     // is usually three lines pasted out of the middle, and the build has to be on one of them
     // or the first question back is always the same one.
     base: {
-      service: 'discord-bot',
+      service: LOG_SERVICE,
       env: cfg.nodeEnv,
       bootId,
       engineVersion: build.engine.version,
@@ -382,7 +382,7 @@ export async function run(env: Readonly<Record<string, string | undefined>> = pr
   });
   // And on stderr too, because the boot log may be JSON going somewhere an operator watching a
   // console restart is not looking.
-  say(`discord-bot: ${describeBuild(build)}`);
+  say(`${PRODUCT_NAME}: ${describeBuild(build)}`);
   if (pin.kind === 'warn') logger.warn('engine pin is not exact', { detail: pin.sentence });
   // Keys that no longer mean anything, said out loud rather than silently ignored.
   for (const warning of removedBuilderKeyWarnings(cfg.modules)) {
@@ -416,7 +416,7 @@ export async function run(env: Readonly<Record<string, string | undefined>> = pr
     ensureCoreSchema(sqlite.connection);
   } catch (cause: unknown) {
     sqlite.close();
-    say(`\ndiscord-bot cannot start: the core schema could not be applied to ${cfg.databasePath}\n  ${thrownMessage(cause)}\n`);
+    say(`\n${BOOT_REFUSAL_PREFIX} the core schema could not be applied to ${cfg.databasePath}\n  ${thrownMessage(cause)}\n`);
     logger.error('core schema failed', { cause: thrownMessage(cause) });
     return 1;
   }
@@ -735,7 +735,7 @@ export async function run(env: Readonly<Record<string, string | undefined>> = pr
     say(
       [
         '',
-        'discord-bot cannot start: a module declares a message hook, but the MessageContent intent is off.',
+        `${BOOT_REFUSAL_PREFIX} a module declares a message hook, but the MessageContent intent is off.`,
         `  ${owners}`,
         '',
         '  A prefix hook reads message content, which is a PRIVILEGED intent. Either:',
@@ -915,7 +915,7 @@ export async function run(env: Readonly<Record<string, string | undefined>> = pr
       stack: thrownStack(cause),
       reason,
     });
-    say(`\ndiscord-bot: ${reason}: ${thrownMessage(cause)}`);
+    say(`\n${PRODUCT_NAME}: ${reason}: ${thrownMessage(cause)}`);
     say(thrownStack(cause));
     void shutdown(reason, 1);
   };

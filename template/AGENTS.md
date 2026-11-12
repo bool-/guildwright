@@ -1,20 +1,24 @@
-# AGENTS.md
+# AGENTS.md - Guildwright
 
 Rules that are **not** inferable from reading the code. Everything else: read
-`node_modules/discord-ai-feature-builder/src/core/module.ts`, run `npm run scaffold`, and read `src/modules/tags/` as the
+`node_modules/guildwright/src/core/module.ts`, run `npm run scaffold`, and read `src/modules/tags/` as the
 worked example.
 
 This repo is extended by AI agents on purpose — that is what the `builder` module does. So the
 contracts are built to make a wrong contribution *fail to compile* rather than fail in production.
 If you are fighting the types, you are almost always doing something the design forbids on purpose.
 
+None of that is a sandbox. A module runs inside the bot's process, so merging a module grants it
+the bot's full authority: its Discord token, its GitHub credentials and its database. The
+contracts make a mistake loud; only a reviewer who reads the pull request stops a hostile one.
+
 ## Start here
 
-This repository holds modules only. The engine is the `discord-ai-feature-builder` package in
+This repository holds modules only. The engine is the `guildwright` package in
 `node_modules`; `#core/*` resolves into it. Do not edit `node_modules`, and do not add
 `#adapters/*` to the imports map.
 
-1. Read exactly two things: `node_modules/discord-ai-feature-builder/src/core/module.ts` and `src/modules/tags/`. That is enough
+1. Read exactly two things: `node_modules/guildwright/src/core/module.ts` and `src/modules/tags/`. That is enough
    to write a module. You do **not** need to read `src/adapters/**` — ever.
 2. **Generate a new module; never hand-create the folder.**
 
@@ -73,7 +77,7 @@ This repository holds modules only. The engine is the `discord-ai-feature-builde
   `constructor(private x: T)` parameter properties, no decorators. `npm run typecheck` catches all
   of them, but the error is easier to read if you know why.
 - **This repo runs its own `.ts` directly and the engine as compiled JavaScript.** `#core/*`
-  resolves through `imports` in `package.json` to `node_modules/discord-ai-feature-builder/dist/core/*.js`
+  resolves through `imports` in `package.json` to `node_modules/guildwright/dist/core/*.js`
   (and its `.d.ts` for types). There is no build step and no `--conditions=source` here: that
   flag would point the installed engine at its shipped `.ts`, which Node refuses to run from
   `node_modules`. Run tests with `npm test`, or a single file with
@@ -162,7 +166,7 @@ Give an entry for each of these your change introduces:
 
 2. **A new Discord bot permission** — a name added to a `needs: [...]` array. It changes the
    permissions integer in the invite URL, so the operator has to **re-invite** the bot. Give the
-   new integer: `npx discord-ai-feature-builder invite-url` prints it - `permissionInteger()` over the
+   new integer: `npx guildwright invite-url` prints it - `permissionInteger()` over the
    union of every `needs:` the installed modules declare.
 
 3. **A new required environment variable** in `EnvSchema` (`src/core/config.ts`), or a new GitHub
@@ -223,7 +227,7 @@ empty commit.
 ## If you are blocked
 
 If you need a new port, a new capability, a new core event, or any change to the engine (anything
-under `node_modules/discord-ai-feature-builder/`), `.github/`, or the dependency list:
+under `node_modules/guildwright/`), `.github/`, or the dependency list:
 
 **Do not work around it.** Do not weaken a type, delete an assertion, loosen a lint rule, or add a
 cast to make the compiler stop complaining. Those guards are the product.

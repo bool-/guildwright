@@ -69,7 +69,7 @@ test('doctor on a fixture with two zod copies fails with the pin sentence', asyn
   const c = captureIo(repo.dir, { ...VALID_ENV, ...NO_MODULES });
   const code = await runCli(['doctor', '--offline'], c.io, { engineRoot: engine.dir });
   assert.equal(code, 1, c.all());
-  assert.match(c.stderr(), /discord-bot cannot start: two copies of zod are installed \(.+ and .+\); pin "zod": "4\.5\.4" in package\.json to match the engine and run npm ci/u);
+  assert.match(c.stderr(), /guildwright cannot start: two copies of zod are installed \(.+ and .+\); pin "zod": "4\.5\.4" in package\.json to match the engine and run npm ci/u);
 });
 
 test('one copy of zod, resolved from both sides, is fine; two different directories refuse', (t) => {
@@ -103,7 +103,7 @@ test('doctor refuses a module repo that pins a different engine than is installe
   writeJson(join(repo.dir, 'package.json'), { name: 'my-bot', dependencies: { [ENGINE_NAME]: '0.9.0' } });
   const c = captureIo(repo.dir, { ...VALID_ENV, ...NO_MODULES });
   assert.equal(await runCli(['doctor', '--offline'], c.io, { engineRoot: engine.dir }), 1);
-  assert.match(c.stderr(), /package\.json asks for discord-ai-feature-builder@0\.9\.0 but 1\.0\.0 is installed\. Run npm ci\./u);
+  assert.match(c.stderr(), /package\.json asks for guildwright@0\.9\.0 but 1\.0\.0 is installed\. Run npm ci\./u);
   // A module repo also needs the built-ins' event declarations in its program.
   assert.match(c.stderr(), /src\/engine\.d\.ts is missing/u);
 });
@@ -192,7 +192,7 @@ test('doctor online: drifted gate files leave builds disabled, naming the fix', 
   gh.push('b'.repeat(40), { [VERIFIER]: 'print("weakened")\n' });
   const { code, c } = await onlineDoctor(gh);
   assert.equal(code, 1);
-  assert.match(c.stderr(), /\.github\/scripts\/verify_approval\.py in o\/r does not match the engine's template \(engine 1\.7\.0\)\. Run npx discord-ai-feature-builder template apply, commit, and restart\./u);
+  assert.match(c.stderr(), /\.github\/scripts\/verify_approval\.py in o\/r does not match the engine's template \(engine 1\.7\.0\)\. Run npx guildwright template apply, commit, and restart\./u);
 });
 
 test('the unanswered-check shapes are the ones the preflight, the probes and the App session write', () => {
