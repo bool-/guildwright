@@ -163,3 +163,7 @@ The engine checkout runs its own source under `--conditions=source`; only the pu
 compiled. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) sections 10 and 11 explain the build step
 and the package boundary, and the template a module repository is made from lives in
 [`template/`](template/).
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).

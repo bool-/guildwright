@@ -494,7 +494,7 @@ test('npm pack ships the whole template, dotfiles included, and no lockfile for 
   assert.ok(!shipped.has('package-lock.json'));
 });
 
-test('npm pack ships exactly the expected file list: dist, core source, the template and five root files', { timeout: 120_000 }, (t) => {
+test('npm pack ships exactly the expected file list: dist, core source, the template and six root files', { timeout: 120_000 }, (t) => {
   // RFC-001 PR 1.8. The package is public from 1.0.0, so a file that lands in the tarball by
   // accident (a fixture, docs/, .github/, an .env.example) is published to everyone, and a file
   // that falls out of it (a template file, a migration) breaks every install. `files` in
@@ -512,6 +512,8 @@ test('npm pack ships exactly the expected file list: dist, core source, the temp
   const expected = [
     'AGENTS.md',
     'CHANGELOG.md',
+    // npm always ships LICENSE, whatever `files` says; it is listed so the tarball's terms are part of the promise.
+    'LICENSE',
     'README.md',
     'package.json',
     'tsconfig.module-repo.json',
@@ -523,6 +525,9 @@ test('npm pack ships exactly the expected file list: dist, core source, the temp
   const unexpected = shipped.filter((p) => !expected.includes(p));
   assert.deepEqual({ missing, unexpected }, { missing: [], unexpected: [] });
   // The shape of what that means, so a reader of a failure knows what was promised.
+  assert.equal(manifest.files.some((f) => f.path === 'LICENSE'), true, 'the license ships with the package');
+  assert.match(readFileSync(join(ROOT, 'LICENSE'), 'utf8'), /^MIT License\n/u, 'and it is the MIT text package.json declares');
+  assert.equal((readJson(join(ROOT, 'package.json')) as { license?: string }).license, 'MIT');
   for (const p of ['dist/cli.js', 'dist/main.js', 'dist/core/module.d.ts', 'dist/engine-events.d.ts', 'src/core/module.ts', 'template/MANIFEST.json']) {
     assert.ok(shipped.includes(p), p);
   }
