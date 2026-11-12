@@ -179,19 +179,28 @@ export function claimEngine(self: EngineClaim, registry: object = globalThis): s
 // Failure text, before a logger exists
 // ---------------------------------------------------------------------------------------
 
+/** The headline of a config refusal at boot, as documented in `docs/SETUP.md` section 6. */
+export const BOOT_CONFIG_HEADLINE = 'The bot is misconfigured.';
+
 /**
  * The message an operator reads when the bot refuses to start.
  *
  * NOT a stack trace, and not a pino line: at this point the logger does not exist yet, and
  * `internal` on a config error is `z.prettifyError` output that already names EVERY missing
  * variable at once - one restart per typo is the failure mode this replaces.
+ *
+ * WHY a config error gets its own headline instead of `userDetail`: a config error's `userDetail`
+ * is `CONFIG_USER_TEXT`, the sentence a DISCORD USER sees ("Tell an admin."). The reader here IS
+ * the admin, so that sentence sends them to themselves. Other kinds keep `userDetail`, which
+ * already states what went wrong in operator terms.
  */
 export function formatConfigFailure(error: AppError): string {
   const where = error.kind === 'config' ? error.location : error.code;
   const detail = error.internal ?? 'no further detail was recorded';
+  const headline = error.kind === 'config' ? BOOT_CONFIG_HEADLINE : error.userDetail;
   return [
     '',
-    `${BOOT_REFUSAL_PREFIX} ${error.userDetail}`,
+    `${BOOT_REFUSAL_PREFIX} ${headline}`,
     `  where: ${where}`,
     '',
     ...detail.split('\n').map((line) => `  ${line}`),

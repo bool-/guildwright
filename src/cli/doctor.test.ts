@@ -121,6 +121,8 @@ test('doctor reports a broken config AND the rest in one pass, and reads ./.env'
   const c = captureIo(repo.dir, { MODULES_BUILTIN: 'false' });
   assert.equal(await runCli(['doctor'], c.io, { engineRoot: engine.dir }), 1);
   const err = c.stderr();
+  assert.match(err, /guildwright cannot start: The bot is misconfigured\.\n/u, 'the operator headline');
+  assert.doesNotMatch(err, /Tell an admin/u, 'not the sentence a Discord user sees');
   assert.match(err, /→ at DISCORD_TOKEN/u, 'every missing variable');
   assert.doesNotMatch(err, /→ at GITHUB_OWNER/u, 'GITHUB_OWNER came from .env');
   assert.match(err, /MODULE_DIRS/u, 'and the discovery failure, in the same run');

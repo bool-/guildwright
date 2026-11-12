@@ -195,12 +195,25 @@ test('docs/SETUP.md walks the App and module-repository setup the RFC describes'
     ['npx guildwright@1.0.0 init . --existing', 'moving an existing install (RFC-001 10 step 4)'],
     ['Secrets: read', 'the PAT cutover needs Secrets: read (RFC-001 10 step 5)'],
     ['0005_repo_key.sql', 'the first engine boot applies a migration, so back up first'],
+    ['src/core src/adapters src/testing src/lib scripts docs test', 'the one delete list (RFC-001 10 step 4 points here)'],
+    ["import { validateView } from '#core/view';", 'module tests that rendered through #adapters/* move to validateView'],
+    ['node_modules/guildwright/template/src/modules/tags/module.test.ts', 'a migrated tags gets its tests back'],
+    ['**Merge** section 9\'s `.dockerignore`', 'the .dockerignore is merged, not replaced'],
+    ['npm install --package-lock-only --ignore-scripts', 'init\'s lockfile step failing before the engine is on the registry'],
+    ['**Merge the pull request before you restart the bot on the engine', 'the gate files disable builds until the switch-over lands'],
+    ['**Contents: read.** Without it the bot starts, but **every build is refused**', 'a PAT without Contents refuses every build'],
     ['`service` field', 'log filters change with the rename'],
   ];
   for (const [needle, why] of needles) assert.ok(setup.includes(needle), `docs/SETUP.md no longer covers ${why} (missing ${JSON.stringify(needle)})`);
   const arch = read('docs/ARCHITECTURE.md');
   assert.match(arch, /^## 10\. The build step/mu, 'ARCHITECTURE.md: the build step');
   assert.match(arch, /^## 11\. The package boundary$/mu, 'ARCHITECTURE.md: the package boundary');
+  // RFC-001 10 step 4 keeps no second delete list, and does not claim the agent workflow survives
+  // the switch-over byte for byte (its prompt changed in PR 1.8).
+  const rfc = read('docs/RFC-001-public-core-private-modules.md');
+  const step4 = rfc.slice(rfc.indexOf('\n4. In the current private repo'), rfc.indexOf('\n5. `.env`'));
+  assert.ok(step4.includes('`docs/SETUP.md` section 11 step 1'), 'RFC-001 10 step 4 points at the SETUP delete list');
+  assert.doesNotMatch(step4, /`agent-implement-request\.yml`, `verify_approval\.py` and `agent-settings\.json` are byte-identical/u);
 });
 
 test('CHANGELOG.md opens with the version package.json carries, and records the contract breaks', () => {
