@@ -1,6 +1,6 @@
 {
   "name": "guildwright",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "type": "module",
   "license": "MIT",
   "description": "The engine for a modular Discord bot whose flagship module turns /request into a GitHub issue, gates it behind human approval, and has Claude Code implement it as a pull request into your own private module repository.",
