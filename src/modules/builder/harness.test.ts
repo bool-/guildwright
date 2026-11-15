@@ -591,7 +591,7 @@ export function url(raw: string) {
  * untested code that first executes the day something upstream regresses.
  */
 export function prRef(isDraft: boolean | null): PrRef {
-  const full: PrRef = { number: 7, url: url(PR_URL), branch: 'agent/req-x', isDraft: isDraft === true };
+  const full: PrRef = { number: 7, url: url(PR_URL), branch: 'agent/req-x', isDraft: isDraft === true, isOpen: true };
   if (isDraft !== null) return full;
   // Strip the field the way an adapter that predates the widening would never have set it. The
   // cast IS the point: it is the only way to produce the shape the tolerant branch defends.

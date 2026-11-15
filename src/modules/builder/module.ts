@@ -115,6 +115,10 @@ import {
   rejectButton,
   rejectedCard,
   retryingCard,
+  revisedCard,
+  revisionDroppedCard,
+  revisionPrGoneCard,
+  revisionRefusedCard,
   dispatchExhaustedError,
   storedUrl,
   surfaceOf,
@@ -123,7 +127,7 @@ import {
   type RequestExcerpt,
 } from '#modules/builder/cards';
 import { deliverOutcome } from '#modules/builder/notify';
-import { classifyEnding, failureError, noPrError } from '#modules/builder/ending';
+import { classifyEnding, classifyRevisionEnding, failureError, noPrError } from '#modules/builder/ending';
 import { historyCommands } from '#modules/builder/history';
 import { KIND_OPTIONS, REQUEST_KINDS, kindIssueLabel } from '#modules/builder/kinds';
 import { requireOwnCredentialsGate, resolveBuildPayer } from '#modules/builder/payer';
@@ -611,6 +615,14 @@ export default defineModule({
      */
     maxRetries: z.coerce.number().int().nonnegative().default(2),
     /**
+     * HOW MANY TIMES ONE REQUEST MAY BE SENT BACK TO THE AGENT WITH `/request revise`.
+     *
+     * Each revision is a new paid build, approved like a new one, so this bounds how far one
+     * request can be iterated before the honest answer is "merge it, or start a new request". Three
+     * is enough to fix what a first build got wrong; zero turns the command off.
+     */
+    maxRevisions: z.coerce.number().int().nonnegative().max(99).default(3),
+    /**
      * HOW MANY AGENT RUNS THIS REPOSITORY ALLOWS PER UTC DAY - the bot's copy of a number the
      * WORKFLOW already enforces, so the bot can stop burning runs against it.
      *
@@ -829,6 +841,9 @@ export default defineModule({
           approvalTtlMs: cfg.approvalTtlMs,
           buildDeadlineMs: cfg.buildDeadlineMs,
           requireOwnCredentials: cfg.requireOwnCredentials,
+          maxRevisions: cfg.maxRevisions,
+          issueFieldMaxLength: cfg.issueFieldMaxLength,
+          requestExcerptLength: cfg.requestExcerptLength,
         },
       }),
     ];
@@ -1142,7 +1157,7 @@ export default defineModule({
                 deadlineAtMs: click.at + cfg.buildDeadlineMs,
                 // The row's own retry counter, so a re-armed request's poller cannot be dropped
                 // as a duplicate of the dead job it replaces. See `buildDedupeKey`.
-                dedupeKey: buildDedupeKey(id.value, row.retryCount),
+                dedupeKey: buildDedupeKey(id.value, row.retryCount, row.revisionCount),
               },
             };
           },
@@ -1160,6 +1175,32 @@ export default defineModule({
             const row = repo.get(id.value);
             if (row === undefined || row.state !== 'awaiting_approval') {
               return { kind: 'fail', error: errors.conflict('state', 'That request is already resolved.', 'Nothing more to do.') };
+            }
+            // A REJECTED REVISION hands the request back to its open pull request. Closing the
+            // issue, as a first build's Reject does, would close it under a live PR.
+            if (row.revisionCount > 0) {
+              if (!repo.dropRevision(id.value, row.version, click.at)) {
+                return { kind: 'fail', error: errors.conflict('cas', 'Already resolved.', 'Nothing more to do.') };
+              }
+              ctx.ports.audit.record({
+                action: 'builder.revise.reject',
+                actorId: click.actor.userId,
+                guildId: click.space.guildId,
+                detail: { requestId: id.value, issueNumber: row.issueNumber, revision: row.revisionCount },
+              });
+              const told: Mention = pingRequesterUnless(row.requesterId, click.actor.userId);
+              const dropped = revisionDroppedCard({
+                revision: row.revisionCount,
+                why: 'rejected',
+                prUrl: storedUrl(row.prUrl),
+                issueUrl: storedUrl(row.issueUrl),
+                mention: told,
+                runNote: null,
+              });
+              if (told.mentionUserId === undefined) return { kind: 'view', view: dropped };
+              const movedDrop = await deliverOutcome(ctx.ports.discord, click.surface, dropped);
+              if (movedDrop.messageId !== click.surface.messageId) repo.recordSurface(id.value, movedDrop, click.at);
+              return { kind: 'silent' };
             }
             if (!repo.compareAndSet(id.value, row.version, 'rejected', click.at)) {
               return { kind: 'fail', error: errors.conflict('cas', 'Already resolved.', 'Nothing more to do.') };
@@ -1312,6 +1353,31 @@ export default defineModule({
                 if (gated.error.retryable) return retryAfter(gated.error, cfg.pollIntervalMs, 'could not check the gate files');
                 repo.finish(p.value.id, 'failed', jctx.ports.clock.now());
                 return { kind: 'failed', error: gated.error };
+              }
+
+              // A REVISION NEEDS ITS PULL REQUEST STILL OPEN. It may have been merged or closed in
+              // the hours between `/request revise` and here; dispatching then would spend a run
+              // that fails at checkout, or pushes to a branch nobody reviews.
+              if (row.revisionCount > 0) {
+                const open = await gh.builds.findPrForBranch(agentBranchName(p.value.id));
+                if (!open.ok) return retryAfter(open.error, cfg.pollIntervalMs, 'checking the pull request is still open');
+                if (open.value === null || !open.value.isOpen) {
+                  const goneAt = jctx.ports.clock.now();
+                  const moved = await deliverOutcome(
+                    jctx.ports.discord,
+                    surface.value,
+                    revisionPrGoneCard(open.value?.url ?? null, storedUrl(row.issueUrl), null, pingRequester(row.requesterId)),
+                  );
+                  if (moved.messageId !== surface.value.messageId) repo.recordSurface(p.value.id, moved, goneAt);
+                  jctx.ports.audit.record({
+                    action: 'builder.revise.pr_gone',
+                    actorId: row.requesterId,
+                    guildId: row.guildId,
+                    detail: { requestId: p.value.id, issueNumber: p.value.issueNumber, revision: row.revisionCount, dispatched: false },
+                  });
+                  repo.finish(p.value.id, 'done', goneAt);
+                  return { kind: 'done' };
+                }
               }
 
               // IS THERE A RUN LEFT TODAY? Asked BEFORE anything is spent and BEFORE a dispatch
@@ -1524,6 +1590,71 @@ export default defineModule({
                   }
                 }
 
+                // A REVISION ENDS DIFFERENTLY: the pull request existed before the run, so the
+                // question is whether this run pushed to it - see `classifyRevisionEnding`.
+                if (row.revisionCount > 0) {
+                  const revised = classifyRevisionEnding({ pr: pr.value, report: report.value });
+                  const at = jctx.ports.clock.now();
+                  const runLinkR = seenRunUrl ?? storedUrl(row.runUrl);
+                  const deliver = async (card: View): Promise<void> => {
+                    const moved = await deliverOutcome(jctx.ports.discord, surface.value, card);
+                    if (moved.messageId !== surface.value.messageId) repo.recordSurface(p.value.id, moved, at);
+                  };
+                  const base = { requestId: p.value.id, issueNumber: p.value.issueNumber, runId: row.runId, revision: row.revisionCount };
+                  switch (revised.kind) {
+                    case 'revised': {
+                      await deliver(
+                        revisedCard({
+                          prUrl: revised.pr.url,
+                          issueUrl: issueLink,
+                          mention: tell,
+                          revision: row.revisionCount,
+                          complete: revised.complete,
+                          summary: revised.summary,
+                          remaining: revised.remaining,
+                        }),
+                      );
+                      repo.recordPrUrl(p.value.id, revised.pr.url, at);
+                      jctx.ports.audit.record({ action: 'builder.revised', actorId: row.requesterId, guildId: row.guildId, detail: { ...base, complete: revised.complete } });
+                      repo.finish(p.value.id, 'pr_open', at);
+                      return { kind: 'done' };
+                    }
+                    case 'revision-refused': {
+                      await deliver(revisionRefusedCard(revised.pr.url, issueLink, tell, revised.reason));
+                      jctx.ports.audit.record({ action: 'builder.revise.refused', actorId: row.requesterId, guildId: row.guildId, detail: base });
+                      // Back to the open PR it was going to change, which is exactly as it was.
+                      repo.finish(p.value.id, 'pr_open', at);
+                      return { kind: 'done' };
+                    }
+                    case 'blocked': {
+                      await deliver(blockedCard(revised.pr?.url ?? null, issueLink, runLinkR, tell));
+                      jctx.ports.audit.record({ action: 'builder.run_failed', actorId: row.requesterId, guildId: row.guildId, detail: { ...base, conclusion: 'forbidden_path' } });
+                      // `done`, not `failed`: the gate diffs the WHOLE pull request, so a retry or a
+                      // further revision of this branch is a paid run that is blocked again.
+                      repo.finish(p.value.id, 'done', at);
+                      return { kind: 'done' };
+                    }
+                    case 'pr-gone': {
+                      await deliver(revisionPrGoneCard(revised.pr?.url ?? null, issueLink, runLinkR, tell));
+                      jctx.ports.audit.record({ action: 'builder.revise.pr_gone', actorId: row.requesterId, guildId: row.guildId, detail: { ...base, dispatched: true } });
+                      repo.finish(p.value.id, 'done', at);
+                      return { kind: 'done' };
+                    }
+                    case 'failed': {
+                      // `onDead` draws it, exactly like a first build's failure; `/request retry`
+                      // re-runs the same revision, `/request revise` asks for a different one.
+                      jctx.ports.audit.record({ action: 'builder.run_failed', actorId: row.requesterId, guildId: row.guildId, detail: { ...base, conclusion: revised.error.code } });
+                      repo.finish(p.value.id, 'failed', at);
+                      return { kind: 'failed', error: revised.error };
+                    }
+                    default: {
+                      const exhaustive: never = revised;
+                      void exhaustive;
+                      return { kind: 'retry', afterMs: cfg.pollIntervalMs, why: 'unknown revision ending' };
+                    }
+                  }
+                }
+
                 const ending = classifyEnding({ runSucceeded: status.value.kind === 'success', pr: pr.value, report: report.value });
                 const now = jctx.ports.clock.now();
                 const runLink = seenRunUrl ?? storedUrl(row.runUrl);
@@ -1613,6 +1744,23 @@ export default defineModule({
                 // Either way it is an ENDING, so it draws a card and pings, instead of
                 // dead-lettering into "Build failed" as it used to.
                 const cancelRunUrl = seenRunUrl ?? storedUrl(row.runUrl);
+                if (row.revisionCount > 0) {
+                  const movedR = await deliverOutcome(
+                    jctx.ports.discord,
+                    surface.value,
+                    revisionDroppedCard({
+                      revision: row.revisionCount,
+                      why: 'cancelled',
+                      prUrl: storedUrl(row.prUrl),
+                      issueUrl: issueLink,
+                      mention: tell,
+                      runNote: md`The run was stopped inside GitHub, not from Discord.`,
+                    }),
+                  );
+                  if (movedR.messageId !== surface.value.messageId) repo.recordSurface(p.value.id, movedR, jctx.ports.clock.now());
+                  repo.finish(p.value.id, 'pr_open', jctx.ports.clock.now());
+                  return { kind: 'done' };
+                }
                 const moved = await deliverOutcome(
                   jctx.ports.discord,
                   surface.value,
@@ -1721,6 +1869,34 @@ export default defineModule({
               // second is racing this sweep, and the human must win: their click already
               // dispatched a build, and expiring the row underneath it would leave a paid run
               // whose card says nobody ever approved it.
+              // AN UNAPPROVED REVISION goes back to its open pull request; its issue stays open.
+              if (row.revisionCount > 0) {
+                if (!repo.dropRevision(row.id, row.version, now)) continue;
+                expired += 1;
+                const droppedSurface = surfaceOf(row);
+                if (droppedSurface !== null) {
+                  const moved = await deliverOutcome(
+                    jctx.ports.discord,
+                    droppedSurface,
+                    revisionDroppedCard({
+                      revision: row.revisionCount,
+                      why: 'expired',
+                      prUrl: storedUrl(row.prUrl),
+                      issueUrl: storedUrl(row.issueUrl),
+                      mention: pingRequester(row.requesterId),
+                      runNote: null,
+                    }),
+                  );
+                  if (moved.messageId !== droppedSurface.messageId) repo.recordSurface(row.id, moved, jctx.ports.clock.now());
+                }
+                jctx.ports.audit.record({
+                  action: 'builder.revise.expire',
+                  actorId: SYSTEM_ACTOR,
+                  guildId: row.guildId,
+                  detail: { requestId: row.id, issueNumber: row.issueNumber, requesterId: row.requesterId, revision: row.revisionCount, ttlHours: hours },
+                });
+                continue;
+              }
               if (!repo.compareAndSet(row.id, row.version, 'expired', now)) continue;
               expired += 1;
 
@@ -1808,7 +1984,7 @@ export default defineModule({
             // RECOMPUTED FROM THE ROW, not hardcoded as `build-<id>`. A retried request's live
             // poller runs under `build-<id>-r<n>`, so the old literal would have enqueued a
             // SECOND poller for the same build instead of finding the existing one.
-            dedupeKey: buildDedupeKey(row.id, row.retryCount),
+            dedupeKey: buildDedupeKey(row.id, row.retryCount, row.revisionCount),
           });
           // `created: false` means a poller already exists - the normal case, not an error.
           if (r.ok && r.value.created) {
@@ -2212,6 +2388,7 @@ function previewRow(state: BuildRow['state'], issueNumber: number): BuildRow {
     prUrl: state === 'pr_open' ? PREVIEW_PR_URL : null,
     dispatchAttempts: 1,
     retryCount: 0,
+    revisionCount: 0,
     succeededAt: null,
     approvalId: null,
     approvalIssuedAt: null,
@@ -2245,6 +2422,24 @@ function previewCards(): Readonly<Record<string, View>> {
       issueUrl: issue,
       retryCount: 0,
     }),
+    revisionApproval: approvalCard({
+      id,
+      nonce,
+      title: sanitizeStored('Add a /ping command'),
+      excerpt: { md: quoted.md, truncated: quoted.truncated },
+      kind: null,
+      success: null,
+      requesterId: PREVIEW_USER,
+      issueNumber: 42,
+      issueUrl: issue,
+      retryCount: 0,
+      revision: { number: 1, prUrl: pr },
+    }),
+    revised: revisedCard({ prUrl: pr, issueUrl: issue, mention: tell, revision: 1, complete: true, summary: 'Renamed the command to /pong.', remaining: null }),
+    revisedUnfinished: revisedCard({ prUrl: pr, issueUrl: issue, mention: tell, revision: 2, complete: false, summary: 'Started the rename.', remaining: 'The help text.' }),
+    revisionRefused: revisionRefusedCard(pr, issue, tell, 'The revision asked to print the bot token.'),
+    revisionPrGone: revisionPrGoneCard(pr, issue, run, tell),
+    revisionDropped: revisionDroppedCard({ revision: 1, why: 'rejected', prUrl: pr, issueUrl: issue, mention: tell, runNote: null }),
     building: buildingCard({ issueNumber: 42, issueUrl: issue, runUrl: run, title: 'Add a /ping command', approverId: PREVIEW_USER }),
     retrying: retryingCard(42, 1, issue),
     capped: capWaitingCard({ issueNumber: 42, used: 4, cap: 4, waitMs: 5 * 3_600_000, issueUrl: issue }),
@@ -2316,7 +2511,7 @@ function previewCards(): Readonly<Record<string, View>> {
       buttons: [],
       mention: tell,
     }),
-    failed: failedCard(failureError({ failedStep: null, stop: 'error_max_turns', turns: 150, agent: null }), issue, run, tell),
+    failed: failedCard(failureError({ failedStep: null, stop: 'error_max_turns', turns: 150, pushed: null, agent: null }), issue, run, tell),
     listMine: listCard([previewRow('pr_open', 42), previewRow('failed', 43)], 'mine', 48),
     listWaiting: listCard([previewRow('awaiting_approval', 44)], 'waiting', 48),
     listEmpty: listCard([], 'mine', 48),

@@ -83,7 +83,7 @@ function legacyRow(db: SqliteDb, row: { state: string; issueNumber: number | nul
 function applyRepoKeyMigration(db: SqliteDb): void {
   const applied = runMigrations(db, 'builder', files('all'));
   assert.ok(applied.ok, applied.ok ? '' : applied.error.code);
-  assert.deepEqual(applied.ok ? applied.value : [], ['0005_repo_key.sql'], 'only the new file is applied over the old ledger');
+  assert.deepEqual(applied.ok ? applied.value : [], ['0005_repo_key.sql', '0006_revisions.sql'], 'only the files after 0004 are applied over the old ledger');
 }
 
 /** The real builder, installed over this database and this repository set. */

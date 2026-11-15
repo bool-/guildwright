@@ -6,6 +6,34 @@ inputs, the approval MAC, or any file under `template/` is a **major** version a
 `BREAKING:`. New optional behaviour is a minor version. To upgrade a module repository, see
 `docs/SETUP.md` section 10.
 
+## Unreleased (2.0.0)
+
+### `/request revise`: iterate on an open pull request from Discord
+
+- **`/request revise id:<id> feedback:<text>`** sends feedback on the pull request a request opened
+  back to the agent. The feedback is appended to the issue body as a fenced `## Revision <k>`
+  section (`buildRevisionSection`, same nonce as the issue), goes back to `awaiting_approval` on a
+  new card, and once approved the workflow checks out the existing `agent/req-<id>` branch and
+  pushes to the open pull request instead of opening another. Requester only; bounded by
+  `modules.builder.maxRevisions` (default 3); every cap and the credential gate apply. A
+  rejected, expired or cancelled revision returns the request to `pr_open` and never closes the
+  issue. A revision whose pull request closed meanwhile is dropped before dispatch.
+- **The mode is bound by the approval MAC, not a dispatch input.** The workflow reads it from the
+  `<!-- build-revision v1 nonce=<nonce> revision=<k> -->` marker in the MAC-bound body; the
+  approval tuple (`v2`) and `verify_approval.py` are unchanged. The stray-nonce check admits
+  exactly that one extra line shape.
+- **The run report gains `pushed`** (did the branch head move during the run), computed by the
+  workflow from two SHAs it read itself. A revision's ending is judged on it.
+- Builder migration `0006_revisions.sql` (`revision_count`).
+- BREAKING: `IssuesPort.appendRevision`, `PrRef.isOpen` and `RunReport.pushed` are new required
+  members, so any other implementation of those ports must add them.
+- BREAKING: `template/.github/workflows/agent-implement-request.yml` changed (a new
+  `Read the approved request` step; the nonce checks moved there from the compose step). A module
+  repository must run `guildwright template apply` after upgrading, or the per-dispatch gate check
+  refuses builds as drifted. That check compares the repository's gate files with the engine's
+  own copies in both directions, so the engine and the module repository's `.github/` are
+  upgraded together.
+
 ## 1.0.0
 
 The first published version. Before it, the engine, the product modules and one operator's

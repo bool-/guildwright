@@ -28,7 +28,7 @@ import { Err, Ok } from '#core/result';
 import type { AppError } from '#core/errors';
 import { errors } from '#core/errors';
 import type { JsonObject } from '#core/json';
-import type { ActionsToken, HttpsUrl, IssueBody, PlainName, SafeMarkdown } from '#core/text';
+import type { ActionsToken, HttpsUrl, IssueBody, PlainName, RevisionSection, SafeMarkdown } from '#core/text';
 import type { ChannelId, GuildId, JobId, MessageId, RoleId, UserId } from '#core/ids';
 import type { SurfaceRef, View } from '#core/view';
 import type { DiscordPermission } from '#core/permissions';
@@ -292,6 +292,18 @@ export interface IssuesPort {
    * should be rendering.
    */
   reopen(issueNumber: number): Promise<Result<void, AppError>>;
+
+  /**
+   * Append one `/request revise` section to the end of an issue body.
+   *
+   * WHY THE BODY AND NOT A COMMENT: the approval MAC binds the body's SHA-256, so the revision
+   * the approver approves is the revision the workflow verifies. See `buildRevisionSection`.
+   *
+   * The adapter reads the body, refuses one that does not carry this section's nonce in its
+   * `build-request` marker (a section fenced with a nonce the issue does not use would be
+   * refused by the workflow anyway, after an approval click), and writes body + section back.
+   */
+  appendRevision(issueNumber: number, section: RevisionSection): Promise<Result<void, AppError>>;
 }
 
 /**
@@ -491,6 +503,14 @@ export interface RunReport {
   /** Claude Code's result subtype (`success`, `error_max_turns`, ...), or null if it never ran. */
   readonly stop: string | null;
   readonly turns: number | null;
+  /**
+   * Whether the run left the working branch at a new commit, computed by the workflow from the
+   * branch head before and after the agent. Null from a workflow that predates the field.
+   *
+   * It is what a REVISION's ending turns on: the pull request already exists, so "there is a PR"
+   * says nothing about whether this run changed it.
+   */
+  readonly pushed: boolean | null;
   /** The agent's own closing report, or null when it ended without one (turn limit, crash). */
   readonly agent: {
     readonly status: 'done' | 'partial' | 'refused';
@@ -505,6 +525,12 @@ export interface PrRef {
   readonly branch: string;
   /** True when the agent opened the PR with `--draft`, i.e. it did not finish the work. */
   readonly isDraft: boolean;
+  /**
+   * False once the pull request is closed or merged. Required for the reason `isDraft` is: a
+   * revision may only be built into a pull request that is still open, and an adapter that
+   * forgot the field would let `/request revise` push commits at a merged branch.
+   */
+  readonly isOpen: boolean;
 }
 
 /**

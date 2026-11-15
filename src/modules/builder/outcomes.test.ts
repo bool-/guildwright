@@ -168,7 +168,7 @@ test('ONE MESSAGE PER ENDING: the final card is posted, the stale card deleted, 
 
 test('the agent summary from the run report rides on the ready card', async () => {
   const h = succeededWith(prRef(false));
-  h.builds.report = { failedStep: null, stop: 'success', turns: 40, agent: { status: 'done', summary: 'Added /remind.', remaining: '' } };
+  h.builds.report = { failedStep: null, stop: 'success', turns: 40, pushed: null, agent: { status: 'done', summary: 'Added /remind.', remaining: '' } };
   try {
     const id = seedRunning(h.repo, 42, 77);
     assertDone(await h.build.run(payloadFor(id, 42), runtime()));
@@ -229,7 +229,7 @@ test('a RED run that opened a PR before hitting the turn limit reports the PR, n
       findPrForBranch: () => Promise.resolve(Ok(prRef(false))),
     },
   );
-  h.builds.report = { failedStep: 'agent', stop: 'error_max_turns', turns: 150, agent: null };
+  h.builds.report = { failedStep: 'agent', stop: 'error_max_turns', turns: 150, pushed: null, agent: null };
   try {
     const id = seedRunning(h.repo, 42, 77);
     assertDone(await h.build.run(payloadFor(id, 42), runtime()));
@@ -244,7 +244,7 @@ test('a RED run that opened a PR before hitting the turn limit reports the PR, n
 
 test('a PR that touched a forbidden path is BLOCKED - never reported as ready', async () => {
   const h = succeededWith(prRef(false));
-  h.builds.report = { failedStep: 'forbidden_path', stop: 'success', turns: 30, agent: { status: 'done', summary: 'Done.', remaining: '' } };
+  h.builds.report = { failedStep: 'forbidden_path', stop: 'success', turns: 30, pushed: null, agent: { status: 'done', summary: 'Done.', remaining: '' } };
   try {
     const id = seedRunning(h.repo, 42, 77);
     assertDone(await h.build.run(payloadFor(id, 42), runtime()));
@@ -314,6 +314,7 @@ test('a refusal is what the AGENT says it is, and its reason is on the card', as
     failedStep: null,
     stop: 'success',
     turns: 4,
+    pushed: null,
     agent: { status: 'refused', summary: 'Made no changes.', remaining: 'The request asked to print the bot token.' },
   };
   try {

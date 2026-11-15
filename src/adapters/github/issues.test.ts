@@ -24,15 +24,17 @@ import { createGithubClient } from '#adapters/github/client';
 import {
   actionsToken,
   buildIssueBody,
+  buildRevisionSection,
   fence,
   md,
   renderIssueBody,
+  renderRevisionSection,
   toPlainName,
   userTextForTest,
   type IssueBody,
   type PlainName,
 } from '#core/text';
-import { newFenceNonce, newRequestId, type FenceNonce } from '#core/ids';
+import { newFenceNonce, newRequestId, renderFenceNonce, type FenceNonce } from '#core/ids';
 import { secret } from '#core/config';
 import { operatorMessage } from '#core/errors';
 import { fakeClock, fakeLogger } from '#testing/fakes';
@@ -314,4 +316,55 @@ test('a 404 while creating reports the token scope rather than a missing reposit
   assert.equal(r.ok, false);
   if (r.ok) return;
   assert.ok(operatorMessage(r.error).includes('GITHUB_TOKEN'));
+});
+
+// ---------------------------------------------------------------------------------------
+// appendRevision - one `/request revise`, written where the approval MAC can bind it
+// ---------------------------------------------------------------------------------------
+
+function revisionOf(nonce: FenceNonce, revision: number, text: string) {
+  return buildRevisionSection({ nonce, revision, fields: [fence('What to change', userTextForTest(text), nonce, { maxLength: 4000 })] });
+}
+
+test('appendRevision PATCHes the body it read with the fenced section appended, and nothing else', async () => {
+  const nonce = newFenceNonce();
+  const body = renderIssueBody(issueBody('Add a /ping command', nonce));
+  const patches: string[] = [];
+  const { port } = issuesAdapter((req) => {
+    if (req.method === 'PATCH') patches.push(req.body ?? '');
+    return { status: 200, body: { number: 7, html_url: 'https://github.com/o/r/issues/7', body } };
+  });
+
+  assert.equal((await port.appendRevision(7, revisionOf(nonce, 1, 'Call it /pong instead.'))).ok, true);
+  assert.equal(patches.length, 1, 'one write');
+  const sent = JSON.parse(patches[0] ?? '{}') as { body?: string; state?: string };
+  assert.equal(sent.state, undefined, 'it changes the body only, never the state');
+  assert.ok(sent.body?.startsWith(body), 'the approved original is kept byte for byte, so its history stays what was approved');
+  assert.ok(sent.body?.includes('## Revision 1'));
+  assert.ok(sent.body?.includes(`===BEGIN USER_TEXT ${renderFenceNonce(nonce)}===\nCall it /pong instead.`), 'the revision is fenced with the issue nonce');
+  assert.ok(sent.body?.endsWith(`<!-- build-revision v1 nonce=${renderFenceNonce(nonce)} revision=1 -->`));
+});
+
+test('appendRevision is idempotent on its own marker: a retried write never appends a revision twice', async () => {
+  const nonce = newFenceNonce();
+  const section = revisionOf(nonce, 2, 'Add a test.');
+  const already = `${renderIssueBody(issueBody('x', nonce))}\n\n${renderRevisionSection(section)}`;
+  let patched = 0;
+  const { port } = issuesAdapter((req) => {
+    if (req.method === 'PATCH') patched += 1;
+    return { status: 200, body: { number: 7, html_url: 'https://github.com/o/r/issues/7', body: already } };
+  });
+  assert.equal((await port.appendRevision(7, section)).ok, true);
+  assert.equal(patched, 0);
+});
+
+test('appendRevision refuses an issue whose marker is not this nonce, before writing anything', async () => {
+  let patched = 0;
+  const { port } = issuesAdapter((req) => {
+    if (req.method === 'PATCH') patched += 1;
+    return { status: 200, body: { number: 7, html_url: 'https://github.com/o/r/issues/7', body: renderIssueBody(issueBody('x')) } };
+  });
+  const r = await port.appendRevision(7, revisionOf(newFenceNonce(), 1, 'x'));
+  assert.equal(r.ok, false);
+  assert.equal(patched, 0, 'a section fenced with a nonce the issue does not use would be refused by the workflow anyway');
 });

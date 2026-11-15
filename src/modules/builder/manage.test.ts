@@ -698,14 +698,14 @@ test('autocomplete offers only what the command can actually act on', async () =
 // The shape of the command tree, which Discord itself constrains
 // ---------------------------------------------------------------------------------------
 
-test('`request` is a container with four subcommands, because Discord forbids the mixed shape', () => {
+test('`request` is a container with five subcommands, because Discord forbids the mixed shape', () => {
   // `buildCommandPayloads` refuses a name that is declared both as a leaf and as a subcommand
   // group, so `/request` (the modal) could not survive alongside `/request list`. This is not a
   // preference; it is the only expressible arrangement, and it is why the flagship verb moved.
   const h = harness();
   try {
     const names = h.installed.commands.map((c: CommandSpec) => c.name).sort();
-    assert.deepEqual(names, ['request cancel', 'request list', 'request new', 'request retry']);
+    assert.deepEqual(names, ['request cancel', 'request list', 'request new', 'request retry', 'request revise']);
     assert.ok(!names.includes('request'), 'a leaf `request` here would fail the command deploy outright');
   } finally {
     h.close();

@@ -58,6 +58,7 @@ only an approver can start a run and merge the code.
 | `/request list` shows what you asked for and where each one got to | bot |
 | `/request cancel` withdraws a request **and asks GitHub to stop the run**, so a build you no longer want stops spending your credits rather than only stopping being watched | bot → Actions |
 | `/request retry` re-arms a failed or expired request, **reopening its issue** so an approver is never asked to fund one GitHub still shows as "not planned" | bot → GitHub |
+| `/request revise` sends feedback on an open pull request back to the agent: the revision is written into the issue, approved like a new build, and **pushed to the same PR** | bot → GitHub → Actions |
 | A request nobody approves expires after 48h: issue closed, card resolved, slot freed | bot |
 
 The bot exposes **no inbound HTTP** — no webhook server, no tunnel, no TLS certificate. It learns

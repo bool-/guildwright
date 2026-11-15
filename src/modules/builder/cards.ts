@@ -164,20 +164,31 @@ export function approvalCard(input: {
   readonly issueNumber: number;
   readonly issueUrl: HttpsUrl | null;
   readonly retryCount: number;
+  /** Present when this approval is for a `/request revise` of an open pull request. */
+  readonly revision?: { readonly number: number; readonly prUrl: HttpsUrl | null };
 }): View {
+  const revision = input.revision;
   return {
     accent: 'pending',
     nodes: [
-      { kind: 'heading', text: 'Build request', icon: 'build' },
+      { kind: 'heading', text: revision === undefined ? 'Build request' : `Revision ${String(revision.number)} of a build`, icon: 'build' },
       { kind: 'field', name: 'Request', md: input.title },
       ...(input.kind === null ? [] : [{ kind: 'field' as const, name: 'Kind', md: sanitizeStored(kindLabel(input.kind)) }]),
-      ...excerptNode(input.excerpt),
+      ...(revision === undefined ? excerptNode(input.excerpt) : revisionExcerptNode(input.excerpt)),
       ...(input.success === null ? [] : [{ kind: 'field' as const, name: 'How we will know it worked', md: input.success }]),
       // A recorded snowflake, so a real mention: it renders as the name, and the renderer's
       // `allowed_mentions: { parse: [] }` means it can never ping.
       { kind: 'field', name: 'Asked by', md: mdMention('user', input.requesterId) },
       { kind: 'field', name: 'Issue', md: issueRef(input.issueNumber, input.issueUrl) },
-      ...(input.retryCount === 0
+      ...(revision === undefined
+        ? []
+        : [
+            {
+              kind: 'text' as const,
+              md: md`This asks the agent to change the pull request it already opened. It is a new build on the requester's credentials, and the revision is written into the GitHub issue as its own section.`,
+            },
+          ]),
+      ...(revision !== undefined || input.retryCount === 0
         ? []
         : [
             {
@@ -188,7 +199,7 @@ export function approvalCard(input: {
       { kind: 'text', md: md`An approver must approve this before anything is built.` },
       {
         kind: 'buttons',
-        links: linkTo('Issue', input.issueUrl),
+        links: [...(revision === undefined ? [] : linkTo('Pull request', revision.prUrl)), ...linkTo('Issue', input.issueUrl)],
         buttons: [approveButton(input.id, input.nonce, false), rejectButton(input.id, input.nonce, false)],
       },
     ],
@@ -202,6 +213,12 @@ export function approvalCard(input: {
 export function issueRef(issueNumber: number, issueUrl: HttpsUrl | null): SafeMarkdown {
   const label = `#${String(issueNumber)}`;
   return issueUrl === null ? mdInlineCode(label) : mdLink(label, issueUrl);
+}
+
+/** The revision's own words, labelled as the change asked for rather than as the original idea. */
+function revisionExcerptNode(excerpt: RequestExcerpt | null): readonly ViewNode[] {
+  if (excerpt === null) return [];
+  return [{ kind: 'field', name: excerpt.truncated ? 'What to change (shortened)' : 'What to change', md: excerpt.md }];
 }
 
 /** WHY a helper: the "cut off" sentence must appear wherever an excerpt does, or nowhere. */
@@ -323,7 +340,109 @@ export function openedCard(prUrl: HttpsUrl, issueUrl: HttpsUrl | null, mention: 
       // strips - the address itself must survive that.
       { kind: 'text', md: sanitizeStored(prUrl) },
       { kind: 'text', md: OPERATOR_NUDGE },
+      { kind: 'text', md: REVISE_NUDGE },
       { kind: 'buttons', links: [...linkTo('Pull request', prUrl), ...linkTo('Issue', issueUrl)], buttons: [] },
+    ],
+  };
+}
+
+/** How to ask for changes to a pull request the agent opened, said on every card that shows one. */
+const REVISE_NUDGE = md`Not quite right? ${mdInlineCode('/request revise')} asks the agent to change this pull request.`;
+
+/**
+ * A REVISION LANDED: new commits are on the pull request. `complete` is false when the agent
+ * says it is not finished, which gets the same warning a draft pull request does.
+ */
+export function revisedCard(input: {
+  readonly prUrl: HttpsUrl;
+  readonly issueUrl: HttpsUrl | null;
+  readonly mention: Mention;
+  readonly revision: number;
+  readonly complete: boolean;
+  readonly summary: string | null;
+  readonly remaining: string | null;
+}): View {
+  return {
+    ...input.mention,
+    accent: input.complete ? 'ok' : 'warn',
+    nodes: [
+      {
+        kind: 'heading',
+        text: input.complete ? `Pull request updated - revision ${String(input.revision)}` : `Pull request updated - revision ${String(input.revision)} unfinished`,
+        icon: input.complete ? 'ok' : 'warn',
+      },
+      ...(input.summary === null ? [] : [{ kind: 'field' as const, name: 'What changed', md: sanitizeStored(input.summary) }]),
+      ...(input.remaining === null ? [] : [{ kind: 'field' as const, name: 'Left to do', md: sanitizeStored(input.remaining) }]),
+      { kind: 'text', md: sanitizeStored(input.prUrl) },
+      { kind: 'text', md: input.complete ? OPERATOR_NUDGE : md`The agent says this revision is not finished. Review it before merging.` },
+      { kind: 'text', md: REVISE_NUDGE },
+      { kind: 'buttons', links: [...linkTo('Pull request', input.prUrl), ...linkTo('Issue', input.issueUrl)], buttons: [] },
+    ],
+  };
+}
+
+/** The agent declined a revision on purpose. The pull request is exactly as it was. */
+export function revisionRefusedCard(prUrl: HttpsUrl, issueUrl: HttpsUrl | null, mention: Mention, reason: string | null): View {
+  return {
+    ...mention,
+    accent: 'warn',
+    nodes: [
+      { kind: 'heading', text: 'Revision refused - pull request unchanged', icon: 'warn' },
+      { kind: 'field', name: 'Why', md: reason === null ? md`The agent did not say. The GitHub issue has its report.` : sanitizeStored(reason) },
+      { kind: 'text', md: md`The same revision will be refused again; ask for something different with ${mdInlineCode('/request revise')}.` },
+      { kind: 'buttons', links: [...linkTo('Pull request', prUrl), ...linkTo('Issue', issueUrl)], buttons: [] },
+    ],
+  };
+}
+
+/** The pull request was closed or merged before the revision could land on it. */
+export function revisionPrGoneCard(prUrl: HttpsUrl | null, issueUrl: HttpsUrl | null, runUrl: HttpsUrl | null, mention: Mention): View {
+  return {
+    ...mention,
+    accent: 'warn',
+    nodes: [
+      { kind: 'heading', text: 'Revision not applied - the pull request is closed', icon: 'warn' },
+      {
+        kind: 'text',
+        md: md`The pull request was closed or merged while the revision was waiting or building, so there is nothing left to revise. Open a new request with ${mdInlineCode('/request new')} for further changes.`,
+      },
+      { kind: 'buttons', links: [...linkTo('Pull request', prUrl), ...linkTo('Run log', runUrl), ...linkTo('Issue', issueUrl)], buttons: [] },
+    ],
+  };
+}
+
+/** Why a revision was handed back without being built. */
+export type RevisionDropReason = 'rejected' | 'expired' | 'cancelled';
+
+/**
+ * A REVISION THAT WILL NOT BE BUILT: rejected, expired or cancelled. The request goes back to
+ * its open pull request, untouched, and the issue stays OPEN - closing it the way a first
+ * build's Reject does would close the issue under a live pull request.
+ */
+export function revisionDroppedCard(input: {
+  readonly revision: number;
+  readonly why: RevisionDropReason;
+  readonly prUrl: HttpsUrl | null;
+  readonly issueUrl: HttpsUrl | null;
+  readonly mention: Mention;
+  /** Only for a cancel that reached a run: the same honest sentence `/request cancel` uses. */
+  readonly runNote: SafeMarkdown | null;
+}): View {
+  const what =
+    input.why === 'rejected'
+      ? 'An approver rejected this revision.'
+      : input.why === 'expired'
+        ? 'Nobody approved this revision in time, so it expired.'
+        : 'This revision was cancelled.';
+  return {
+    ...input.mention,
+    accent: 'warn',
+    nodes: [
+      { kind: 'heading', text: `Revision ${String(input.revision)} dropped`, icon: 'warn' },
+      { kind: 'text', md: sanitizeStored(`${what} The pull request is unchanged and still open.`) },
+      ...(input.runNote === null ? [] : [{ kind: 'text' as const, md: input.runNote }]),
+      { kind: 'text', md: REVISE_NUDGE },
+      { kind: 'buttons', links: [...linkTo('Pull request', input.prUrl), ...linkTo('Issue', input.issueUrl)], buttons: [] },
     ],
   };
 }

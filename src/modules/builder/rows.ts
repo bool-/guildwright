@@ -87,6 +87,15 @@ export interface BuildRow {
    * replaces - and `reconcile()` has to be able to recompute that key from the row alone.
    */
   readonly retryCount: number;
+  /**
+   * How many times `/request revise` has re-armed this row (migration 0006).
+   *
+   * While the row is active, a non-zero count means the work in flight is a REVISION of an open
+   * pull request: a Reject, an expiry or a cancel hands it back to `pr_open` rather than closing
+   * the issue under a live PR, and the build's ending is judged by `classifyRevisionEnding`. It
+   * is also the third part of the job dedupe key - see `buildDedupeKey`.
+   */
+  readonly revisionCount: number;
   /** When the poller FIRST saw this run finish successfully; null until then. It is what
    *  separates "the PR has not appeared yet" from "the agent refused, so there is no PR". */
   readonly succeededAt: number | null;
@@ -116,7 +125,7 @@ export interface BuildRow {
  */
 export type NewBuildRow = Omit<
   BuildRow,
-  'createdAt' | 'updatedAt' | 'prUrl' | 'retryCount' | 'approvalId' | 'approvalIssuedAt' | 'firstDispatchAt'
+  'createdAt' | 'updatedAt' | 'prUrl' | 'retryCount' | 'revisionCount' | 'approvalId' | 'approvalIssuedAt' | 'firstDispatchAt'
 >;
 
 /**
@@ -364,6 +373,26 @@ export interface BuildRepo {
    * The slot is claimed in this statement too, for the reason given on `reopenForDispatch`.
    */
   reopenForApproval(claim: SlotReopen & { readonly nonce: string }): SlotClaim;
+  /**
+   * RE-ARM A REQUEST WHOSE PULL REQUEST IS OPEN FOR A REVISION, back in front of an approver.
+   *
+   * From `pr_open`, or from `failed` when the failure was itself a revision (the PR is still
+   * there, and the requester wants to say something different rather than run the same thing
+   * again with `/request retry`). It goes to `awaiting_approval` for the reason
+   * `reopenForApproval` does: a revision is a new paid build, so a human approves it.
+   *
+   * `pr_url` IS KEPT: the pull request is what is being revised, and `/request list` should
+   * still link it while the revision waits. The run identity and the approval are cleared, as a
+   * retry clears them. `retry_count` is NOT raised - that bounds re-running the same request,
+   * and `revision_count` bounds this.
+   */
+  reopenForRevision(claim: SlotReopen & { readonly nonce: string }): SlotClaim;
+  /**
+   * HAND A REVISION THAT WILL NOT BE BUILT BACK TO `pr_open`: a Reject, an expiry or a cancel of
+   * a revision. Compare-and-set on `expectVersion`, and only for an active row with a revision
+   * count, so it cannot reopen a first build's row or race an Approve click.
+   */
+  dropRevision(id: RequestId, expectVersion: number, at: number): boolean;
   /** Rows the reconciler must re-adopt after a crash. */
   stuck(before: number, limitRows: number): readonly BuildRow[];
   /**
@@ -431,6 +460,7 @@ const selectRow = (t: SqlIdent): SqlQuery => sql`
          issue_number AS issueNumber, issue_url AS issueUrl,
          run_id AS runId, run_url AS runUrl, pr_url AS prUrl,
          dispatch_attempts AS dispatchAttempts, retry_count AS retryCount,
+         revision_count AS revisionCount,
          succeeded_at AS succeededAt,
          approval_id AS approvalId, approval_issued_at AS approvalIssuedAt,
          first_dispatch_at AS firstDispatchAt,
@@ -615,7 +645,10 @@ export const buildRepo = (db: Db): BuildRepo => {
         sqlJoin([
           // A FRESH approval id: a retry is a new spend, and the workflow has already consumed
           // the old id (or refused it). Re-sending it would be refused as a replay.
-          sql`UPDATE ${t} SET state = 'dispatching', run_id = NULL, run_url = NULL, pr_url = NULL,
+          // A FAILED REVISION keeps its pull request link: the PR is still open, and it is what
+          // the retry builds into. A first build that failed never had one.
+          sql`UPDATE ${t} SET state = 'dispatching', run_id = NULL, run_url = NULL,
+                              pr_url = CASE WHEN revision_count > 0 THEN pr_url ELSE NULL END,
                               succeeded_at = NULL, dispatch_attempts = 0,
                               approval_id = ${claim.approvalId}, approval_issued_at = NULL,
                               first_dispatch_at = NULL,
@@ -653,6 +686,28 @@ export const buildRepo = (db: Db): BuildRepo => {
         claim,
         null,
       ),
+    reopenForRevision: (claim) =>
+      settle(
+        sqlJoin([
+          sql`UPDATE ${t} SET state = 'awaiting_approval', nonce = ${claim.nonce},
+                              run_id = NULL, run_url = NULL, succeeded_at = NULL,
+                              approval_id = NULL, approval_issued_at = NULL, first_dispatch_at = NULL,
+                              dispatch_attempts = 0, revision_count = revision_count + 1,
+                              version = version + 1, updated_at = ${claim.at}
+              WHERE id = ${claim.id} AND version = ${claim.expectVersion}
+                AND (state = 'pr_open' OR (state = 'failed' AND revision_count > 0))
+                AND`,
+          slotsHeldBy(t, claim.guildId),
+          sql`< ${claim.maxConcurrent}`,
+        ]),
+        claim,
+        null,
+      ),
+    dropRevision: (id, expectVersion, at) =>
+      db.execute(sql`
+        UPDATE ${t} SET state = 'pr_open', run_id = NULL, version = version + 1, updated_at = ${at}
+        WHERE id = ${id} AND version = ${expectVersion} AND revision_count > 0
+          AND state IN ('awaiting_approval', 'dispatching', 'running')`).changes === 1,
     stuck: (before, limitRows) =>
       db.query<BuildRow>(
         sqlJoin([
@@ -762,6 +817,10 @@ export function msUntilUtcDayEnd(nowMs: number): number {
  * arriving on purpose. `reconcile()` recomputes this from the row, so the two agree by
  * construction rather than by memory.
  */
-export function buildDedupeKey(id: RequestId, retryCount: number): string {
-  return retryCount === 0 ? `build-${id}` : `build-${id}-r${String(retryCount)}`;
+export function buildDedupeKey(id: RequestId, retryCount: number, revisionCount = 0): string {
+  const retried = retryCount === 0 ? `build-${id}` : `build-${id}-r${String(retryCount)}`;
+  // A revision's poller is a new job for a row whose first build's job finished long ago; the
+  // `-v<k>` suffix keeps it from ever colliding with that one, or with a retry's. Every key an
+  // unrevised row has ever used is unchanged.
+  return revisionCount === 0 ? retried : `${retried}-v${String(revisionCount)}`;
 }

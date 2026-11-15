@@ -223,7 +223,7 @@ test('retry mints a FRESH approval id - the old one has been consumed by the rep
 
 /** A run report saying the repository refused this run because the approval was already used. */
 function replayedReport(): RunReport {
-  return { failedStep: 'approval_replayed', stop: null, turns: null, agent: null };
+  return { failedStep: 'approval_replayed', stop: null, turns: null, pushed: null, agent: null };
 }
 
 test('on approval_replayed the bot ADOPTS its own earlier run instead of drawing a failure', async () => {
@@ -292,7 +292,7 @@ test('an approval the repository found too old is a failure that points at retry
   const h = harness({}, { runStatus: async () => Ok({ kind: 'failure', runUrl: null, detail: 'failure' }) });
   try {
     const id = seedRunning(h.repo, 42, 9);
-    h.builds.report = { failedStep: 'approval_expired', stop: null, turns: null, agent: null };
+    h.builds.report = { failedStep: 'approval_expired', stop: null, turns: null, pushed: null, agent: null };
 
     const outcome = await h.build.run(payloadFor(id, 42), runtime());
     assert.equal(outcome.kind, 'failed');

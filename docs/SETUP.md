@@ -565,13 +565,14 @@ Two costs, two payers: the **Anthropic tokens** come out of the requester's cred
 moves the first, not the second — which is why the workflow's daily run cap still matters. See
 "What it costs to run" below.
 
-### After you have asked: `/request list`, `cancel`, `retry`
+### After you have asked: `/request list`, `cancel`, `retry`, `revise`
 
 | Command | What it does |
 |---|---|
 | `/request list` | Your requests in this server, newest first: the state each is in, how long it has been there, and the links (issue, run, pull request) that state has produced. Anyone holding `builder.approve` sees everyone's. |
 | `/request cancel` | Withdraws a request of yours (an approver may withdraw anybody's). The issue is closed `not_planned`, the card is rewritten with its buttons disabled, and the concurrency slot is freed immediately. If it is already building, the bot also **asks GitHub to cancel the run**, so a build you no longer want stops spending your credits rather than only stopping being watched. |
 | `/request retry` | Runs a **failed** build again, or puts an **expired** request back in front of an approver, reopening its issue — without retyping and without a second issue. |
+| `/request revise` | Asks the agent to change the **open pull request** a request produced: `/request revise id:<id> feedback:<what to change>`. The feedback is appended to the issue as a `## Revision <n>` section, goes back in front of an approver on a new card, and once approved the agent checks out the same branch and pushes to the same pull request. Only the requester can revise, because the revision runs on their credentials. |
 
 - **A retry is a fresh request for spend purposes.** It re-checks the requester's credential, the
   concurrency caps and the daily build cap, it is rate-limited like a submission, and it is bounded
@@ -579,8 +580,15 @@ moves the first, not the second — which is why the workflow's daily run cap st
   request was never approved, so it goes back to `awaiting_approval` on a new card and a human
   still has to click Approve.
 - **Retry is offered for failures, not for outcomes you dislike.** A request that reached
-  `pr_open` or `done` produced a pull request or a documented refusal; the answer to "the PR is
-  wrong" is a new `/request new` describing what is wrong.
+  `pr_open` or `done` produced a pull request or a documented refusal. When the pull request is
+  close but not right, `/request revise` says what to change; for something else entirely, open a
+  new `/request new`.
+- **A revision is a new paid build too.** It needs an Approve click, a fresh approval id, the
+  requester's credential and room under every cap, and `maxRevisions` (default 3) bounds how many
+  one request may ask for. It is written into the issue body - where the approval signature covers
+  it - not posted as a comment. A rejected, expired or cancelled revision goes back to the open
+  pull request untouched; the issue stays open. A revision whose pull request was merged or closed
+  in the meantime is dropped before anything is dispatched.
 
 `/request list` is also the honest answer to "is it stuck?". A request sitting in `running` with
 its run link is a build that is still going; one sitting in `awaiting_approval` for a day is
@@ -774,7 +782,7 @@ A credential lives in a GitHub environment, and environments belong to one repos
 |---|---|---|---|
 | `maxConcurrentPerGuild` | each server | 2 | Requests one server holds at once, including ones waiting for an approver. Counted when a request is filed. |
 | `maxConcurrentPerRepo` | each repository | 2 | Builds **dispatched** in one repository at once, from every server routed there. Counted when Approve is clicked or `/request retry` re-dispatches. |
-| `dailyRunCap` | each repository | 4 | Agent runs per UTC day, counted in that repository. |
+| `dailyRunCap` | each repository | 4 | Agent runs per UTC day, counted in that repository. Revisions count like any other run. |
 
 **Why `maxConcurrentPerRepo` exists.** The workflow's concurrency group keeps one running build
 and **one** pending one; GitHub silently cancels the older pending run when a third is queued. So
