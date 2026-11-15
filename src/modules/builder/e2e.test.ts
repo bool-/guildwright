@@ -519,7 +519,7 @@ async function deliver(w: World, outcome: { kind: string }): Promise<JsonObject>
 }
 
 function prRef(isDraft: boolean): PrRef {
-  return { number: 7, url: httpsUrl(PR_URL), branch: 'agent/req-x', isDraft };
+  return { number: 7, url: httpsUrl(PR_URL), branch: 'agent/req-x', isDraft, isOpen: true };
 }
 
 // =======================================================================================
@@ -856,6 +856,7 @@ test('the agent REFUSED on purpose: reported as a refusal, never as a crash', as
       failedStep: null,
       stop: 'success',
       turns: 5,
+      pushed: null,
       agent: { status: 'refused', summary: 'Made no changes.', remaining: 'The request asked me to edit .github.' },
     };
 

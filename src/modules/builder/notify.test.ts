@@ -198,7 +198,7 @@ test('a DRAFT pull request pings too - "I could not finish" is the ending most w
 
 test('a deliberate refusal pings, because "nothing was built and here is why" is an answer', async () => {
   const h = harness({}, { runStatus: () => okStatus('success', RUN_URL), findPrForBranch: async () => Ok(null) });
-  h.builds.report = { failedStep: null, stop: 'success', turns: 3, agent: { status: 'refused', summary: '', remaining: 'It asked for the token.' } };
+  h.builds.report = { failedStep: null, stop: 'success', turns: 3, pushed: null, agent: { status: 'refused', summary: '', remaining: 'It asked for the token.' } };
   try {
     const id = seedRunning(h.repo, 42, 77);
     await h.build.run(payloadFor(id, 42), runtime());

@@ -34,7 +34,16 @@ import { z } from 'zod';
 import { Err, Ok, type Result } from '#core/result';
 import type { AppError } from '#core/errors';
 import { errors } from '#core/errors';
-import { parseHttpsUrl, renderIssueBody, renderPlainName, renderSafeMarkdown, type IssueBody, type SafeMarkdown } from '#core/text';
+import {
+  parseHttpsUrl,
+  renderIssueBody,
+  renderPlainName,
+  renderRevisionSection,
+  renderSafeMarkdown,
+  type IssueBody,
+  type RevisionSection,
+  type SafeMarkdown,
+} from '#core/text';
 import type { ClockPort, IssueRef, IssuesPort, LoggerPort } from '#core/ports';
 import { isAlreadyExists, mapGithubError, readGithubFailure, type GithubRepo } from '#adapters/github/client';
 
@@ -356,5 +365,58 @@ export function createGithubIssues(input: {
         return Err(fail(cause, 'issues.reopen'));
       }
     },
+
+    /**
+     * Read the body, append one revision section, write it back.
+     *
+     * IDEMPOTENT ON THE SECTION'S OWN MARKER: a retry after a write whose answer was lost finds
+     * `build-revision ... revision=<k>` already present and changes nothing, so one revision is
+     * never appended twice.
+     *
+     * NOT ATOMIC against a human editing the body in the same second, and it does not need to
+     * be: the MAC is signed over the body as it stands at dispatch, so a lost or mangled section
+     * is something the approver sees on the issue, never something that builds unverified.
+     */
+    async appendRevision(issueNumber, section): Promise<Result<void, AppError>> {
+      const text = renderRevisionSection(section);
+      try {
+        const res = await octokit.request('GET /repos/{owner}/{repo}/issues/{issue_number}', {
+          owner,
+          repo,
+          issue_number: issueNumber,
+        });
+        const parsed = IssuePayload.safeParse(res.data);
+        if (!parsed.success) {
+          return Err(
+            errors.upstream('github', res.status, 'Ask an admin to check the GitHub API version pin.', 'issues.get: unrecognised response shape'),
+          );
+        }
+        const body = parsed.data.body ?? '';
+        if (!body.includes(`<!-- build-request v1 nonce=${section.nonce} `)) {
+          return Err(
+            errors.conflict(
+              'issue_not_bot_filed',
+              'That GitHub issue no longer carries the marker the bot filed it with, so a revision cannot be added to it.',
+              'Open a new request with /request new.',
+            ),
+          );
+        }
+        if (body.includes(revisionMarker(section))) return Ok(undefined);
+        await octokit.request('PATCH /repos/{owner}/{repo}/issues/{issue_number}', {
+          owner,
+          repo,
+          issue_number: issueNumber,
+          body: `${body.replace(/\s+$/u, '')}\n\n${text}`,
+        });
+        return Ok(undefined);
+      } catch (cause: unknown) {
+        return Err(fail(cause, 'issues.appendRevision'));
+      }
+    },
   };
+}
+
+/** The trailing marker of one revision section; how `appendRevision` recognises its own write. */
+export function revisionMarker(section: RevisionSection): string {
+  return `<!-- build-revision v1 nonce=${section.nonce} revision=${String(section.revision)} -->`;
 }

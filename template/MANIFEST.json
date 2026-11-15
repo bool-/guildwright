@@ -3,7 +3,7 @@
   "files": {
     ".github/claude/agent-settings.json": "45ee422afd40b6652c42c25acf9d231e74679cad3fa0d8c6be8a73a94e9be1a5",
     ".github/scripts/verify_approval.py": "61c168d6b7438e840364a8156bd2e42d5d3ca03e44a79971a3dbf1d07c6fadf5",
-    ".github/workflows/agent-implement-request.yml": "e61d5e929af018baa3b6b4274337699a54e78a5252f320204d7fa2236cd32bd9",
+    ".github/workflows/agent-implement-request.yml": "d60c5d7763eb6b3ff4e865bbea4e30329daeb8ebc9119c44b5a65574096eeddd",
     ".github/workflows/ci.yml": "9a273300939c677433fa4f86276a38dc4dace519286a23c8541f423bbb845fdb",
     "AGENTS.md": "512227510c1b632ebdd57b78a53106dc6968df8c7e078f914910d612c0fa4265"
   }

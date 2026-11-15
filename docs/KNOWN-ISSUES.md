@@ -518,3 +518,29 @@ settle it.
 - **The rollback is silently best-effort.** If the post-failure `list` or `deleteEnvironment` fails,
   the user stays stranded with an empty environment and nothing says so. It heals on the next
   `/credentials set`. Deliberate — deleting an environment the bot cannot inspect would be worse.
+
+## Revisions (`/request revise`)
+
+An adversarial review of the change found two high-severity defects, both fixed before merge: the
+agent loaded `agent-settings.json` (and could load `.claude/`, `.mcp.json`, `CLAUDE.md`) from the
+unreviewed PR branch it starts inside, and a revise run that failed before its branch step was
+reported as a successful push. The fixes: the settings file is snapshotted from the base checkout,
+the branch is refused before the agent starts if it carries agent configuration, those paths join
+the post-hoc gate, and `pushed` needs both heads. The fence now scrubs the nonce case-insensitively
+and neutralises `untrusted_`, because a reviser has seen the nonce on their own issue.
+
+### Open - low
+
+- **A dropped revision still uses up one of `maxRevisions`.** Reject, expiry, cancel and an
+  `appendRevision` failure never hand the number back. Section numbers must stay unique (the
+  append is idempotent on the marker), so a fix counts BUILT revisions separately from numbers.
+- **A revise run with no report fails at once**, where a first build gets the `prGraceMs` window.
+  Only reachable when the report step itself fails.
+- **Dependencies are installed from the BASE lockfile in revise mode**, before the PR branch is
+  checked out. A branch that changed `package-lock.json` (which needs human approval anyway) runs
+  its first `npm run check` against the base's `node_modules`.
+- **`maxRetries` is shared** by the first build and every revision of it.
+- **Inherited, not new:** the MAC signs the issue body as it is at DISPATCH, not at the Approve
+  click, so a repository writer who edits the body in between gets their edit signed. Revisions
+  inherit this. A forged `build-revision` marker added that way can only flip a new build into
+  revise mode, which then fails at the branch step because no open PR exists.

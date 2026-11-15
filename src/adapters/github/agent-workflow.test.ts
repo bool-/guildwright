@@ -157,21 +157,74 @@ test('the static <untrusted_user_request> tag is gone; the boundary is named by 
 });
 
 test('the nonce is read from the MAC-bound body, shape-checked, and only then written to GITHUB_OUTPUT', () => {
-  const compose = agent.slice(stepAt(agent, 'Compose the delimited prompt file'), stepAt(agent, 'Install bubblewrap and socat'));
-  assert.ok(compose.includes("grep -oE '<!-- build-request v1 nonce=[0-9a-f]{16}'"), 'the nonce comes from the trailing marker the bot writes');
-  const check = compose.indexOf('case "$NONCE" in');
-  const output = compose.indexOf('echo "nonce=$NONCE" >> "$GITHUB_OUTPUT"');
+  const read = agent.slice(stepAt(agent, 'Read the approved request'), stepAt(agent, 'Create the working branch'));
+  assert.match(read, /^\s+id: request$/mu, 'the step has an id so later steps can read its outputs');
+  // The copy the approval gate fetched and the MAC verified, never a re-fetch.
+  assert.ok(read.includes('ISSUE_JSON_PATH: ${{ runner.temp }}/issue.json'), 'it reads the verified copy of the issue');
+  assert.ok(!read.includes('gh issue view'), 'and never re-fetches it');
+  assert.ok(read.includes("grep -oE '<!-- build-request v1 nonce=[0-9a-f]{16}'"), 'the nonce comes from the trailing marker the bot writes');
+  const check = read.indexOf('case "$NONCE" in');
+  const output = read.indexOf('echo "nonce=$NONCE"');
   assert.ok(check > 0 && output > check, 'the 16-hex shape check runs before the value becomes a step output');
   // The three refusals, each with the exact text the operator will read in the run log.
-  assert.ok(compose.includes('carries no bot fence nonce, so it was not filed by the bot and will not be built'));
-  assert.ok(compose.includes('the fence nonce appears outside its delimiters; refusing to build a tampered issue'));
-  assert.ok(compose.includes('the fence nonce appears in the issue title; refusing to build a tampered issue'));
-  assert.ok(output < compose.indexOf('} > .agent/request.md'), 'and every refusal happens before the prompt file is written');
+  assert.ok(read.includes('carries no bot fence nonce, so it was not filed by the bot and will not be built'));
+  assert.ok(read.includes('the fence nonce appears outside its delimiters; refusing to build a tampered issue'));
+  assert.ok(read.includes('the fence nonce appears in the issue title; refusing to build a tampered issue'));
+  assert.ok(output > read.indexOf('the fence nonce appears in the issue title'), 'every refusal happens before anything is written out');
+  assert.ok(stepAt(agent, 'Read the approved request') < stepAt(agent, 'Compose the delimited prompt file'), 'and before the prompt file is composed');
+});
+
+test('a revision is told apart by the MAC-bound marker, and the stray check allows exactly that one extra line shape', () => {
+  const read = agent.slice(stepAt(agent, 'Read the approved request'), stepAt(agent, 'Create the working branch'));
+  // The fourth sanctioned line is anchored at both ends and its revision number is digits only,
+  // so a forged boundary cannot hide inside it.
+  assert.ok(read.includes('|^[0-9]+:<!-- build-revision v1 nonce=$NONCE revision=[0-9]{1,3} -->$'), 'the revision marker is the one added line shape');
+  assert.ok(read.includes('s/^<!-- build-revision v1 nonce=$NONCE revision=([0-9]{1,3}) -->$/\\1/p'), 'the mode is read from that same anchored line');
+  assert.ok(read.includes('sort -n | tail -n1'), 'the highest revision is the one to implement');
+  assert.ok(read.includes('if [ -n "$REVISION" ]; then MODE=revise; else MODE=new; REVISION=0; fi'));
+  // The mode is NOT a dispatch input: nothing a dispatcher chooses can turn a build into a push.
+  const inputs = agent.slice(agent.indexOf('workflow_dispatch:'), agent.indexOf('permissions: {}'));
+  assert.ok(!/^\s+mode:/mu.test(inputs), 'mode is never a workflow input');
+});
+
+test('a revision checks out the existing branch, only while its pull request is open, and the report says whether it pushed', () => {
+  const branch = agent.slice(stepAt(agent, 'Create the working branch'), stepAt(agent, 'Stage the verified issue content'));
+  assert.ok(branch.includes('MODE: ${{ steps.request.outputs.mode }}'));
+  assert.ok(branch.includes('gh pr list --repo "$REPO" --head "$BRANCH" --state open'), 'it refuses a branch whose pull request is closed');
+  assert.ok(branch.includes('git checkout -b "$BRANCH" "origin/$BRANCH"'), 'it builds on the open pull request');
+  assert.ok(!branch.includes('--force') && !branch.includes('reset --hard'), 'and never rewrites it');
+  const gate = agent.slice(stepAt(agent, 'Reject forbidden path changes'), stepAt(agent, 'Resolve the PR URL'));
+  assert.ok(gate.indexOf('head_after=') < gate.indexOf('agent modified a forbidden path'), 'the head is recorded before a refusal can end the step');
+  const report = agent.slice(stepAt(agent, 'Post the run report'));
+  assert.ok(report.includes('HEAD_BEFORE: ${{ steps.branch.outputs.head_before }}'));
+  assert.ok(report.includes('HEAD_AFTER: ${{ steps.gate.outputs.head_after }}'));
+  assert.ok(report.includes('pushed: $pushed'), 'the machine-readable report carries the fact');
+  // `pushed` needs BOTH heads: a run that died before the branch step recorded none.
+  assert.ok(report.includes('if [ -n "${HEAD_BEFORE:-}" ] && [ -n "${HEAD_AFTER:-}" ]'));
+  assert.ok(branch.includes('echo "head_before=$(git rev-parse HEAD)"'), 'recorded in both modes');
+});
+
+test('the agent never loads configuration from the unreviewed branch it is started inside', () => {
+  const branch = agent.slice(stepAt(agent, 'Create the working branch'), stepAt(agent, 'Stage the verified issue content'));
+  const snapshot = branch.indexOf('cp .github/claude/agent-settings.json "$RUNNER_TEMP/agent-settings.json"');
+  assert.ok(snapshot > 0 && snapshot < branch.indexOf('git checkout -b "$BRANCH" "origin/$BRANCH"'), 'the base copy is taken before the switch');
+  const claude = agent.slice(stepAt(agent, 'Implement with Claude Code'), stepAt(agent, "Show the agent's final message"));
+  assert.match(claude, /^\s+settings: \$\{\{ runner\.temp \}\}\/agent-settings\.json$/mu, 'and the action loads that copy');
+  // A branch carrying what Claude Code loads as its own config is refused before the agent starts...
+  const precheck = branch.indexOf('carries agent configuration or a forbidden path');
+  assert.ok(precheck > 0 && precheck < branch.indexOf('git checkout -b "$BRANCH" "origin/$BRANCH"'));
+  for (const path of ['(^|/)\\.claude/', '(^|/)\\.mcp\\.json$', '(^|/)CLAUDE\\.md$']) {
+    assert.ok(branch.includes(path), `the pre-check refuses ${path}`);
+    // ...and a run that commits one is blocked, so it cannot configure the next run.
+    const gate = agent.slice(stepAt(agent, 'Reject forbidden path changes'), stepAt(agent, 'Resolve the PR URL'));
+    assert.ok(gate.includes(path), `the post-hoc gate forbids ${path}`);
+  }
+  assert.ok(branch.includes('select(.isCrossRepository == false)'), "a fork's PR with the same head name is not ours");
 });
 
 test('the action prompt names the nonce tag through the step output, not a literal', () => {
   const claude = agent.slice(stepAt(agent, 'Implement with Claude Code'), stepAt(agent, "Show the agent's final message"));
-  assert.match(claude, /<untrusted_\$\{\{ steps\.compose\.outputs\.nonce \}\}> tags in that file/u, 'the prompt must name the exact tag the file uses');
+  assert.match(claude, /<untrusted_\$\{\{ steps\.request\.outputs\.nonce \}\}> tags in that file/u, 'the prompt must name the exact tag the file uses');
   // It lives under `with:`, where an expression is data, not shell. contract.test.ts polices run: blocks.
   const promptAt = claude.indexOf('prompt: |');
   const withAt = claude.indexOf('with:');

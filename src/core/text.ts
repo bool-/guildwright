@@ -41,6 +41,7 @@ const PN = Symbol('core.text.plainName');
 const AT = Symbol('core.text.actionsToken');
 const FF = Symbol('core.text.fencedField');
 const IB = Symbol('core.text.issueBody');
+const RS = Symbol('core.text.revisionSection');
 
 /** Where untrusted text entered. Audit-only; never a reason to trust it. */
 export type UserTextSource = 'command-option' | 'modal-field' | 'message-body' | 'autocomplete';
@@ -91,6 +92,17 @@ export interface IssueBody {
   readonly [IB]: string;
   /** The nonce this body's fences use, so the approval marker can bind to it. */
   readonly nonce: string;
+}
+
+/**
+ * One revision appended to an existing issue body. Minted only by `buildRevisionSection`, from
+ * `FencedField`s minted only by `fence` - the same wall as `IssueBody`, one section at a time.
+ */
+export interface RevisionSection {
+  readonly [RS]: string;
+  /** The nonce this section's fences use. It MUST be the issue's own nonce; see the builder. */
+  readonly nonce: string;
+  readonly revision: number;
 }
 
 declare const TEXT_BRAND: unique symbol;
@@ -236,6 +248,11 @@ export function renderActionsToken(t: ActionsToken): string {
 /** Render for transport. Adapters only. */
 export function renderIssueBody(b: IssueBody): string {
   return b[IB];
+}
+
+/** Render for transport. Adapters only. */
+export function renderRevisionSection(s: RevisionSection): string {
+  return s[RS];
 }
 
 /**
@@ -563,7 +580,13 @@ export function fence(
   opts: { readonly maxLength: number },
 ): FencedField {
   const n = renderFenceNonce(nonce);
-  const inner = toMarkdown(t, opts).text.split(n).join('[nonce]');
+  // CASE-INSENSITIVE, and the prompt tag's own prefix too. Since `/request revise` a requester
+  // can write text AFTER the nonce is visible on their issue, so "they never saw it" no longer
+  // holds: an uppercase copy, or a hand-typed `</untrusted_...>`, must not survive into a fence.
+  // The nonce is 16 hex characters, so it is safe inside a RegExp as-is.
+  const inner = toMarkdown(t, opts)
+    .text.replace(new RegExp(n, 'giu'), '[nonce]')
+    .replace(/untrusted_/giu, 'untrusted-');
   const safeLabel = collapseToSingleLine(stripInvisible(label)).slice(0, 64);
   return { [FF]: `### ${safeLabel}\n===BEGIN USER_TEXT ${n}===\n${inner}\n===END USER_TEXT ${n}===`, label: safeLabel };
 }
@@ -596,6 +619,42 @@ export function buildIssueBody(input: {
     `<!-- build-request v1 nonce=${n} ${metaLines} -->`,
   ].join('\n');
   return { [IB]: body, nonce: n };
+}
+
+/** The highest revision number a section may carry. Far above any `maxRevisions` an operator sets. */
+export const MAX_REVISION_NUMBER = 999;
+
+/**
+ * The ONLY producer of a `RevisionSection`: one `/request revise`, appended to the issue body.
+ *
+ * WHY IT IS APPENDED TO THE BODY and not posted as a comment: the approval MAC binds the SHA-256
+ * of the issue body, so text in the body is text the approver approved and the workflow verifies.
+ * A comment is bound by nothing.
+ *
+ * WHY THE SAME NONCE: the workflow allows the nonce on exactly four line shapes - the two
+ * USER_TEXT delimiters, the `build-request` marker and the `build-revision` marker this writes -
+ * and refuses the issue if it appears anywhere else. A second nonce would be a second fence the
+ * workflow does not know about. The `build-revision` marker is also how the workflow knows the run
+ * revises an open pull request instead of opening one, so the mode is bound by the MAC too.
+ */
+export function buildRevisionSection(input: {
+  readonly nonce: FenceNonce;
+  readonly revision: number;
+  readonly fields: readonly FencedField[];
+}): RevisionSection {
+  if (!Number.isInteger(input.revision) || input.revision < 1 || input.revision > MAX_REVISION_NUMBER) {
+    throw new TypeError('buildRevisionSection: revision must be an integer from 1 to 999');
+  }
+  const n = renderFenceNonce(input.nonce);
+  const k = String(input.revision);
+  const section = [
+    `## Revision ${k}`,
+    '',
+    ...input.fields.map((f) => f[FF]),
+    '',
+    `<!-- build-revision v1 nonce=${n} revision=${k} -->`,
+  ].join('\n');
+  return { [RS]: section, nonce: n, revision: input.revision };
 }
 
 // ---------------------------------------------------------------------------------------

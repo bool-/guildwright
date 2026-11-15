@@ -29,6 +29,7 @@ import type {
   JobStats,
   LoggerPort,
   PortRegistry,
+  PrRef,
   RunReport,
   LogLevel,
   SecretName,
@@ -41,7 +42,7 @@ import { errors } from '#core/errors';
 import type { Secret } from '#core/secret';
 import type { ChannelId, JobId } from '#core/ids';
 import type { SurfaceRef, View } from '#core/view';
-import { SHARED_BUILD_ENVIRONMENT, actionsToken, parseHttpsUrl, renderIssueBody, renderPlainName } from '#core/text';
+import { SHARED_BUILD_ENVIRONMENT, actionsToken, parseHttpsUrl, renderIssueBody, renderPlainName, renderRevisionSection } from '#core/text';
 import { Err } from '#core/result';
 import { createRepoSet, createReposPort, repoScoped, type RepoScoped, type RepoSet, type RepoSetEntry, type ReposPort } from '#core/ports/repos';
 import type { GuildId } from '#core/ids';
@@ -408,12 +409,17 @@ export interface FakeIssues extends IssuesPort {
    * (`closed: [7]`, and the issue is open) - the same evidence for the bug and for the fix.
    */
   isOpen(issueNumber: number): boolean;
+  /** Every `appendRevision` call, in order: the issue and the revision number appended. */
+  readonly revisions: readonly { readonly issueNumber: number; readonly revision: number }[];
+  /** The issue's CURRENT body, revisions included; `''` for an issue that was never filed. */
+  bodyOf(issueNumber: number): string;
 }
 
 export function fakeIssues(): FakeIssues {
   const created: { title: string; body: string; labels: readonly string[] }[] = [];
   const closed: number[] = [];
   const reopened: number[] = [];
+  const revisions: { issueNumber: number; revision: number }[] = [];
   // Modelled, not inferred from the call logs: an issue is open until it is closed, and open
   // again after a reopen. This is the fact a retry path is actually judged on.
   const open = new Map<number, boolean>();
@@ -421,6 +427,10 @@ export function fakeIssues(): FakeIssues {
     created,
     closed,
     reopened,
+    revisions,
+    bodyOf(issueNumber) {
+      return created[issueNumber - 1]?.body ?? '';
+    },
     isOpen(issueNumber) {
       return open.get(issueNumber) ?? false;
     },
@@ -457,6 +467,16 @@ export function fakeIssues(): FakeIssues {
     async reopen(n) {
       reopened.push(n);
       open.set(n, true);
+      return Ok(undefined);
+    },
+    /** Appends to the modelled body, so `bodySha256` changes exactly as GitHub's would. */
+    async appendRevision(n, section) {
+      const row = created[n - 1];
+      if (row === undefined) return Err(errors.notFound('issue', 'Open a new request.'));
+      revisions.push({ issueNumber: n, revision: section.revision });
+      row.body = `${row.body}
+
+${renderRevisionSection(section)}`;
       return Ok(undefined);
     },
   };
@@ -510,6 +530,8 @@ export interface FakeBuilds extends BuildsPort {
   readonly variables: Map<string, string>;
   /** What `findRunReport` answers. Null by default: a workflow that posted no report. */
   report: RunReport | null;
+  /** What `findPrForBranch` answers, read at call time. Null by default: no pull request. */
+  pr: PrRef | null;
   /**
    * What `verifyGates` answers, read at call time. `Ok` by default: the gate files match.
    * Assign an `Err` (a non-retryable config error for drift, a retryable one for "could not
@@ -544,6 +566,7 @@ export function fakeBuilds(): FakeBuilds {
     variables,
     runsToday: 0,
     report: null,
+    pr: null,
     gateAnswer: Ok(undefined),
     gateChecks: 0,
     async verifyGates() {
@@ -581,7 +604,7 @@ export function fakeBuilds(): FakeBuilds {
       return Ok(builds.report);
     },
     async findPrForBranch() {
-      return Ok(null);
+      return Ok(builds.pr);
     },
     /**
      * Both arms are reachable, which is the entire point of `finishedRuns`.

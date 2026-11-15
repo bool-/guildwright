@@ -976,6 +976,7 @@ test('a report is read back for the run it names, and for no other run', () => {
     failedStep: null,
     stop: 'success',
     turns: 40,
+    pushed: null,
     agent: { status: 'done', summary: 'Added /remind.', remaining: '' },
   });
   assert.equal(parseRunReport(reportComment(REPORT), 78), null, 'a retried request reuses the issue; the run id picks the report');

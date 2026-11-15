@@ -99,6 +99,7 @@ test('every retry arm holding a failed result consults that result', () => {
       'dispatched; polling',
       'still building',
       'unknown ending',
+      'unknown revision ending',
       'unknown status',
     ],
     'a retry arm is ignoring the retryAfterMs on an AppError it is holding. Use retryAfter(error, cfg.pollIntervalMs, why).',
@@ -109,7 +110,7 @@ test('every retry arm holding a failed result consults that result', () => {
   const routed = [...code.matchAll(/retryAfter\(\s*(\w+)\.error,\s*cfg\.pollIntervalMs/gu)].map((m) => m[1] ?? '?');
   assert.deepEqual(
     routed.sort(),
-    ['bodySha', 'earlier', 'gated', 'out', 'payer', 'pr', 'report', 'status', 'used'],
-    'every arm holding a failed Result must consult it: gate-file check, daily-cap read, payer, body digest, dispatch, poll, PR lookup, report, replay search',
+    ['bodySha', 'earlier', 'gated', 'open', 'out', 'payer', 'pr', 'report', 'status', 'used'],
+    'every arm holding a failed Result must consult it: gate-file check, daily-cap read, payer, body digest, dispatch, poll, PR lookup, report, replay search, the revision open-PR check',
   );
 });

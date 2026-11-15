@@ -347,6 +347,8 @@ const RunReportPayload = z.object({
     .nullable(),
   stop: z.string().max(64).nullable(),
   turns: z.number().int().nonnegative().nullable(),
+  // Absent from a workflow older than revisions, which is null: "not reported", never "false".
+  pushed: z.boolean().nullable().optional(),
   // `.catch(null)`: a malformed agent half must not cost the facts the workflow computed.
   agent: z
     .object({ status: z.enum(['done', 'partial', 'refused']), summary: agentText, remaining: agentText })
@@ -370,8 +372,8 @@ export function parseRunReport(body: string, runId: number): RunReport | null {
   }
   const parsed = RunReportPayload.safeParse(raw);
   if (!parsed.success || parsed.data.run_id !== runId) return null;
-  const { failed_step, stop, turns, agent } = parsed.data;
-  return { failedStep: failed_step, stop, turns, agent };
+  const { failed_step, stop, turns, pushed, agent } = parsed.data;
+  return { failedStep: failed_step, stop, turns, pushed: pushed ?? null, agent };
 }
 
 /**
@@ -860,7 +862,8 @@ export function createGithubBuilds(input: {
       // `isDraft` is what lets the builder tell "the agent finished" from "the agent ran out of
       // room and pushed what it had". Reporting the second as the first is the one wrong answer
       // of the three, because it invites a merge of work the agent said was incomplete.
-      return Ok({ number: match.number, url: url.value, branch, isDraft: match.isDraft });
+      // `isOpen`: a revision may only build into a pull request that is still open.
+      return Ok({ number: match.number, url: url.value, branch, isDraft: match.isDraft, isOpen: match.state === 'open' });
     },
   };
 }

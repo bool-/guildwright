@@ -13,6 +13,8 @@
  *   /request cancel <id>   withdraw your own; an approver may withdraw anybody's
  *   /request retry <id>    re-run a failed build, or put an expired one back in front of an
  *                          approver - without retyping and without a second issue
+ *   /request revise <id>   ask the agent to change the pull request it opened, through the
+ *                          same approval as a new build, on the same branch and the same PR
  *
  * TWO RULES RUN THROUGH ALL OF IT.
  *
@@ -39,9 +41,16 @@ import { errors, type AppError } from '#core/errors';
 import { limit } from '#core/ratelimit';
 import type { PermissionRef } from '#core/policy';
 import {
+  agentBranchName,
+  buildRevisionSection,
+  fence,
   md,
+  mdInlineCode,
+  redactUserSecrets,
   renderPlainName,
+  renderSafeMarkdown,
   sanitizeStored,
+  toMarkdown,
   toPlainName,
   type SafeMarkdown,
   type UserText,
@@ -51,6 +60,7 @@ import {
   newCardNonce,
   toCardNonce,
   toChannelId,
+  toFenceNonce,
   toRequestId,
   type ChannelId,
   type RequestId,
@@ -72,6 +82,7 @@ import {
   listCard,
   rejectButton,
   retryingCard,
+  revisionDroppedCard,
   approvalCard,
   pingRequesterUnless,
   stateLabel,
@@ -119,8 +130,8 @@ export interface HistoryPorts extends GithubScopes<HistoryIssues, HistoryBuilds>
  * `.at(repo)` (RFC-001 PR 2.1), and every command here reaches the row's own repository
  * through `githubForRow`, never "the" repository.
  */
-export type HistoryIssues = Pick<IssuesPort, 'close'> & ReopensIssues;
-export type HistoryBuilds = Pick<BuildsPort, 'environmentCredentials' | 'verifyGates'> & CancelsRuns;
+export type HistoryIssues = Pick<IssuesPort, 'close' | 'appendRevision'> & ReopensIssues;
+export type HistoryBuilds = Pick<BuildsPort, 'environmentCredentials' | 'verifyGates' | 'findPrForBranch'> & CancelsRuns;
 
 /** Exactly the config these commands read. Kept explicit so the manifest is the only defaults. */
 export interface HistoryConfig {
@@ -132,6 +143,12 @@ export interface HistoryConfig {
   readonly approvalTtlMs: number;
   readonly buildDeadlineMs: number;
   readonly requireOwnCredentials: boolean;
+  /** How many `/request revise` one request may ask for. */
+  readonly maxRevisions: number;
+  /** The same cap `/request new` puts on one fenced field of the issue body. */
+  readonly issueFieldMaxLength: number;
+  /** How much of the revision the approval card quotes. */
+  readonly requestExcerptLength: number;
 }
 
 export interface HistoryDeps {
@@ -152,7 +169,7 @@ const ID_OPTION = {
 } as const;
 
 export function historyCommands(deps: HistoryDeps): readonly CommandSpec[] {
-  return [listCommand(deps), cancelCommand(deps), retryCommand(deps)];
+  return [listCommand(deps), cancelCommand(deps), retryCommand(deps), reviseCommand(deps)];
 }
 
 // ---------------------------------------------------------------------------------------
@@ -249,6 +266,10 @@ function cancelCommand(deps: HistoryDeps): CommandSpec {
       // one fact the user has to be told honestly.
       const wasRunning = row.state === 'dispatching' || row.state === 'running';
 
+      // A REVISION goes back to its open pull request instead of ending the request: the PR it
+      // was going to change is still there, and closing the issue would close it under a live PR.
+      if (row.revisionCount > 0) return cancelRevision(deps, inv, row, wasRunning);
+
       // COMPARE-AND-SET, not a blind UPDATE: an approver may be clicking Approve in this exact
       // second, and losing that race must be a refusal rather than a cancelled build that
       // dispatched anyway.
@@ -266,7 +287,7 @@ function cancelCommand(deps: HistoryDeps): CommandSpec {
       // cancel lands while an attempt is already in flight.
       let stoppedPolling = false;
       if (wasRunning) {
-        const jobId = deps.ports.jobs.findByDedupeKey(buildDedupeKey(row.id, row.retryCount));
+        const jobId = deps.ports.jobs.findByDedupeKey(buildDedupeKey(row.id, row.retryCount, row.revisionCount));
         if (jobId !== undefined) {
           const cancelled = deps.ports.jobs.cancel(jobId);
           stoppedPolling = cancelled.ok && cancelled.value;
@@ -329,6 +350,71 @@ function cancelCommand(deps: HistoryDeps): CommandSpec {
     },
     async autocomplete(req): Promise<readonly AutocompleteChoice[]> {
       return suggest(deps, req, (row) => !isTerminalState(row.state));
+    },
+  };
+}
+
+/**
+ * CANCEL A REVISION: stop its poller and its run exactly as a build's cancel does, then hand the
+ * row back to `pr_open` - the issue stays open and the pull request untouched.
+ */
+async function cancelRevision(deps: HistoryDeps, inv: Invocation, row: BuildRow, wasRunning: boolean): Promise<Outcome> {
+  if (!deps.repo.dropRevision(row.id, row.version, inv.at)) {
+    return {
+      kind: 'fail',
+      error: errors.conflict('cas', 'Someone else resolved that revision a moment before you did.', 'Run /request list to see what happened to it.'),
+    };
+  }
+  let stoppedPolling = false;
+  if (wasRunning) {
+    const jobId = deps.ports.jobs.findByDedupeKey(buildDedupeKey(row.id, row.retryCount, row.revisionCount));
+    if (jobId !== undefined) {
+      const cancelled = deps.ports.jobs.cancel(jobId);
+      stoppedPolling = cancelled.ok && cancelled.value;
+    }
+  }
+  const cancelReport = await stopTheRun(deps, row, wasRunning);
+  const run = describeCancelledRun(wasRunning, row.runId !== null, cancelReport);
+
+  const surface = surfaceOf(row);
+  if (surface !== null) {
+    const view = revisionDroppedCard({
+      revision: row.revisionCount,
+      why: 'cancelled',
+      prUrl: storedUrl(row.prUrl),
+      issueUrl: storedUrl(row.issueUrl),
+      mention: pingRequesterUnless(row.requesterId, inv.actor.userId),
+      runNote: wasRunning ? receiptLine(run) : null,
+    });
+    const moved = await deliverOutcome(deps.ports.discord, surface, view);
+    if (moved.messageId !== surface.messageId) deps.repo.recordSurface(row.id, moved, inv.at);
+  }
+
+  deps.ports.audit.record({
+    action: 'builder.revise.cancel',
+    actorId: inv.actor.userId,
+    guildId: row.guildId,
+    detail: {
+      requestId: row.id,
+      issueNumber: row.issueNumber,
+      requesterId: row.requesterId,
+      revision: row.revisionCount,
+      fromState: row.state,
+      wasRunning,
+      stoppedPolling,
+      runCancel: cancelReport.kind,
+    },
+  });
+
+  return {
+    kind: 'view',
+    view: {
+      accent: 'ok',
+      ephemeral: true,
+      nodes: [
+        { kind: 'text', md: receiptLine(run) },
+        { kind: 'text', md: md`The pull request is unchanged and still open; ${mdInlineCode('/request revise')} asks for a different change.` },
+      ],
     },
   };
 }
@@ -510,6 +596,228 @@ function retryCommand(deps: HistoryDeps): CommandSpec {
   };
 }
 
+// ---------------------------------------------------------------------------------------
+// /request revise
+// ---------------------------------------------------------------------------------------
+
+/** Discord's cap on a slash-command string option is 6000; a revision is a paragraph, not an essay. */
+const REVISION_MAX_LENGTH = 2000;
+
+/**
+ * ASK THE AGENT TO CHANGE THE PULL REQUEST IT OPENED.
+ *
+ * THE FOUR DECISIONS, each one the conservative answer:
+ *
+ * 1. **The requester only.** An approver may cancel or retry anybody's request, but a revision is
+ *    NEW TEXT, and it is built on the requester's own credentials. Letting somebody else write a
+ *    paid instruction onto another person's bill is a different thing from re-running their own.
+ * 2. **A fresh approval.** It goes back to `awaiting_approval` on a new card, and the Approve
+ *    click mints a new approval id, exactly as a new request does. There is no owner bypass.
+ * 3. **Written into the issue body**, as a `## Revision <k>` section fenced with the issue's own
+ *    nonce, so the approval MAC binds it and the workflow verifies it. The section's marker is
+ *    also what tells the workflow to check out the existing branch and push to the open PR.
+ * 4. **Bounded** by `maxRevisions`, and every revision faces the guild slot cap, the daily run
+ *    cap and the per-repository dispatch cap like any other build.
+ *
+ * ORDER, as in `redispatch`: the compare-and-set claims the row first, so two revisions typed at
+ * once cannot both append a section. A failure to write the section or draw the card hands the
+ * row straight back to `pr_open`.
+ */
+function reviseCommand(deps: HistoryDeps): CommandSpec {
+  return {
+    name: 'request revise',
+    description: 'Ask the agent to change the pull request your request opened',
+    surface: 'guild',
+    options: [
+      ID_OPTION,
+      {
+        name: 'feedback',
+        description: 'What should change in the pull request',
+        type: 'text',
+        required: true,
+        maxLength: REVISION_MAX_LENGTH,
+      },
+    ],
+    permission: deps.perms.request,
+    // THE SAME TWO BUCKETS AS THE MODAL SUBMISSION: a revision files text into an issue and, once
+    // approved, spends exactly what a new build spends.
+    limit: [limit.perUser(3, 3_600_000), limit.perGuild(20, 86_400_000)],
+    needs: ['SendMessages'],
+    ack: 'defer-ephemeral',
+    async handle(inv): Promise<Outcome> {
+      const guildId = inv.space.guildId;
+      if (guildId === null) return { kind: 'silent' };
+      const found = await loadForAction(deps, inv);
+      if (!found.ok) return { kind: 'fail', error: found.error };
+      const row = found.value;
+
+      if (row.requesterId !== inv.actor.userId) {
+        return {
+          kind: 'fail',
+          error: errors.forbidden(
+            'builder.request',
+            'the person who opened it',
+            'Only the person who opened a request can revise it, because the revision runs on their credentials. Ask them to run /request revise.',
+          ),
+        };
+      }
+      const revisable = revisableState(row);
+      if (!revisable.ok) return { kind: 'fail', error: revisable.error };
+      if (row.revisionCount >= deps.cfg.maxRevisions) {
+        return {
+          kind: 'fail',
+          error: errors.conflict(
+            'revision_exhausted',
+            `That request has already been revised ${String(row.revisionCount)} times, which is the limit.`,
+            'Review and merge the pull request as it is, or close it and open a new request with /request new.',
+            'exhausted',
+          ),
+        };
+      }
+      const issueNumber = row.issueNumber;
+      if (issueNumber === null) {
+        return { kind: 'fail', error: errors.conflict('no_issue', 'That request never got as far as a GitHub issue.', 'Open a new one with /request new.') };
+      }
+      const fenceNonce = toFenceNonce(row.fenceNonce);
+      if (!fenceNonce.ok) return { kind: 'fail', error: fenceNonce.error };
+
+      const target = githubForRow(deps.ports, row);
+      if (!target.ok) return { kind: 'fail', error: target.error };
+      const gh = target.value;
+      const gated = await gh.builds.verifyGates();
+      if (!gated.ok) return { kind: 'fail', error: gated.error };
+      if (deps.cfg.requireOwnCredentials) {
+        const gate = await requireOwnCredentialsGate(gh.builds, row.requesterId);
+        if (!gate.ok) return { kind: 'fail', error: gate.error };
+      }
+
+      // THE PULL REQUEST MUST STILL BE OPEN. A revision of a merged or closed PR would push commits
+      // to a branch nobody is reviewing any more - or fail at checkout after an approver paid for it.
+      const pr = await gh.builds.findPrForBranch(agentBranchName(row.id));
+      if (!pr.ok) return { kind: 'fail', error: pr.error };
+      if (pr.value === null || !pr.value.isOpen) {
+        return {
+          kind: 'fail',
+          error: errors.conflict(
+            'pr_closed',
+            'That request has no open pull request to revise - it was merged or closed.',
+            'Open a new request with /request new for further changes.',
+            'closed',
+          ),
+        };
+      }
+
+      // The requester's text, with THEIR secrets redacted before it reaches an issue, a log or a card.
+      const feedback = redactUserSecrets(inv.args.textRequired('feedback'));
+      if (renderSafeMarkdown(toMarkdown(feedback, { maxLength: REVISION_MAX_LENGTH }).md).trim().length === 0) {
+        return { kind: 'fail', error: errors.validation('feedback', 'The revision is empty.', 'Say what should change in the pull request.') };
+      }
+      const revision = row.revisionCount + 1;
+      const section = buildRevisionSection({
+        nonce: fenceNonce.value,
+        revision,
+        fields: [fence('What to change', feedback, fenceNonce.value, { maxLength: deps.cfg.issueFieldMaxLength })],
+      });
+
+      const nonce = newCardNonce();
+      const claimed = deps.repo.reopenForRevision({
+        id: row.id,
+        expectVersion: row.version,
+        guildId: row.guildId,
+        at: inv.at,
+        maxConcurrent: deps.cfg.maxConcurrentPerGuild,
+        nonce,
+      });
+      if (claimed !== 'claimed') {
+        return {
+          kind: 'fail',
+          error:
+            claimed === 'full' || claimed === 'repo-full'
+              ? claimRefusal(deps, row, claimed, 'where it is')
+              : errors.conflict('cas', 'That request changed a moment ago.', 'Run /request list to see where it is.', 'cas'),
+        };
+      }
+      // The row is `awaiting_approval` at version + 1 from here: what `dropRevision` must name.
+      const claimedVersion = row.version + 1;
+
+      const appended = await gh.issues.appendRevision(issueNumber, section);
+      if (!appended.ok) {
+        deps.repo.dropRevision(row.id, claimedVersion, inv.at);
+        return { kind: 'fail', error: appended.error };
+      }
+
+      const quoted = toMarkdown(feedback, { maxLength: deps.cfg.requestExcerptLength });
+      const view = approvalCard({
+        id: row.id,
+        nonce,
+        title: row.title === null ? md`_(no title recorded)_` : sanitizeStored(row.title),
+        excerpt: { md: quoted.md, truncated: quoted.truncated },
+        kind: null,
+        success: null,
+        requesterId: row.requesterId,
+        issueNumber,
+        issueUrl: storedUrl(row.issueUrl),
+        retryCount: row.retryCount,
+        revision: { number: revision, prUrl: pr.value.url },
+      });
+      const surface = await placeCard(deps, inv, row, view, { forceNew: true });
+      if (surface === null) {
+        deps.repo.dropRevision(row.id, claimedVersion, inv.at);
+        return { kind: 'fail', error: errors.unavailable('discord', 'Check that the bot can still post in this channel, then try again.') };
+      }
+      deps.repo.recordSurface(row.id, surface, inv.at);
+
+      deps.ports.audit.record({
+        action: 'builder.revise',
+        actorId: inv.actor.userId,
+        guildId: row.guildId,
+        detail: { requestId: row.id, issueNumber, revision, prNumber: pr.value.number, fromState: row.state },
+      });
+
+      return {
+        kind: 'view',
+        view: {
+          accent: 'ok',
+          ephemeral: true,
+          nodes: [
+            {
+              kind: 'text',
+              md: md`Revision ${mdInlineCode(String(revision))} is written into the issue and waiting for an approver on a new card. Once approved, the agent pushes to the same pull request - nothing is built until then.`,
+            },
+          ],
+        },
+      };
+    },
+    async autocomplete(req): Promise<readonly AutocompleteChoice[]> {
+      return suggest(deps, req, (row) => row.state === 'pr_open' || (row.state === 'failed' && row.revisionCount > 0));
+    },
+  };
+}
+
+/** Which states may be revised, with a sentence for each that may not. */
+function revisableState(row: BuildRow): Result<void, AppError> {
+  if (row.state === 'pr_open') return Ok(undefined);
+  if (row.state === 'failed' && row.revisionCount > 0) return Ok(undefined);
+  if (row.state === 'failed') {
+    return Err(
+      errors.conflict('not_opened', 'That build failed before it opened a pull request, so there is nothing to revise.', 'Run /request retry to build it again.', 'failed'),
+    );
+  }
+  if (!isTerminalState(row.state)) {
+    return Err(
+      errors.conflict(
+        'not_finished',
+        `That request is "${stateLabel(row.state)}", so there is nothing to revise yet.`,
+        'Wait for it to finish, or withdraw it with /request cancel.',
+        row.state,
+      ),
+    );
+  }
+  return Err(
+    errors.conflict('no_pr', `That request is "${stateLabel(row.state)}" and has no pull request to revise.`, 'Open a new request with /request new.', row.state),
+  );
+}
+
 /**
  * Which terminal states may be retried, and - the part that matters - a DIFFERENT sentence for
  * each state that may not.
@@ -614,7 +922,7 @@ async function redispatch(
     // `retryCount + 1` because the row has already been bumped. The dead job from the previous
     // attempt may still be in `core_jobs` under the old key, and one live job per (module,
     // dedupeKey) would otherwise drop this enqueue on the floor.
-    dedupeKey: buildDedupeKey(row.id, attempt),
+    dedupeKey: buildDedupeKey(row.id, attempt, row.revisionCount),
   });
   if (!enqueued.ok) return { kind: 'fail', error: enqueued.error };
 

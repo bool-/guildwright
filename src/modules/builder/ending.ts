@@ -116,3 +116,60 @@ export function failureError(report: RunReport | null): AppError {
   }
   return fail('run_failed', 'The build failed before opening a pull request.', 'Open the run log to see what broke, then run /request retry.');
 }
+
+/**
+ * HOW A REVISION ENDED. A different question from `classifyEnding`, because the pull request
+ * already existed before the run started: "there is a PR" says nothing about whether this run
+ * changed it. What does is the workflow's `pushed` fact - the branch head moved - so that is
+ * what this turns on.
+ */
+export type RevisionEnding =
+  /** New commits are on the pull request. `complete` is false when the agent says it is not finished. */
+  | {
+      readonly kind: 'revised';
+      readonly pr: PrRef;
+      readonly complete: boolean;
+      readonly summary: string | null;
+      readonly remaining: string | null;
+    }
+  /** The agent declined the revision on purpose. The pull request is as it was. */
+  | { readonly kind: 'revision-refused'; readonly pr: PrRef; readonly reason: string | null }
+  /** The agent touched a forbidden path. The pull request must not be merged. */
+  | { readonly kind: 'blocked'; readonly pr: PrRef | null }
+  /** The pull request was closed or merged while the revision was waiting or building. */
+  | { readonly kind: 'pr-gone'; readonly pr: PrRef | null }
+  /** Nothing was pushed and the agent did not refuse: a setup failure, the turn limit, a crash. */
+  | { readonly kind: 'failed'; readonly error: AppError };
+
+export function classifyRevisionEnding(input: {
+  readonly pr: PrRef | null;
+  readonly report: RunReport | null;
+}): RevisionEnding {
+  const { pr, report } = input;
+  const agent = report?.agent ?? null;
+
+  if (report?.failedStep === 'forbidden_path') return { kind: 'blocked', pr };
+  if (pr === null || !pr.isOpen) return { kind: 'pr-gone', pr };
+  // A GUARD THAT FAILED BEFORE THE AGENT (approval, credentials, cap, setup) is that failure,
+  // whatever `pushed` says: the push fact is only meaningful for a run that reached the agent.
+  if (report !== null && report.failedStep !== null && report.failedStep !== 'agent') {
+    return { kind: 'failed', error: failureError(report) };
+  }
+
+  if (report?.pushed === true) {
+    const complete = agent?.status === 'done' && report.stop === 'success' && !pr.isDraft;
+    return { kind: 'revised', pr, complete, summary: said(agent?.summary), remaining: complete ? null : said(agent?.remaining) };
+  }
+  if (agent?.status === 'refused') return { kind: 'revision-refused', pr, reason: said(agent.remaining) ?? said(agent.summary) };
+  return { kind: 'failed', error: revisionFailureError(report) };
+}
+
+/** Why a revision changed nothing, in the requester's terms. Setup failures read as they always have. */
+export function revisionFailureError(report: RunReport | null): AppError {
+  if (report?.failedStep !== null && report?.failedStep !== undefined && report.failedStep !== 'agent') return failureError(report);
+  const fail = (code: string, detail: string): AppError =>
+    errors.conflict(code, detail, 'The pull request is unchanged. Run /request retry to run the same revision again, or /request revise to ask for something different.', 'failed');
+  if (turnLimitHit(report)) return fail('revision_turn_limit', `The agent used ${allTurns(report)} without pushing the revision.`);
+  if (report === null) return fail('revision_no_report', 'The revision run finished without reporting what it did.');
+  return fail('revision_not_pushed', 'The agent finished without pushing any change to the pull request.');
+}
