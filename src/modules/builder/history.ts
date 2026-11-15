@@ -84,6 +84,7 @@ import {
   retryingCard,
   revisionDroppedCard,
   approvalCard,
+  fundingOf,
   pingRequesterUnless,
   stateLabel,
   storedUrl,
@@ -102,7 +103,7 @@ import {
   type ReopensIssues,
   type RunCancelReport,
 } from '#modules/builder/ports';
-import { requireOwnCredentialsGate } from '#modules/builder/payer';
+import { canPay } from '#modules/builder/payer';
 import { deliverOutcome } from '#modules/builder/notify';
 
 /**
@@ -555,28 +556,16 @@ function retryCommand(deps: HistoryDeps): CommandSpec {
       const gated = await target.value.builds.verifyGates();
       if (!gated.ok) return { kind: 'fail', error: gated.error };
 
-      // NO FREE BUILDS, ON THE RETRY PATH TOO. This is the check that makes a retry a fresh
-      // request rather than a way around the gate: without it, one approved build that failed
-      // would be re-runnable forever by somebody who has since cleared their credentials.
-      //
-      // It asks about the ROW's requester, not the caller, because they are who pays - an
-      // approver retrying somebody else's build does not put it on their own key.
+      // NO FREE BUILDS, ON THE RETRY PATH TOO - and NO INHERITED SPONSOR. A retry is a new spend,
+      // and nobody's bill may grow from a Sponsor click made for an earlier build. So it asks
+      // about the ROW's requester (they pay, not the caller): if they can, a failed build is
+      // re-dispatched straight away on their credentials, as before; if they cannot, it goes back
+      // in front of an approver on a new card that asks for a sponsor, rather than being refused.
+      let requesterCanPay = true;
       if (deps.cfg.requireOwnCredentials) {
-        const gate = await requireOwnCredentialsGate(target.value.builds, row.requesterId);
-        if (!gate.ok) {
-          const mine = row.requesterId === inv.actor.userId;
-          return {
-            kind: 'fail',
-            error: mine
-              ? gate.error
-              : errors.conflict(
-                  'requester_credentials',
-                  'The person who asked for this has no build credentials stored, so nothing would pay for the retry.',
-                  'Ask them to run /credentials set, then retry it.',
-                  'requester',
-                ),
-          };
-        }
+        const can = await canPay(target.value.builds, row.requesterId);
+        if (!can.ok) return { kind: 'fail', error: can.error };
+        requesterCanPay = can.value;
       }
 
       // THE SLOT IS NOT CHECKED HERE ANY MORE, and its absence is the fix.
@@ -586,9 +575,9 @@ function retryCommand(deps: HistoryDeps): CommandSpec {
       // check-then-act shape that made the cap advisory. The claim now happens INSIDE the
       // guarded UPDATE that re-arms the row (`reopenForDispatch` / `reopenForApproval`), so the
       // count and the write are one statement and a loser is refused rather than admitted.
-      return row.state === 'failed'
+      return row.state === 'failed' && requesterCanPay
         ? redispatch(deps, inv, row, issueNumber)
-        : reArmForApproval(deps, inv, row, issueNumber);
+        : reArmForApproval(deps, inv, row, issueNumber, !requesterCanPay);
     },
     async autocomplete(req): Promise<readonly AutocompleteChoice[]> {
       return suggest(deps, req, (row) => row.state === 'failed' || row.state === 'expired');
@@ -657,7 +646,7 @@ function reviseCommand(deps: HistoryDeps): CommandSpec {
           error: errors.forbidden(
             'builder.request',
             'the person who opened it',
-            'Only the person who opened a request can revise it, because the revision runs on their credentials. Ask them to run /request revise.',
+            'Only the person who opened a request can revise it. Ask them to run /request revise.',
           ),
         };
       }
@@ -686,9 +675,13 @@ function reviseCommand(deps: HistoryDeps): CommandSpec {
       const gh = target.value;
       const gated = await gh.builds.verifyGates();
       if (!gated.ok) return { kind: 'fail', error: gated.error };
+      // WHO PAYS FOR THE REVISION: the requester if they can, else whoever sponsors it on the new
+      // card - a fresh click, never the sponsor of an earlier build.
+      let needsSponsor = false;
       if (deps.cfg.requireOwnCredentials) {
-        const gate = await requireOwnCredentialsGate(gh.builds, row.requesterId);
-        if (!gate.ok) return { kind: 'fail', error: gate.error };
+        const can = await canPay(gh.builds, row.requesterId);
+        if (!can.ok) return { kind: 'fail', error: can.error };
+        needsSponsor = !can.value;
       }
 
       // THE PULL REQUEST MUST STILL BE OPEN. A revision of a merged or closed PR would push commits
@@ -727,6 +720,7 @@ function reviseCommand(deps: HistoryDeps): CommandSpec {
         at: inv.at,
         maxConcurrent: deps.cfg.maxConcurrentPerGuild,
         nonce,
+        needsSponsor,
       });
       if (claimed !== 'claimed') {
         return {
@@ -759,6 +753,7 @@ function reviseCommand(deps: HistoryDeps): CommandSpec {
         issueUrl: storedUrl(row.issueUrl),
         retryCount: row.retryCount,
         revision: { number: revision, prUrl: pr.value.url },
+        ...fundingOf({ sponsorId: null, needsSponsor: needsSponsor ? 1 : 0 }),
       });
       const surface = await placeCard(deps, inv, row, view, { forceNew: true });
       if (surface === null) {
@@ -766,6 +761,8 @@ function reviseCommand(deps: HistoryDeps): CommandSpec {
         return { kind: 'fail', error: errors.unavailable('discord', 'Check that the bot can still post in this channel, then try again.') };
       }
       deps.repo.recordSurface(row.id, surface, inv.at);
+      // What this card shows, so a Sponsor click redraws the REVISION's words, not the original idea's.
+      deps.repo.recordCard(row.id, { excerpt: renderSafeMarkdown(quoted.md), excerptTruncated: quoted.truncated, kind: null, success: null, needsSponsor });
 
       deps.ports.audit.record({
         action: 'builder.revise',
@@ -963,7 +960,9 @@ async function reArmForApproval(
   inv: Invocation,
   row: BuildRow,
   issueNumber: number,
+  needsSponsor: boolean,
 ): Promise<Outcome> {
+  const fromState = row.state;
   const nonce = newCardNonce();
   const claimed = deps.repo.reopenForApproval({
     id: row.id,
@@ -972,6 +971,7 @@ async function reArmForApproval(
     at: inv.at,
     maxConcurrent: deps.cfg.maxConcurrentPerGuild,
     nonce,
+    needsSponsor,
   });
   if (claimed !== 'claimed') {
     return { kind: 'fail', error: claimRefusal(deps, row, claimed, 'where it is') };
@@ -1006,21 +1006,23 @@ async function reArmForApproval(
     // The stored title, re-scrubbed. It was sanitised before it was written; a column is a plain
     // string, so the round trip validates rather than launders.
     title: row.title === null ? md`_(no title recorded)_` : sanitizeStored(row.title),
-    // The body was never persisted - it lives in the GitHub issue, fenced. An approver reads it
-    // there, which is why the issue link is on the card.
-    excerpt: null,
-    // Neither is persisted on the row; both are in the issue (the kind as a label).
+    // The card's own excerpt, as stored when it was first drawn (migration 0007); a request filed
+    // before that has none, and the approver reads the full text on the issue as before.
+    excerpt: row.cardExcerpt === null ? null : { md: sanitizeStored(row.cardExcerpt), truncated: row.cardExcerptTruncated !== 0 },
     kind: null,
-    success: null,
+    success: row.cardSuccess === null ? null : sanitizeStored(row.cardSuccess),
     requesterId: row.requesterId,
     issueNumber,
     issueUrl: storedUrl(row.issueUrl),
     retryCount: row.retryCount + 1,
+    retryReason: fromState === 'failed' ? 'failed' : 'expired',
+    ...(row.revisionCount > 0 ? { revision: { number: row.revisionCount, prUrl: storedUrl(row.prUrl) } } : {}),
+    ...fundingOf({ sponsorId: null, needsSponsor: needsSponsor ? 1 : 0 }),
   });
 
   const surface = await placeCard(deps, inv, row, view, { forceNew: true });
   if (surface === null) {
-    deps.repo.finish(row.id, 'expired', inv.at);
+    deps.repo.finish(row.id, fromState === 'failed' ? 'failed' : 'expired', inv.at);
     return {
       kind: 'fail',
       error: errors.unavailable('discord', 'Check that the bot can still post in this channel, then try again.'),

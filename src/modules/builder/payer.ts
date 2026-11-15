@@ -285,3 +285,39 @@ export async function resolveBuildPayer(
   }
   return Ok(null);
 }
+
+/**
+ * CAN THIS PERSON PAY RIGHT NOW? The question sponsoring turns on: a requester who cannot is
+ * filed anyway and their card offers Sponsor; a Sponsor click from someone who cannot is refused.
+ *
+ * `Ok(false)` covers both "never brought a credential" and "brought one that is gone"; an
+ * environment GitHub would not let the bot read is the same fail-closed config error the gate
+ * raises, because "I cannot check" is not "they can pay".
+ */
+export async function canPay(builds: Pick<BuildsPort, 'environmentCredentials'>, userId: string): Promise<Result<boolean, AppError>> {
+  const own = await readOwnCredentials(builds, userId);
+  switch (own.kind) {
+    case 'has':
+      return Ok(true);
+    case 'empty':
+    case 'none':
+      return Ok(false);
+    case 'unreadable':
+      return Err(unverifiableCredentialsError(own.error));
+    default: {
+      const exhaustive: never = own;
+      void exhaustive;
+      return Ok(false);
+    }
+  }
+}
+
+/** The refusal for a sponsor whose credential disappeared between their click and the dispatch. */
+export function sponsorCredentialsGoneError(): AppError {
+  return errors.conflict(
+    'sponsor_credentials_gone',
+    "The sponsor's build credentials are no longer stored on GitHub, so nothing would pay for this build.",
+    'Ask the sponsor to run /credentials set, then run /request retry - or find a new sponsor on the retried card.',
+    'sponsor',
+  );
+}

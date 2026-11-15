@@ -39,12 +39,13 @@ import {
 import { assertActionRef, toUserId, type CardNonce, type RequestId } from '#core/ids';
 import type { ButtonSpec, LinkSpec, SurfaceRef, View, ViewNode } from '#core/view';
 import type { ActiveCounts, BuildRow, BuildState } from '#modules/builder/rows';
-import { kindLabel, type RequestKind } from '#modules/builder/kinds';
+import { REQUEST_KINDS, kindLabel, type RequestKind } from '#modules/builder/kinds';
 
 /** Action names, shared with the manifest so a button and its handler cannot drift. */
 export const REQUEST_FORM = 'request';
 export const APPROVE = 'approve';
 export const REJECT = 'reject';
+export const SPONSOR = 'sponsor';
 
 // ---------------------------------------------------------------------------------------
 // The ping
@@ -111,6 +112,29 @@ export function rejectButton(id: RequestId, nonce: CardNonce, disabled: boolean)
 }
 
 /**
+ * Sponsor, or - for the person already sponsoring - Withdraw. One action either way: the handler
+ * decides from the row which one the click means, so a stale label cannot change the outcome.
+ */
+export function sponsorButton(id: RequestId, nonce: CardNonce, withdraw: boolean): ButtonSpec {
+  return {
+    customId: assertActionRef({ moduleId: 'builder', action: SPONSOR, entityId: id, nonce }),
+    label: withdraw ? 'Withdraw sponsorship' : 'Sponsor',
+    style: withdraw ? 'secondary' : 'primary',
+    disabled: false,
+  };
+}
+
+/**
+ * Who pays, as the approval card shows it. Absent on a card whose requester pays for themselves,
+ * which keeps those cards exactly as they were.
+ */
+export type Funding =
+  /** Nobody can pay yet: the requester has no credentials and nobody has sponsored. */
+  | { readonly kind: 'needs-sponsor' }
+  /** Somebody clicked Sponsor; their credentials pay. */
+  | { readonly kind: 'sponsored'; readonly sponsorId: string };
+
+/**
  * A link row entry, or none.
  *
  * `HttpsUrl` is what `LinkSpec.url` demands, which is why a stored URL is re-proven by
@@ -167,8 +191,13 @@ export function approvalCard(input: {
   readonly retryCount: number;
   /** Present when this approval is for a `/request revise` of an open pull request. */
   readonly revision?: { readonly number: number; readonly prUrl: HttpsUrl | null };
+  /** Who pays, when it is not simply the requester. See `Funding`. */
+  readonly funding?: Funding;
+  /** Why a retried request is back on a card: it expired unapproved, or it failed and needs paying for again. */
+  readonly retryReason?: 'expired' | 'failed';
 }): View {
   const revision = input.revision;
+  const funding = input.funding;
   return {
     accent: 'pending',
     nodes: [
@@ -186,7 +215,7 @@ export function approvalCard(input: {
         : [
             {
               kind: 'text' as const,
-              md: md`This asks the agent to change the pull request it already opened. It is a new build on the requester's credentials, and the revision is written into the GitHub issue as its own section.`,
+              md: md`This asks the agent to change the pull request it already opened. It is a new build, and the revision is written into the GitHub issue as its own section.`,
             },
           ]),
       ...(revision !== undefined || input.retryCount === 0
@@ -194,14 +223,22 @@ export function approvalCard(input: {
         : [
             {
               kind: 'text' as const,
-              md: md`This request expired without a decision and was put back by ${mdInlineCode('/request retry')}. Nothing has been built and nothing has been charged.`,
+              md:
+                input.retryReason === 'failed'
+                  ? md`The last build failed and this was put back by ${mdInlineCode('/request retry')} so somebody can pay for another one.`
+                  : md`This request expired without a decision and was put back by ${mdInlineCode('/request retry')}. Nothing has been built and nothing has been charged.`,
             },
           ]),
+      ...fundingNodes(funding),
       { kind: 'text', md: md`An approver must approve this before anything is built.` },
       {
         kind: 'buttons',
         links: [...(revision === undefined ? [] : linkTo('Pull request', revision.prUrl)), ...linkTo('Issue', input.issueUrl)],
-        buttons: [approveButton(input.id, input.nonce, false), rejectButton(input.id, input.nonce, false)],
+        buttons: [
+          approveButton(input.id, input.nonce, false),
+          rejectButton(input.id, input.nonce, false),
+          ...(funding === undefined ? [] : [sponsorButton(input.id, input.nonce, funding.kind === 'sponsored')]),
+        ],
       },
     ],
   };
@@ -214,6 +251,21 @@ export function approvalCard(input: {
 export function issueRef(issueNumber: number, issueUrl: HttpsUrl | null): SafeMarkdown {
   const label = `#${String(issueNumber)}`;
   return issueUrl === null ? mdInlineCode(label) : mdLink(label, issueUrl);
+}
+
+/** The "Paid by" line, and for a request nobody pays for yet, how to fix that. */
+function fundingNodes(funding: Funding | undefined): readonly ViewNode[] {
+  if (funding === undefined) return [];
+  if (funding.kind === 'sponsored') {
+    return [{ kind: 'field', name: 'Paid by', md: md`${mdMention('user', funding.sponsorId)} (sponsor)` }];
+  }
+  return [
+    { kind: 'field', name: 'Paid by', md: md`Nobody yet - this needs a sponsor` },
+    {
+      kind: 'text',
+      md: md`The requester has no build credentials stored. Anyone who has run ${mdInlineCode('/credentials set')} can click **Sponsor** to pay for this build with their own; it cannot be approved until somebody does.`,
+    },
+  ];
 }
 
 /** The revision's own words, labelled as the change asked for rather than as the original idea. */
@@ -251,6 +303,8 @@ export function buildingCard(input: {
   readonly prUrl?: HttpsUrl | null;
   /** Set when this build is a `/request revise`. */
   readonly revision?: number;
+  /** Set when a sponsor is paying for this build. */
+  readonly sponsorId?: string;
 }): View {
   const prUrl = input.prUrl ?? null;
   return {
@@ -268,6 +322,7 @@ export function buildingCard(input: {
             ? md`Approved. This usually takes five to thirty minutes.`
             : md`Approved by ${mdMention('user', input.approverId)}. This usually takes five to thirty minutes.`,
       },
+      ...(input.sponsorId === undefined ? [] : [{ kind: 'field' as const, name: 'Paid by', md: md`${mdMention('user', input.sponsorId)} (sponsor)` }]),
       {
         kind: 'buttons',
         links: [...linkTo('Run log', input.runUrl), ...linkTo('Pull request', prUrl), ...linkTo('Issue', input.issueUrl)],
@@ -1064,4 +1119,36 @@ export function concurrencyError(active: ActiveCounts, approvalTtlMs: number): A
     `Wait for the build to finish, or ask an approver to clear the waiting ${active.waiting === 1 ? 'request' : 'requests'} - /request list all shows them and /request cancel withdraws one. Unapproved requests only clear themselves after ${hours} hours.`,
     'mixed',
   );
+}
+
+/**
+ * THE APPROVAL CARD, REDRAWN FROM THE ROW - what a Sponsor click, a withdrawal or an Approve that
+ * finds nobody able to pay puts back in front of people. Everything comes from columns, re-scrubbed
+ * on the way out (`sanitizeStored` is idempotent on what `recordCard` stored), and the nonce is
+ * the one the same statement just wrote, so the card drawn before the change is inert.
+ */
+export function approvalCardForRow(row: BuildRow, nonce: CardNonce): View | null {
+  if (row.issueNumber === null) return null;
+  const kind = (REQUEST_KINDS as readonly string[]).includes(row.cardKind ?? '') ? (row.cardKind as RequestKind) : null;
+  return approvalCard({
+    id: row.id,
+    nonce,
+    title: row.title === null ? md`_(no title recorded)_` : sanitizeStored(row.title),
+    excerpt: row.cardExcerpt === null ? null : { md: sanitizeStored(row.cardExcerpt), truncated: row.cardExcerptTruncated !== 0 },
+    kind,
+    success: row.cardSuccess === null ? null : sanitizeStored(row.cardSuccess),
+    requesterId: row.requesterId,
+    issueNumber: row.issueNumber,
+    issueUrl: storedUrl(row.issueUrl),
+    // The "put back by retry" sentence is for the moment of re-arming; a redraw does not repeat it.
+    retryCount: 0,
+    ...(row.revisionCount > 0 ? { revision: { number: row.revisionCount, prUrl: storedUrl(row.prUrl) } } : {}),
+    ...fundingOf(row),
+  });
+}
+
+/** The card's funding for a row: a sponsor, a request that needs one, or nothing to show. */
+export function fundingOf(row: Pick<BuildRow, 'sponsorId' | 'needsSponsor'>): { readonly funding?: Funding } {
+  if (row.sponsorId !== null) return { funding: { kind: 'sponsored', sponsorId: row.sponsorId } };
+  return row.needsSponsor !== 0 ? { funding: { kind: 'needs-sponsor' } } : {};
 }

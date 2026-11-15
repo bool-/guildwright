@@ -94,7 +94,9 @@ import {
   APPROVE,
   REJECT,
   REQUEST_FORM,
+  SPONSOR,
   approvalCard,
+  approvalCardForRow,
   approveButton,
   blockedCard,
   buildingCard,
@@ -132,7 +134,7 @@ import { classifyEnding, classifyRevisionEnding, failureError, noPrError } from 
 import { historyCommands } from '#modules/builder/history';
 import { isAgentStep, mayHavePr, progressKey, stepLabel } from '#modules/builder/progress';
 import { KIND_OPTIONS, REQUEST_KINDS, kindIssueLabel } from '#modules/builder/kinds';
-import { requireOwnCredentialsGate, resolveBuildPayer } from '#modules/builder/payer';
+import { canPay, ownCredentialsRequiredError, resolveBuildPayer, sponsorCredentialsGoneError } from '#modules/builder/payer';
 import {
   repositoryLabel,
   githubForGuild,
@@ -894,15 +896,16 @@ export default defineModule({
             const gated = await gh.builds.verifyGates();
             if (!gated.ok) return { kind: 'fail', error: gated.error };
 
-            // NO FREE BUILDS, REFUSED BEFORE ANYTHING IS FILED.
-            //
-            // WHY HERE and not at approve time: everything below this line files a GitHub issue
-            // and posts an Approve/Reject card. Refusing later would leave a permanent issue in
-            // the repository and a card demanding an approver's attention, both for a build that
-            // could never have run - litter that somebody has to clean up by hand.
+            // NO FREE BUILDS - BUT NO REFUSAL AT THE DOOR ANY MORE. A requester without build
+            // credentials is filed anyway, and their card offers Sponsor: somebody who has
+            // credentials pays, by their own click. Nothing is built until somebody can pay AND an
+            // approver approves; the Approve click refuses while nobody can. A credential the bot
+            // is not allowed to read still fails closed here, before anything is filed.
+            let needsSponsor = false;
             if (cfg.requireOwnCredentials) {
-              const gate = await requireOwnCredentialsGate(gh.builds, sub.actor.userId);
-              if (!gate.ok) return { kind: 'fail', error: gate.error };
+              const can = await canPay(gh.builds, sub.actor.userId);
+              if (!can.ok) return { kind: 'fail', error: can.error };
+              needsSponsor = !can.value;
             }
 
             // Redact THEIR secrets before the text reaches an issue, a log or an audit row.
@@ -1028,6 +1031,7 @@ export default defineModule({
                 issueNumber: issue.value.number,
                 issueUrl: issue.value.url,
                 retryCount: 0,
+                ...(needsSponsor ? { funding: { kind: 'needs-sponsor' as const } } : {}),
               }),
             );
             if (!posted.ok) {
@@ -1042,11 +1046,20 @@ export default defineModule({
             }
 
             repo.recordIssue(id, issue.value.number, issue.value.url, posted.value, sub.at);
+            // WHAT THE CARD SAID, so a Sponsor click can redraw it. Already sanitised: these are the
+            // exact strings the card above rendered.
+            repo.recordCard(id, {
+              excerpt: renderSafeMarkdown(excerpt.md),
+              excerptTruncated: excerpt.truncated,
+              kind: kind.value ?? null,
+              success: successGiven === undefined ? null : renderSafeMarkdown(toMarkdown(successGiven, { maxLength: cfg.requestExcerptLength }).md),
+              needsSponsor,
+            });
             ctx.ports.audit.record({
               action: 'builder.request',
               actorId: sub.actor.userId,
               guildId,
-              detail: { requestId: id, issueNumber: issue.value.number },
+              detail: { requestId: id, issueNumber: issue.value.number, needsSponsor },
             });
             return {
               kind: 'view',
@@ -1058,6 +1071,14 @@ export default defineModule({
                     kind: 'text',
                     md: md`Filed as issue ${mdInlineCode('#' + String(issue.value.number))}. An approver must approve it before anything is built, and you will be pinged on the card whichever way it goes. ${mdInlineCode('/request list')} shows where it got to.`,
                   },
+                  ...(needsSponsor
+                    ? [
+                        {
+                          kind: 'text' as const,
+                          md: md`You have no build credentials stored, so it needs a **sponsor**: anyone with credentials can click Sponsor on the card to pay for it. Or run ${mdInlineCode('/credentials set')} and sponsor it yourself.`,
+                        },
+                      ]
+                    : []),
                 ],
               },
             };
@@ -1100,6 +1121,54 @@ export default defineModule({
             // SC-8: separation of duty, IN ADDITION to the permission check.
             if (!cfg.allowSelfApproval && row.requesterId === click.actor.userId) {
               return { kind: 'fail', error: errors.forbiddenSelfApproval('builder.approve') };
+            }
+            // AND THE SPONSOR IS NOT THE APPROVER: otherwise one person could spend their own way
+            // past the approval gate on somebody else's request. Same switch as self-approval.
+            if (!cfg.allowSelfApproval && row.sponsorId === click.actor.userId) {
+              return {
+                kind: 'fail',
+                error: errors.conflict('sponsor_approval', 'You are sponsoring this build, so somebody else has to approve it.', 'Ask another approver.', 'sponsor'),
+              };
+            }
+            // SOMEBODY MUST BE ABLE TO PAY before anything is approved: the sponsor if there is one,
+            // else the requester. A requester who cannot (never could, or cleared their credential
+            // since filing) and no sponsor: the card is redrawn offering Sponsor, so the request is
+            // never stuck with nobody able to pay and no button to fix it.
+            if (cfg.requireOwnCredentials) {
+              const target = githubForRow(ctx.ports, row);
+              if (!target.ok) return { kind: 'fail', error: target.error };
+              const can = await canPay(target.value.builds, row.sponsorId ?? row.requesterId);
+              if (!can.ok) return { kind: 'fail', error: can.error };
+              if (!can.value) {
+                if (row.sponsorId !== null) {
+                  return {
+                    kind: 'fail',
+                    error: errors.conflict(
+                      'sponsor_cannot_pay',
+                      "The sponsor's build credentials are no longer stored on GitHub.",
+                      'Ask them to run /credentials set, or to withdraw so somebody else can sponsor.',
+                      'sponsor',
+                    ),
+                  };
+                }
+                if (row.needsSponsor === 0) {
+                  const offered = newCardNonce();
+                  if (repo.markNeedsSponsor({ id: id.value, expectVersion: row.version, nonce: offered, at: click.at })) {
+                    const redrawn = repo.get(id.value);
+                    const card = redrawn === undefined ? null : approvalCardForRow(redrawn, offered);
+                    if (card !== null) return { kind: 'view', view: card };
+                  }
+                }
+                return {
+                  kind: 'fail',
+                  error: errors.conflict(
+                    'needs_sponsor',
+                    'Nobody can pay for this build yet: the person who asked has no build credentials and nobody has sponsored it.',
+                    'Anyone with build credentials can click Sponsor on the card. Approve it after that.',
+                    'needs_sponsor',
+                  ),
+                };
+              }
             }
             const issueNumber = row.issueNumber;
             if (issueNumber === null) {
@@ -1160,6 +1229,7 @@ export default defineModule({
                 title: row.title,
                 approverId: click.actor.userId,
                 ...(row.revisionCount > 0 ? { revision: row.revisionCount, prUrl: storedUrl(row.prUrl) } : {}),
+                ...(row.sponsorId === null ? {} : { sponsorId: row.sponsorId }),
               }),
               job: {
                 type: 'build',
@@ -1171,6 +1241,88 @@ export default defineModule({
                 dedupeKey: buildDedupeKey(id.value, row.retryCount, row.revisionCount),
               },
             };
+          },
+        },
+        {
+          /**
+           * SPONSOR - or, for whoever is already sponsoring, WITHDRAW. One action, decided from
+           * the row rather than the button label, so a stale card cannot sponsor what it meant to
+           * withdraw. Only the clicker's own credentials can be put on the bill: there is no way
+           * to name somebody else as sponsor.
+           */
+          name: SPONSOR,
+          permission: ctx.perms.request,
+          limit: [limit.perUser(10, 60_000)],
+          needs: ['SendMessages'],
+          ack: 'defer-update',
+          idempotency: { kind: 'nonce-and-cas', staleMessage: 'That card has changed - use the current one.' },
+          async handle(click): Promise<Outcome> {
+            const id = toRequestId(click.ref.entityId);
+            if (!id.ok) return { kind: 'fail', error: id.error };
+            const row = repo.get(id.value);
+            if (row === undefined) return { kind: 'fail', error: errors.notFound('request', 'Open a new request.') };
+            if (row.state !== 'awaiting_approval') {
+              return { kind: 'fail', error: errors.conflict('state', 'That request is not waiting for approval any more.', 'Nothing more to do.', row.state) };
+            }
+            const stored = toCardNonce(row.nonce);
+            if (!stored.ok) return { kind: 'fail', error: stored.error };
+            if (stored.value !== click.ref.nonce) {
+              return { kind: 'fail', error: errors.conflict('stale_card', 'That card has been superseded.', 'Scroll down to the current card.') };
+            }
+            if (!cfg.requireOwnCredentials) {
+              return {
+                kind: 'fail',
+                error: errors.conflict('sponsor_off', 'Builds here are paid for by the server, so there is nothing to sponsor.', 'Ask an approver to approve it.', 'sponsor_off'),
+              };
+            }
+            const actor = click.actor.userId;
+            const nonce = newCardNonce();
+
+            // WITHDRAW: only the sponsor's own click, and only before approval (the state check above).
+            if (row.sponsorId === actor) {
+              if (!repo.setSponsor({ id: id.value, expectVersion: row.version, sponsorId: null, nonce, at: click.at })) {
+                return { kind: 'fail', error: errors.conflict('cas', 'That request changed a moment ago.', 'Use the current card.') };
+              }
+              ctx.ports.audit.record({
+                action: 'builder.sponsor.withdraw',
+                actorId: actor,
+                guildId: click.space.guildId,
+                detail: { requestId: id.value, issueNumber: row.issueNumber, requesterId: row.requesterId },
+              });
+              const after = repo.get(id.value);
+              const card = after === undefined ? null : approvalCardForRow(after, nonce);
+              return card === null ? { kind: 'silent' } : { kind: 'view', view: card };
+            }
+            if (row.sponsorId !== null) {
+              return { kind: 'fail', error: errors.conflict('already_sponsored', 'Somebody is already sponsoring this build.', 'Nothing more to do.', 'sponsored') };
+            }
+            if (row.needsSponsor === 0) {
+              return {
+                kind: 'fail',
+                error: errors.conflict('no_sponsor_needed', 'The person who asked for this pays for it with their own credentials.', 'Nothing to do.', 'self_funded'),
+              };
+            }
+
+            // THE CLICKER MUST BE ABLE TO PAY, read now rather than trusted: the dispatch reads it
+            // again, because a credential can be cleared between this click and the build.
+            const target = githubForRow(ctx.ports, row);
+            if (!target.ok) return { kind: 'fail', error: target.error };
+            const can = await canPay(target.value.builds, actor);
+            if (!can.ok) return { kind: 'fail', error: can.error };
+            if (!can.value) return { kind: 'fail', error: ownCredentialsRequiredError('none') };
+
+            if (!repo.setSponsor({ id: id.value, expectVersion: row.version, sponsorId: actor, nonce, at: click.at })) {
+              return { kind: 'fail', error: errors.conflict('cas', 'Somebody sponsored or approved this a moment before you did.', 'Use the current card.') };
+            }
+            ctx.ports.audit.record({
+              action: 'builder.sponsor',
+              actorId: actor,
+              guildId: click.space.guildId,
+              detail: { requestId: id.value, issueNumber: row.issueNumber, requesterId: row.requesterId, sponsorId: actor, repo: repositoryLabel(ctx.ports, row.repoKey) },
+            });
+            const after = repo.get(id.value);
+            const card = after === undefined ? null : approvalCardForRow(after, nonce);
+            return card === null ? { kind: 'silent' } : { kind: 'view', view: card };
           },
         },
         {
@@ -1293,6 +1445,7 @@ export default defineModule({
                 ...(progress === undefined ? {} : { progress }),
                 ...(prUrl === undefined ? {} : { prUrl }),
                 ...(row.revisionCount > 0 ? { revision: row.revisionCount } : {}),
+                ...(row.sponsorId === null ? {} : { sponsorId: row.sponsorId }),
               });
             const showRunLink = async (runUrl: HttpsUrl): Promise<void> => {
               const edited = await jctx.ports.discord.edit(surface.value, drawBuilding(runUrl, undefined, row.revisionCount > 0 ? storedUrl(row.prUrl) : undefined));
@@ -1453,13 +1606,18 @@ export default defineModule({
               // refused anyone without a credential, but that was minutes to days ago; a user
               // can run `/credentials clear`, or have a key revoked, between being filed and
               // being approved.
-              const payer = await resolveBuildPayer(gh.builds, row.requesterId, cfg.requireOwnCredentials);
+              //
+              // A SPONSOR PAYS WHEN THERE IS ONE - fixed at the Approve click, because the sponsor
+              // can only change while the row awaits approval. It is a sponsor only with
+              // `requireOwnCredentials` on (the Sponsor action refuses otherwise), so the shared
+              // environment is never reachable through somebody else's click.
+              const payerId = cfg.requireOwnCredentials && row.sponsorId !== null ? row.sponsorId : row.requesterId;
+              const payer = await resolveBuildPayer(gh.builds, payerId, cfg.requireOwnCredentials);
               if (!payer.ok) {
                 // A GitHub blip must not burn the request; only a real "no credentials" answer
                 // is terminal, and those two AppErrors are not retryable.
-                return payer.error.retryable
-                  ? retryAfter(payer.error, cfg.pollIntervalMs, 'could not read the build credentials')
-                  : { kind: 'failed', error: payer.error };
+                if (payer.error.retryable) return retryAfter(payer.error, cfg.pollIntervalMs, 'could not read the build credentials');
+                return { kind: 'failed', error: payerId !== row.requesterId && payer.error.kind === 'conflict' ? sponsorCredentialsGoneError() : payer.error };
               }
               // ONE derivation, used by both the MAC and the dispatch input below. They must be
               // byte-identical or the workflow's approval gate rejects every attempt.
@@ -1475,6 +1633,7 @@ export default defineModule({
                   requestId: p.value.id,
                   environmentName,
                   byo: payer.value !== null,
+                  sponsorId: payerId === row.requesterId ? null : payerId,
                   approvalId: approvalId.value,
                   repo: repoFullName(gh.repo),
                 },
@@ -2442,6 +2601,12 @@ function previewRow(state: BuildRow['state'], issueNumber: number): BuildRow {
     dispatchAttempts: 1,
     retryCount: 0,
     revisionCount: 0,
+    sponsorId: null,
+    needsSponsor: 0,
+    cardExcerpt: null,
+    cardExcerptTruncated: 0,
+    cardKind: null,
+    cardSuccess: null,
     succeededAt: null,
     approvalId: null,
     approvalIssuedAt: null,
@@ -2487,6 +2652,32 @@ function previewCards(): Readonly<Record<string, View>> {
       issueUrl: issue,
       retryCount: 0,
       revision: { number: 1, prUrl: pr },
+    }),
+    needsSponsor: approvalCard({
+      id,
+      nonce,
+      title: sanitizeStored('Add a /ping command'),
+      excerpt: { md: quoted.md, truncated: quoted.truncated },
+      kind: 'new-command',
+      success: null,
+      requesterId: PREVIEW_USER,
+      issueNumber: 42,
+      issueUrl: issue,
+      retryCount: 0,
+      funding: { kind: 'needs-sponsor' },
+    }),
+    sponsored: approvalCard({
+      id,
+      nonce,
+      title: sanitizeStored('Add a /ping command'),
+      excerpt: { md: quoted.md, truncated: quoted.truncated },
+      kind: 'new-command',
+      success: null,
+      requesterId: PREVIEW_USER,
+      issueNumber: 42,
+      issueUrl: issue,
+      retryCount: 0,
+      funding: { kind: 'sponsored', sponsorId: PREVIEW_USER },
     }),
     revised: revisedCard({ prUrl: pr, issueUrl: issue, mention: tell, revision: 1, complete: true, summary: 'Renamed the command to /pong.', remaining: null }),
     revisedUnfinished: revisedCard({ prUrl: pr, issueUrl: issue, mention: tell, revision: 2, complete: false, summary: 'Started the rename.', remaining: 'The help text.' }),

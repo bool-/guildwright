@@ -339,6 +339,7 @@ test('an EXPIRED request being put back in front of an approver faces the cap th
         at: NOW,
         maxConcurrent: 1,
         nonce: 'x'.repeat(8),
+        needsSponsor: false,
       }),
       'full',
       'waiting two days and retrying must not be a way past the cap either',

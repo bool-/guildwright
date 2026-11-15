@@ -384,7 +384,7 @@ test('PAYER READS THE ROW\'S REPOSITORY: a credential only in the guild\'s CURRE
   }
 });
 
-test('FRONT DOOR: a guild linked to events is refused when the requester\'s only credential is in main', async () => {
+test('FRONT DOOR: credentials are read in the LINKED repository - only one in main means events needs a sponsor', async () => {
   const l = links({ [GUILD]: 'events' });
   const h = harness({}, {}, {}, twoRepos(), l.mapping);
   try {
@@ -393,9 +393,12 @@ test('FRONT DOOR: a guild linked to events is refused when the requester\'s only
     events.builds.environments.delete(`user-${REQUESTER}`);
 
     const out = await requestForm(h).handle(submission());
-    assert.equal(out.kind, 'fail');
-    assert.equal(out.kind === 'fail' ? out.error.code : '', 'conflict.own_credentials_required');
-    assert.equal(events.issues.created.length + h.issues.created.length, 0, 'nothing filed');
+    assert.equal(out.kind, 'view', 'filed (sponsoring, 2.2), not refused');
+    assert.equal(events.issues.created.length, 1, 'filed in events, where the guild is linked');
+    assert.equal(h.issues.created.length, 0, 'and not in main, where the credential is');
+    const card = h.discord.posted.at(-1)?.view;
+    assert.ok(card?.nodes.some((n) => n.kind === 'field' && n.name === 'Paid by'), 'the card asks for a sponsor: the main credential does not pay in events');
+    assert.equal(events.builds.dispatched.length + h.dispatched.length, 0, 'nothing dispatched anywhere');
   } finally {
     h.close();
   }
