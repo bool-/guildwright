@@ -30,6 +30,7 @@ import type {
   LoggerPort,
   PortRegistry,
   PrRef,
+  RunProgress,
   RunReport,
   LogLevel,
   SecretName,
@@ -532,6 +533,10 @@ export interface FakeBuilds extends BuildsPort {
   report: RunReport | null;
   /** What `findPrForBranch` answers, read at call time. Null by default: no pull request. */
   pr: PrRef | null;
+  /** What `runProgress` answers, read at call time. Null by default: no step started yet. */
+  progress: Result<RunProgress | null, AppError>;
+  /** How many times `runProgress` was asked. */
+  progressReads: number;
   /**
    * What `verifyGates` answers, read at call time. `Ok` by default: the gate files match.
    * Assign an `Err` (a non-retryable config error for drift, a retryable one for "could not
@@ -567,6 +572,8 @@ export function fakeBuilds(): FakeBuilds {
     runsToday: 0,
     report: null,
     pr: null,
+    progress: Ok(null),
+    progressReads: 0,
     gateAnswer: Ok(undefined),
     gateChecks: 0,
     async verifyGates() {
@@ -602,6 +609,10 @@ export function fakeBuilds(): FakeBuilds {
     },
     async findRunReport() {
       return Ok(builds.report);
+    },
+    async runProgress() {
+      builds.progressReads += 1;
+      return builds.progress;
     },
     async findPrForBranch() {
       return Ok(builds.pr);

@@ -32,6 +32,7 @@ import {
   toSlug,
   userTextForTest,
   LOG_PREVIEW_MAX,
+  mdTimestamp,
 } from '#core/text';
 import { newFenceNonce } from '#core/ids';
 
@@ -212,4 +213,11 @@ test('mdLink builds a markdown link that neither the label nor the url can break
   assert.ok(tricky.ok);
   if (!tricky.ok) return;
   assert.equal(renderSafeMarkdown(mdLink('x](https://evil.example)[y', tricky.value)), '[x(https://evil.example)y](https://example.com/a_%28b%29)');
+});
+
+test('mdTimestamp is digits only: a Discord timestamp the client keeps live, or nothing', () => {
+  assert.equal(renderSafeMarkdown(mdTimestamp(1_700_000_000_999)), '<t:1700000000:R>');
+  assert.equal(renderSafeMarkdown(mdTimestamp(1_700_000_000_000, 'f')), '<t:1700000000:f>');
+  assert.equal(renderSafeMarkdown(mdTimestamp(Number.NaN)), '');
+  assert.equal(renderSafeMarkdown(mdTimestamp(-1)), '');
 });

@@ -20,6 +20,7 @@ import {
   matchPrForBranch,
   matchRunByName,
   parseRunReport,
+  toRunProgress,
   toBuildCredentials,
   toRunStatus,
   type PullSummary,
@@ -1008,4 +1009,34 @@ test('only the workflow token\'s comments count - anyone can type the marker on 
   assert.ok(r.ok);
   if (!r.ok) return;
   assert.equal(r.value?.failedStep, 'forbidden_path', 'the later, forged comment is ignored');
+});
+
+// ---------------------------------------------------------------------------------------
+// runProgress - which step a run is on
+// ---------------------------------------------------------------------------------------
+
+function jobs(steps: readonly { readonly name: string; readonly status: string; readonly number: number; readonly started_at?: string | null }[], status = 'in_progress') {
+  return { total_count: 1, jobs: [{ status, steps }] };
+}
+
+test('toRunProgress names the step in progress, its position, and when it started', () => {
+  const p = toRunProgress(
+    jobs([
+      { name: 'Set up job', status: 'completed', number: 1 },
+      { name: 'Validate dispatch inputs', status: 'completed', number: 2 },
+      { name: 'Implement with Claude Code', status: 'in_progress', number: 3, started_at: '2026-11-15T01:00:00Z' },
+      { name: 'Post the run report', status: 'queued', number: 4 },
+    ]),
+  );
+  assert.deepEqual(p, { stepNumber: 3, totalSteps: 4, stepName: 'Implement with Claude Code', stepStartedAtMs: Date.parse('2026-11-15T01:00:00Z') });
+});
+
+test('toRunProgress falls back to the last finished step, and is null before any step or on a bad shape', () => {
+  const done = toRunProgress(jobs([{ name: 'a', status: 'completed', number: 1 }, { name: 'b', status: 'completed', number: 2 }, { name: 'c', status: 'queued', number: 3 }]));
+  assert.equal(done?.stepName, 'b');
+  assert.equal(done?.stepStartedAtMs, null, 'no started_at is null, never NaN');
+  assert.equal(toRunProgress(jobs([], 'queued')), null);
+  assert.equal(toRunProgress({ jobs: [{ status: 'queued' }] }), null);
+  assert.equal(toRunProgress({ nope: true }), null);
+  assert.equal(toRunProgress(jobs([{ name: 'x'.repeat(500), status: 'in_progress', number: 1 }]))?.stepName.length, 120, 'a step name is capped');
 });

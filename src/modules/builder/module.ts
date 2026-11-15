@@ -123,12 +123,14 @@ import {
   storedUrl,
   surfaceOf,
   ttlHours,
+  type BuildingProgress,
   type Mention,
   type RequestExcerpt,
 } from '#modules/builder/cards';
 import { deliverOutcome } from '#modules/builder/notify';
 import { classifyEnding, classifyRevisionEnding, failureError, noPrError } from '#modules/builder/ending';
 import { historyCommands } from '#modules/builder/history';
+import { isAgentStep, mayHavePr, progressKey, stepLabel } from '#modules/builder/progress';
 import { KIND_OPTIONS, REQUEST_KINDS, kindIssueLabel } from '#modules/builder/kinds';
 import { requireOwnCredentialsGate, resolveBuildPayer } from '#modules/builder/payer';
 import {
@@ -719,6 +721,14 @@ export default defineModule({
      * today's.
      */
     const runsCounted = new Map<string, { readonly day: number; readonly used: number }>();
+
+    /**
+     * LIVE PROGRESS, per request: the last progress key drawn on its card, and a pull request the
+     * poller found mid-run. In memory on purpose - losing them on a restart costs one extra card
+     * edit, and persisting a cosmetic would mean a migration for nothing.
+     */
+    const progressShown = new Map<string, string>();
+    const progressPrs = new Map<string, HttpsUrl>();
     const runsTodayIn = (key: string): number | null => {
       const seen = runsCounted.get(key);
       return seen !== undefined && seen.day === startOfUtcDay(ctx.ports.clock.now()) ? seen.used : null;
@@ -1149,6 +1159,7 @@ export default defineModule({
                 runUrl: null,
                 title: row.title,
                 approverId: click.actor.userId,
+                ...(row.revisionCount > 0 ? { revision: row.revisionCount, prUrl: storedUrl(row.prUrl) } : {}),
               }),
               job: {
                 type: 'build',
@@ -1272,19 +1283,60 @@ export default defineModule({
             // run did; re-draw it as soon as the run is known so the person waiting can watch.
             // Best-effort: a failed edit costs a link, never the build, so it is logged and
             // the job carries on.
+            const drawBuilding = (runUrl: HttpsUrl | null, progress?: BuildingProgress, prUrl?: HttpsUrl | null): View =>
+              buildingCard({
+                issueNumber: p.value.issueNumber,
+                issueUrl: storedUrl(row.issueUrl),
+                runUrl,
+                title: row.title,
+                approverId: p.value.approverId,
+                ...(progress === undefined ? {} : { progress }),
+                ...(prUrl === undefined ? {} : { prUrl }),
+                ...(row.revisionCount > 0 ? { revision: row.revisionCount } : {}),
+              });
             const showRunLink = async (runUrl: HttpsUrl): Promise<void> => {
-              const edited = await jctx.ports.discord.edit(
-                surface.value,
-                buildingCard({
-                  issueNumber: p.value.issueNumber,
-                  issueUrl: storedUrl(row.issueUrl),
-                  runUrl,
-                  title: row.title,
-                  approverId: p.value.approverId,
-                }),
-              );
+              const edited = await jctx.ports.discord.edit(surface.value, drawBuilding(runUrl, undefined, row.revisionCount > 0 ? storedUrl(row.prUrl) : undefined));
               if (!edited.ok) {
                 jctx.logger.warn('could not add the run link to the card', { requestId: p.value.id, code: edited.error.code });
+              }
+            };
+
+            // LIVE PROGRESS (see `progress.ts`). Cosmetic from end to end: an absent method, a
+            // failed read or a failed edit draws nothing and changes nothing about the build, so
+            // none of them returns early or retries. The card is redrawn only when the step - or
+            // the pull request found while the agent works - changes.
+            const showProgress = async (builds: Pick<BuildsPort, 'runProgress' | 'findPrForBranch'>, runId: number, runUrl: HttpsUrl | null): Promise<void> => {
+              if (builds.runProgress === undefined) return;
+              const read = await builds.runProgress(runId);
+              if (!read.ok || read.value === null) return;
+              const progress = read.value;
+              let prUrl: HttpsUrl | null = storedUrl(row.prUrl) ?? progressPrs.get(p.value.id) ?? null;
+              if (prUrl === null && mayHavePr(progress.stepName)) {
+                const pr = await builds.findPrForBranch(agentBranchName(p.value.id));
+                if (pr.ok && pr.value !== null && pr.value.isOpen) {
+                  prUrl = pr.value.url;
+                  progressPrs.set(p.value.id, prUrl);
+                }
+              }
+              const key = progressKey(progress, prUrl);
+              if (progressShown.get(p.value.id) === key) return;
+              const edited = await jctx.ports.discord.edit(
+                surface.value,
+                drawBuilding(
+                  runUrl,
+                  {
+                    stepNumber: progress.stepNumber,
+                    totalSteps: progress.totalSteps,
+                    label: stepLabel(progress.stepName),
+                    startedAtMs: progress.stepStartedAtMs,
+                  },
+                  prUrl,
+                ),
+              );
+              if (edited.ok) {
+                progressShown.set(p.value.id, key);
+              } else {
+                jctx.logger.debug('could not draw build progress', { requestId: p.value.id, code: edited.error.code, agent: isAgentStep(progress.stepName) });
               }
             };
 
@@ -1543,6 +1595,7 @@ export default defineModule({
             switch (status.value.kind) {
               case 'queued':
               case 'in-progress':
+                await showProgress(gh.builds, row.runId, seenRunUrl ?? storedUrl(row.runUrl));
                 return { kind: 'retry', afterMs: cfg.pollIntervalMs, why: 'still building' };
               case 'success':
               case 'failure': {
@@ -2441,6 +2494,16 @@ function previewCards(): Readonly<Record<string, View>> {
     revisionPrGone: revisionPrGoneCard(pr, issue, run, tell),
     revisionDropped: revisionDroppedCard({ revision: 1, why: 'rejected', prUrl: pr, issueUrl: issue, mention: tell, runNote: null }),
     building: buildingCard({ issueNumber: 42, issueUrl: issue, runUrl: run, title: 'Add a /ping command', approverId: PREVIEW_USER }),
+    buildingProgress: buildingCard({
+      issueNumber: 42,
+      issueUrl: issue,
+      runUrl: run,
+      title: 'Add a /ping command',
+      approverId: PREVIEW_USER,
+      progress: { stepNumber: 14, totalSteps: 22, label: 'Agent is writing code', startedAtMs: 1_700_000_000_000 },
+      prUrl: pr,
+      revision: 1,
+    }),
     retrying: retryingCard(42, 1, issue),
     capped: capWaitingCard({ issueNumber: 42, used: 4, cap: 4, waitMs: 5 * 3_600_000, issueUrl: issue }),
     opened: openedCard(pr, issue, tell, 'Added a /remind command that pings you after a delay.'),

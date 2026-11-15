@@ -209,6 +209,18 @@ export function mdLink(label: string, url: HttpsUrl): SafeMarkdown {
   return { [MD]: `[${text}](${target})` };
 }
 
+/**
+ * A Discord timestamp, e.g. `<t:1700000000:R>`, which the client renders in the reader's own
+ * timezone and - for `R` - keeps counting ("4 minutes ago") without the message being edited.
+ *
+ * WHY it takes a number: the markup is built from an integer this process computed, never from
+ * text, so nothing but digits can reach it. A non-finite or negative value renders as nothing.
+ */
+export function mdTimestamp(epochMs: number, style: 'R' | 't' | 'f' = 'R'): SafeMarkdown {
+  if (!Number.isFinite(epochMs) || epochMs < 0) return { [MD]: '' };
+  return { [MD]: `<t:${String(Math.floor(epochMs / 1000))}:${style}>` };
+}
+
 /** Fenced code block. `lang` is restricted so it cannot carry attributes or a newline. */
 export function mdCode(s: string, lang = ''): SafeMarkdown {
   const tag = /^[a-z0-9]{0,12}$/u.test(lang) ? lang : '';
