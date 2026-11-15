@@ -544,3 +544,23 @@ and neutralises `untrusted_`, because a reviser has seen the nonce on their own 
   click, so a repository writer who edits the body in between gets their edit signed. Revisions
   inherit this. A forged `build-revision` marker added that way can only flip a new build into
   revise mode, which then fails at the branch step because no open PR exists.
+
+## Sponsored builds
+
+An adversarial review found no way to charge somebody who did not click Sponsor and no path to
+`ai-agent` with `requireOwnCredentials` on. It found, and this release fixes: Sponsor/Withdraw
+resetting the expiry clock (a slot held forever by clicking every 47 hours); a requester who
+stored a credential after filing being charged by an approval on a card that said nobody pays; a
+retry of a sponsored build re-dispatching onto the requester; a sponsor whose credential vanished
+blocking the request; and a dispatch pass spending a stale snapshot after the row moved under it.
+
+### Open - low
+
+- **A failed card edit after a Sponsor click strands the buttons.** The click rotates the card
+  nonce in the same statement as the change, so if Discord then refuses the redraw, the card still
+  on screen carries the old nonce and every button on it is refused as superseded. The router logs
+  the failed edit; the request recovers only by expiry or `/request cancel`.
+- **"Nothing has been built and nothing has been charged"** on a re-approval card is wrong for a
+  request that failed, was put back, expired, and is retried again: `retryReason` sees only the
+  state it was put back from.
+- The redraw normalises text (NFKC), so a truncated excerpt's `…` becomes `...`.

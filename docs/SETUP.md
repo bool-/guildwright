@@ -17,10 +17,11 @@ altogether, the bot now refuses to start and says so.
 
 **2. Nothing in `.env` pays for a build.** The Anthropic credential is not an operator setting.
 Every person who wants to use `/request new` — **including you** — runs `/credentials set` in
-Discord first, and their own key funds their own builds. There is no owner bypass. A fresh install
-where nobody has done that has a working bot that refuses every request, with a message telling the
-person exactly what to run. Section 7 is the walkthrough; section 5c is what the shared `ai-agent`
-environment is still for.
+Discord first, and their own key funds their own builds - or somebody who has done it clicks
+**Sponsor** on their request and pays for it instead. There is no owner bypass. On a fresh install
+where nobody has stored a credential, requests are filed but nothing can be approved until somebody
+can pay. Section 7 is the walkthrough; section 5c is what the shared `ai-agent` environment is still
+for.
 
 > The bot needs **no privileged intent**. `/request new` is a slash command, and slash commands and
 > modal submissions arrive as interactions, so the bot never asks to read your server's messages.
@@ -290,10 +291,11 @@ agent step, and the run report says `failed_step: agent`.
 
 `modules.builder.requireOwnCredentials` defaults to `true`. With it on:
 
-- every requester funds their own build from the credential they stored with `/credentials set`;
-- the shared `ai-agent` environment is **unreachable from a user request** — the bot refuses at
-  `/request new` and refuses again at dispatch, so a credential cleared in between still cannot
-  reach it;
+- every build is funded by a person's own credential stored with `/credentials set`: the
+  requester's, or a **sponsor's** - somebody who clicked Sponsor on the request's card;
+- the shared `ai-agent` environment is **unreachable from a user request** — the Approve click
+  refuses while nobody can pay, and the dispatch checks again, so a credential cleared in between
+  still cannot reach it;
 - you create **no** environment by hand: each `user-<discord id>` environment is created by the
   bot the first time that person runs `/credentials set`.
 
@@ -503,25 +505,31 @@ A **modal** opens with one field. Paste either credential shape from section 5c 
 reply is ephemeral and names only *which* secret was stored, because the bot cannot read the value
 back.
 
-**Do this before `/request new`, including for your own account.** With
-`modules.builder.requireOwnCredentials` at its default of `true`, `/request new` is refused for
-anyone who has stored nothing, and there is deliberately **no owner bypass** — "no free builds"
-with a silent exemption for whoever holds the bot token is not the rule it claims to be, and the
-exemption would be discovered in a bill.
+**Do this to pay for your own builds, including for your own account.** With
+`modules.builder.requireOwnCredentials` at its default of `true`, every build runs on somebody's own
+credential, and there is deliberately **no owner bypass** — "no free builds" with a silent exemption
+for whoever holds the bot token is not the rule it claims to be, and the exemption would be
+discovered in a bill.
 
-If you skip it, this is what you get, privately, and nothing is filed:
+If you have stored nothing, `/request new` still files your request, but its card says **Paid by:
+Nobody yet - this needs a sponsor** and carries a **Sponsor** button. It cannot be approved until
+somebody can pay.
 
-```
-Builds here run on your own Anthropic credentials, and you have not stored any.
-Run /credentials set and paste either an Anthropic API key (sk-ant-api...) from
-console.anthropic.com, or a Claude Code OAuth token (sk-ant-oat...) from running
-`claude setup-token`.
-```
+### Sponsoring somebody else's request
 
-That refusal happens at **modal submit**, before any GitHub issue is filed and before any card is
-posted — so a refused request leaves nothing behind for anyone to clean up. The cost is that you
-find out after typing your request rather than before the dialog opens; `/request new` opens a
-modal and Discord forbids doing any work before showing one.
+Anyone who has stored a credential can click **Sponsor** on a card that needs one; that includes
+the requester, after running `/credentials set`. The build is then paid from the sponsor's own
+credential, and the card says so. The rules:
+
+- **Only your own click puts a build on your bill.** Nobody can name you as a sponsor.
+- **Sponsoring is not approving.** An approver still has to click Approve, and the sponsor cannot be
+  that approver unless `allowSelfApproval` is on.
+- **The sponsor can withdraw** (the same button reads "Withdraw sponsorship") until it is approved.
+- **Each build is sponsored once.** A retry, a revision, or an expired request put back loses its
+  sponsor: the requester pays if they can, and otherwise the new card asks for a sponsor again.
+- A card offers Sponsor only when the requester cannot pay. If a requester clears their credential
+  after filing, the Approve click redraws the card with a Sponsor button instead of approving.
+- With `requireOwnCredentials` off, the server pays and there is nothing to sponsor.
 
 ### Then: file a request
 

@@ -31,7 +31,7 @@ import type { FormHandlerSpec, FormSubmission, InstalledModule, Outcome, Progres
 import type { FormValues } from '#core/args';
 import { createEventBus } from '#core/events';
 import { errors, userMessage } from '#core/errors';
-import { buildEnvironmentName, toEnum, userTextForTest } from '#core/text';
+import { buildEnvironmentName, renderSafeMarkdown, toEnum, userTextForTest } from '#core/text';
 import { newCardNonce, newRequestId, toChannelId, toGuildId, toUserId, type ChannelId, type GuildId, type UserId } from '#core/ids';
 import type { SurfaceRef } from '#core/view';
 import type { BuildsPort, IssuesPort } from '#core/ports';
@@ -197,42 +197,55 @@ function failure(outcome: Outcome): string {
 // The refusal, and the absence of litter
 // ---------------------------------------------------------------------------------------
 
-test('a requester with no credential is refused, and NOTHING is filed', async () => {
+/** Every heading and field of the card the bot posted, joined, for asserting on what it says. */
+function postedCardText(h: Harness): string {
+  const card = h.discord.posted.at(-1)?.view;
+  assert.ok(card !== undefined, 'the approval card was posted');
+  if (card === undefined) return '';
+  return card.nodes
+    .map((n) => (n.kind === 'heading' ? n.text : n.kind === 'field' ? `${n.name}: ${renderSafeMarkdown(n.md)}` : n.kind === 'text' ? renderSafeMarkdown(n.md) : n.kind === 'buttons' ? n.buttons.map((b) => b.label).join(' ') : ''))
+    .join('\n');
+}
+
+test('a requester with no credential is FILED, and the card asks for a sponsor instead of refusing', async () => {
+  // SPONSORING (2.2): filing costs nothing, so a request is never refused at the door for want of
+  // credentials. What spends is a dispatch, and nothing dispatches until somebody can pay AND an
+  // approver approves.
   const h = harness();
 
   const outcome = await h.form.handle(submission(REQUESTER));
 
-  assert.equal(outcome.kind, 'fail', 'a build nobody can pay for must not be accepted');
-  assert.deepEqual(
-    litter(h),
-    { issues: 0, cards: 0, writes: [] },
-    'no issue, no approval card and no row: refusing later is what leaves all three behind',
-  );
+  assert.equal(outcome.kind, 'view', 'filed, not refused');
+  assert.equal(h.issues.created.length, 1, 'the issue is filed');
+  const card = postedCardText(h);
+  assert.match(card, /Paid by: Nobody yet - this needs a sponsor/u);
+  assert.match(card, /\bSponsor\b/u, 'the card carries a Sponsor button');
+  assert.equal(h.builds.dispatched.length, 0, 'and nothing is built');
 });
 
-test('the requester is told exactly what to do, and told it privately', async () => {
-  // A refusal with no instructions is the dead end `AppError.nextStep` exists to forbid, and a
-  // refusal in public is a spend policy announced in someone else's channel.
+test('the requester is told, privately, that it needs a sponsor and how to sponsor it themselves', async () => {
   const h = harness();
 
-  const message = failure(await h.form.handle(submission(REQUESTER)));
+  const outcome = await h.form.handle(submission(REQUESTER));
 
-  assert.match(message, /\/credentials set/u, 'the command to run');
-  assert.match(message, /sk-ant-api/u, 'the API key shape');
-  assert.match(message, /console\.anthropic\.com/u, 'and where an API key comes from');
-  assert.match(message, /sk-ant-oat/u, 'the OAuth token shape');
-  assert.match(message, /claude setup-token/u, 'and how to mint one');
-  assert.ok(message.includes(CREDENTIALS_NEXT_STEP), 'the same sentence the dispatch check uses');
-
-  assert.equal(h.form.ack, 'defer-ephemeral', 'so the refusal is visible only to the person who must act on it');
+  assert.equal(outcome.kind, 'view');
+  if (outcome.kind !== 'view') return;
+  assert.equal(outcome.view.ephemeral, true, 'the reply is the requester\'s business, not the channel\'s');
+  const said = outcome.view.nodes.map((n) => (n.kind === 'text' ? renderSafeMarkdown(n.md) : '')).join(' ');
+  assert.match(said, /needs a \*\*sponsor\*\*/u);
+  assert.match(said, /\/credentials set/u, 'and the command that lets them pay for it themselves');
+  // The full credential instructions still exist for the place a person is refused: a Sponsor
+  // click from somebody with nothing stored.
+  assert.match(CREDENTIALS_NEXT_STEP, /sk-ant-api.*sk-ant-oat/su);
+  assert.equal(h.form.ack, 'defer-ephemeral');
 });
 
 test('the gate is ON when an operator configures nothing at all', async () => {
   // The product decision lives in a zod default, so it is asserted through the real config parse
   // rather than by reading the schema. An install with `{}` must already be closed.
   const h = harness({});
-  const outcome = await h.form.handle(submission(REQUESTER));
-  assert.equal(outcome.kind, 'fail', 'default-open would subsidise every stranger on day one');
+  await h.form.handle(submission(REQUESTER));
+  assert.match(postedCardText(h), /needs a sponsor/u, 'default-open would subsidise every stranger on day one');
 
   const health = await h.installed.health();
   assert.match(health.detail, /own build/u, 'and /status says which way the money flows');
@@ -243,10 +256,10 @@ test('THE OPERATOR IS NOT EXEMPT: an app owner with no credential is refused too
   // bypass is one line, would be invisible in review, and would be discovered by a bill.
   const h = harness();
 
-  const outcome = await h.form.handle(submission(REQUESTER, { isAppOwner: true }));
+  await h.form.handle(submission(REQUESTER, { isAppOwner: true }));
 
-  assert.equal(outcome.kind, 'fail', 'the person holding the token pays like everybody else');
-  assert.deepEqual(litter(h), { issues: 0, cards: 0, writes: [] });
+  assert.match(postedCardText(h), /needs a sponsor/u, 'the person holding the token pays like everybody else');
+  assert.equal(h.builds.dispatched.length, 0);
 });
 
 test('no owner bypass exists to be reached: the module never reads isAppOwner', async () => {
@@ -286,17 +299,16 @@ test('an API key funds a request exactly as much as a subscription token', async
   assert.equal(h.issues.created.length, 1);
 });
 
-test('an EMPTY environment is refused at the door, not accepted and failed later', async () => {
+test('an EMPTY environment is "cannot pay" too: filed, and the card asks for a sponsor', async () => {
   // `/credentials clear` deletes the environment; a revoked or hand-deleted secret leaves it
-  // present and empty. Both mean "cannot pay", and only the sentence differs.
+  // present and empty. Both mean "cannot pay".
   const h = harness();
   h.builds.environments.set(buildEnvironmentName(REQUESTER), []);
 
-  const message = failure(await h.form.handle(submission(REQUESTER)));
+  const outcome = await h.form.handle(submission(REQUESTER));
 
-  assert.match(message, /no longer stored/u, 'the diagnosis names what actually happened');
-  assert.match(message, /\/credentials set/u, 'and the fix is still the same command');
-  assert.deepEqual(litter(h), { issues: 0, cards: 0, writes: [] });
+  assert.equal(outcome.kind, 'view');
+  assert.match(postedCardText(h), /needs a sponsor/u);
 });
 
 test('a GitHub outage does not read as "you have no credentials"', async () => {

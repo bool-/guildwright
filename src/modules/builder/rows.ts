@@ -96,6 +96,18 @@ export interface BuildRow {
    * is also the third part of the job dedupe key - see `buildDedupeKey`.
    */
   readonly revisionCount: number;
+  /**
+   * WHO PAYS when it is not the requester (migration 0007): set only by that person's own Sponsor
+   * click, cleared on every re-arm. Null: the requester pays.
+   */
+  readonly sponsorId: string | null;
+  /** 1 when the card offers sponsoring - the requester had no credentials when it was armed. */
+  readonly needsSponsor: number;
+  /** What the approval card showed, already sanitised, so a Sponsor click can redraw it. */
+  readonly cardExcerpt: string | null;
+  readonly cardExcerptTruncated: number;
+  readonly cardKind: string | null;
+  readonly cardSuccess: string | null;
   /** When the poller FIRST saw this run finish successfully; null until then. It is what
    *  separates "the PR has not appeared yet" from "the agent refused, so there is no PR". */
   readonly succeededAt: number | null;
@@ -125,7 +137,20 @@ export interface BuildRow {
  */
 export type NewBuildRow = Omit<
   BuildRow,
-  'createdAt' | 'updatedAt' | 'prUrl' | 'retryCount' | 'revisionCount' | 'approvalId' | 'approvalIssuedAt' | 'firstDispatchAt'
+  | 'createdAt'
+  | 'updatedAt'
+  | 'prUrl'
+  | 'retryCount'
+  | 'revisionCount'
+  | 'sponsorId'
+  | 'needsSponsor'
+  | 'cardExcerpt'
+  | 'cardExcerptTruncated'
+  | 'cardKind'
+  | 'cardSuccess'
+  | 'approvalId'
+  | 'approvalIssuedAt'
+  | 'firstDispatchAt'
 >;
 
 /**
@@ -372,7 +397,7 @@ export interface BuildRepo {
    *
    * The slot is claimed in this statement too, for the reason given on `reopenForDispatch`.
    */
-  reopenForApproval(claim: SlotReopen & { readonly nonce: string }): SlotClaim;
+  reopenForApproval(claim: SlotReopen & { readonly nonce: string; readonly needsSponsor: boolean }): SlotClaim;
   /**
    * RE-ARM A REQUEST WHOSE PULL REQUEST IS OPEN FOR A REVISION, back in front of an approver.
    *
@@ -386,13 +411,26 @@ export interface BuildRepo {
    * retry clears them. `retry_count` is NOT raised - that bounds re-running the same request,
    * and `revision_count` bounds this.
    */
-  reopenForRevision(claim: SlotReopen & { readonly nonce: string }): SlotClaim;
+  reopenForRevision(claim: SlotReopen & { readonly nonce: string; readonly needsSponsor: boolean }): SlotClaim;
   /**
    * HAND A REVISION THAT WILL NOT BE BUILT BACK TO `pr_open`: a Reject, an expiry or a cancel of
    * a revision. Compare-and-set on `expectVersion`, and only for an active row with a revision
    * count, so it cannot reopen a first build's row or race an Approve click.
    */
   dropRevision(id: RequestId, expectVersion: number, at: number): boolean;
+  /**
+   * SPONSOR (or withdraw) - compare-and-set on the version, only while the row awaits approval,
+   * with a fresh card nonce in the same statement so a card drawn before the change is inert.
+   * `sponsorId: null` withdraws. The caller has already proved the sponsor can pay.
+   */
+  setSponsor(claim: { readonly id: RequestId; readonly expectVersion: number; readonly sponsorId: string | null; readonly nonce: string; readonly at: number }): boolean;
+  /**
+   * The requester can no longer pay and nobody has sponsored: offer sponsoring on a fresh card.
+   * Same guards as `setSponsor`.
+   */
+  markNeedsSponsor(claim: { readonly id: RequestId; readonly expectVersion: number; readonly nonce: string; readonly at: number }): boolean;
+  /** What the approval card shows, written when it is drawn (filing, revision, re-approval). */
+  recordCard(id: RequestId, card: CardContent): boolean;
   /** Rows the reconciler must re-adopt after a crash. */
   stuck(before: number, limitRows: number): readonly BuildRow[];
   /**
@@ -442,6 +480,15 @@ export interface BuildRepo {
   activeCounts(guildId: string): ActiveCounts;
 }
 
+/** The approval card's content, as `recordCard` stores it. Every string is already sanitised. */
+export interface CardContent {
+  readonly excerpt: string | null;
+  readonly excerptTruncated: boolean;
+  readonly kind: string | null;
+  readonly success: string | null;
+  readonly needsSponsor: boolean;
+}
+
 /**
  * The column list, aliased to the field names `BuildRow` declares, WRITTEN ONCE.
  *
@@ -461,6 +508,9 @@ const selectRow = (t: SqlIdent): SqlQuery => sql`
          run_id AS runId, run_url AS runUrl, pr_url AS prUrl,
          dispatch_attempts AS dispatchAttempts, retry_count AS retryCount,
          revision_count AS revisionCount,
+         sponsor_id AS sponsorId, needs_sponsor AS needsSponsor,
+         card_excerpt AS cardExcerpt, card_excerpt_truncated AS cardExcerptTruncated,
+         card_kind AS cardKind, card_success AS cardSuccess,
          succeeded_at AS succeededAt,
          approval_id AS approvalId, approval_issued_at AS approvalIssuedAt,
          first_dispatch_at AS firstDispatchAt,
@@ -647,7 +697,9 @@ export const buildRepo = (db: Db): BuildRepo => {
           // the old id (or refused it). Re-sending it would be refused as a replay.
           // A FAILED REVISION keeps its pull request link: the PR is still open, and it is what
           // the retry builds into. A first build that failed never had one.
-          sql`UPDATE ${t} SET state = 'dispatching', run_id = NULL, run_url = NULL,
+          // `sponsor_id = NULL`: a retry that dispatches straight away is paid by the REQUESTER;
+          // nobody's bill grows from a Sponsor click made for an earlier build.
+          sql`UPDATE ${t} SET state = 'dispatching', run_id = NULL, run_url = NULL, sponsor_id = NULL,
                               pr_url = CASE WHEN revision_count > 0 THEN pr_url ELSE NULL END,
                               succeeded_at = NULL, dispatch_attempts = 0,
                               approval_id = ${claim.approvalId}, approval_issued_at = NULL,
@@ -672,12 +724,16 @@ export const buildRepo = (db: Db): BuildRepo => {
       settle(
         sqlJoin([
           // No approval id: nobody has approved this yet. The Approve click mints one.
+          // FROM `expired` (never approved) OR `failed` (a retry nobody can pay for yet, which
+          // must find a new sponsor and so a new approval). The sponsor is cleared either way.
           sql`UPDATE ${t} SET state = 'awaiting_approval', nonce = ${claim.nonce},
-                              run_id = NULL, run_url = NULL, pr_url = NULL, succeeded_at = NULL,
+                              run_id = NULL, run_url = NULL, succeeded_at = NULL,
+                              pr_url = CASE WHEN revision_count > 0 THEN pr_url ELSE NULL END,
                               approval_id = NULL, approval_issued_at = NULL, first_dispatch_at = NULL,
+                              sponsor_id = NULL, needs_sponsor = ${claim.needsSponsor ? 1 : 0},
                               dispatch_attempts = 0, retry_count = retry_count + 1,
                               version = version + 1, updated_at = ${claim.at}
-              WHERE id = ${claim.id} AND version = ${claim.expectVersion} AND state = 'expired'
+              WHERE id = ${claim.id} AND version = ${claim.expectVersion} AND state IN ('expired', 'failed')
                 AND`,
           slotsHeldBy(t, claim.guildId),
           sql`< ${claim.maxConcurrent}`,
@@ -692,6 +748,7 @@ export const buildRepo = (db: Db): BuildRepo => {
           sql`UPDATE ${t} SET state = 'awaiting_approval', nonce = ${claim.nonce},
                               run_id = NULL, run_url = NULL, succeeded_at = NULL,
                               approval_id = NULL, approval_issued_at = NULL, first_dispatch_at = NULL,
+                              sponsor_id = NULL, needs_sponsor = ${claim.needsSponsor ? 1 : 0},
                               dispatch_attempts = 0, revision_count = revision_count + 1,
                               version = version + 1, updated_at = ${claim.at}
               WHERE id = ${claim.id} AND version = ${claim.expectVersion}
@@ -703,9 +760,30 @@ export const buildRepo = (db: Db): BuildRepo => {
         claim,
         null,
       ),
+    // NEITHER WRITE MOVES `updated_at`: it is the clock the expiry sweep reads, and a Sponsor /
+    // Withdraw pair every 47 hours would otherwise keep an unapproved request - and its guild slot -
+    // alive forever. `version` still moves, because these race with Approve.
+    setSponsor: (claim) =>
+      db.execute(sql`
+        UPDATE ${t} SET sponsor_id = ${claim.sponsorId}, nonce = ${claim.nonce},
+                        version = version + 1
+        WHERE id = ${claim.id} AND version = ${claim.expectVersion} AND state = 'awaiting_approval'`).changes === 1,
+    markNeedsSponsor: (claim) =>
+      db.execute(sql`
+        UPDATE ${t} SET needs_sponsor = 1, nonce = ${claim.nonce}, version = version + 1
+        WHERE id = ${claim.id} AND version = ${claim.expectVersion} AND state = 'awaiting_approval'
+          AND sponsor_id IS NULL`).changes === 1,
+    recordCard: (id, card) =>
+      // Not a state transition, so neither `version` nor `updated_at` moves: the expiry clock and
+      // a concurrent Approve's compare-and-set are both untouched.
+      db.execute(sql`
+        UPDATE ${t} SET card_excerpt = ${card.excerpt}, card_excerpt_truncated = ${card.excerptTruncated ? 1 : 0},
+                        card_kind = ${card.kind}, card_success = ${card.success},
+                        needs_sponsor = ${card.needsSponsor ? 1 : 0}
+        WHERE id = ${id}`).changes === 1,
     dropRevision: (id, expectVersion, at) =>
       db.execute(sql`
-        UPDATE ${t} SET state = 'pr_open', run_id = NULL, version = version + 1, updated_at = ${at}
+        UPDATE ${t} SET state = 'pr_open', run_id = NULL, sponsor_id = NULL, version = version + 1, updated_at = ${at}
         WHERE id = ${id} AND version = ${expectVersion} AND revision_count > 0
           AND state IN ('awaiting_approval', 'dispatching', 'running')`).changes === 1,
     stuck: (before, limitRows) =>

@@ -673,26 +673,21 @@ test('THE WHOLE LIFECYCLE: submit -> approve -> dispatch -> poll -> PR -> notifi
 // THE BRANCHES
 // =======================================================================================
 
-test('no credentials: refused at the front door, and NO GitHub issue is created', async () => {
+test('no credentials: filed with a card that needs a SPONSOR, and nothing is built', async () => {
   const w = world();
   // Deliberately NOT funded: this models somebody who has never run `/credentials set`.
   try {
     const boot = w.boot();
     const out = await formOf(boot).handle(submission());
 
-    assert.equal(out.kind, 'fail', 'a requester who brought nothing must be refused');
-    const failure = out as unknown as { readonly error: AppError };
-    assert.match(
-      `${failure.error.userDetail} ${failure.error.nextStep}`,
-      /\/credentials set/u,
-      'and told exactly how to fix it - "you need credentials" with no instruction is the dead end nextStep exists to prevent',
-    );
-
-    // THE ASSERTION THAT MATTERS. Refusing later would leave a permanent GitHub issue and a
-    // card demanding a human decision, both describing a build that could never have run.
-    assert.deepEqual(w.issues.created, [], 'nothing was written to the repository');
-    assert.deepEqual(w.discord.posted, [], 'and no approval card was posted');
-    assert.deepEqual(w.repo.activeCounts(GUILD), { waiting: 0, running: 0, filing: 0 }, 'and no slot was taken');
+    // SPONSORING (2.2): filing costs nothing, so it is not refused. What spends is a dispatch,
+    // and the Approve click refuses while nobody can pay.
+    assert.equal(out.kind, 'view', 'filed, not refused');
+    assert.equal(w.issues.created.length, 1, 'the issue is filed');
+    const card = w.discord.posted.at(-1)?.view;
+    assert.ok(card?.nodes.some((n) => n.kind === 'field' && n.name === 'Paid by'), 'the card asks for a sponsor');
+    assert.ok(card?.nodes.some((n) => n.kind === 'buttons' && n.buttons.some((b) => b.label === 'Sponsor')), 'with a Sponsor button');
+    assert.deepEqual(w.repo.activeCounts(GUILD), { waiting: 1, running: 0, filing: 0 }, 'it waits like any request');
   } finally {
     w.close();
   }

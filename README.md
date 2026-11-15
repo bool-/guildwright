@@ -48,11 +48,11 @@ only an approver can start a run and merge the code.
 | Step | Where |
 |---|---|
 | `/credentials set` seals your Anthropic credential into a `user-<your id>` GitHub environment | bot → GitHub |
-| `/request new` opens a modal; the submission is refused outright if you have stored no credential | bot |
+| `/request new` opens a modal; with no credential stored, the request is filed and its card asks for a **sponsor**: anyone with a credential clicks Sponsor to pay | bot |
 | Otherwise it is validated, redacted, and rate-limited | bot |
 | A well-formed GitHub Issue is filed | bot → GitHub |
 | An Approve / Reject card is posted, gated on `builder.approve` — handed out with `/access grant` | bot |
-| Approve re-checks who is paying **and how many builds have run today**, then dispatches into **that person's** environment | bot → Actions |
+| Approve is refused until somebody can pay, re-checks who is paying (the sponsor, else the requester) **and how many builds have run today**, then dispatches into **that person's** environment | bot → Actions |
 | Claude Code implements the issue on a deterministic branch and opens a PR | GitHub Actions |
 | The run is polled; the PR link — or a draft PR, or the agent's refusal, or the run log — comes back **as a message that @-mentions the requester** | bot |
 | `/request list` shows what you asked for and where each one got to | bot |

@@ -622,20 +622,27 @@ test('retries are bounded, so a permanently broken request stops costing money',
   }
 });
 
-test('NO FREE BUILDS ON THE RETRY PATH: a requester whose credential is gone is refused', async () => {
+test('NO FREE BUILDS ON THE RETRY PATH: a requester whose credential is gone goes back for a SPONSOR, never straight to a build', async () => {
   // This is the check that makes a retry a fresh request rather than a way around the gate.
   // Without it, one approved-and-failed build is re-runnable forever by somebody who has since
-  // run `/credentials clear`.
+  // run `/credentials clear`. With sponsoring (2.2) it is no longer a refusal: the request goes
+  // back in front of an approver on a card that asks somebody to pay.
   const h = harness();
   try {
     const id = seedRunning(h.repo, 42, 77);
     toState(h, id, 'failed');
     h.builds.environments.delete(buildEnvironmentName(REQUESTER));
 
-    const said = failureText(await commandOf(h, 'request retry').handle(invocation({ args: { id } })));
-    assert.match(said, /\/credentials set/u);
-    assert.equal(h.repo.get(id)?.state, 'failed', 'and the row did not move');
-    assert.equal(h.jobs.enqueued.length, 0);
+    const outcome = await commandOf(h, 'request retry').handle(invocation({ args: { id } }));
+    assert.equal(outcome.kind, 'view');
+    const row = h.repo.get(id as never);
+    assert.equal(row?.state, 'awaiting_approval', 'back for a new approval, not dispatched');
+    assert.equal(row?.needsSponsor, 1);
+    assert.equal(row?.sponsorId, null);
+    assert.equal(h.jobs.enqueued.length, 0, 'nothing is built');
+    assert.equal(h.dispatched.length, 0);
+    const card = lastPost(h);
+    assert.ok(fieldNames(card).includes('Paid by'), 'the new card asks for a sponsor');
   } finally {
     h.close();
   }

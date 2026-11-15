@@ -523,3 +523,23 @@ test('buildRevisionSection numbers revisions from 1 and refuses anything else', 
   assert.throws(() => buildRevisionSection({ nonce, revision: 1.5, fields }));
   assert.equal(buildRevisionSection({ nonce, revision: 3, fields }).revision, 3);
 });
+
+test('a revision by a requester with no credentials asks for a NEW sponsor, never the earlier one', async () => {
+  const h = harness();
+  try {
+    const { id } = seedOpened(h);
+    h.builds.pr = openPr();
+    h.builds.environments.delete(`user-${REQUESTER}`);
+    assert.equal((await revise(h, id)).kind, 'view', 'filed, not refused');
+    const row = h.repo.get(id);
+    assert.equal(row?.state, 'awaiting_approval');
+    assert.equal(row?.sponsorId, null);
+    assert.equal(row?.needsSponsor, 1);
+    const card = h.discord.posted.at(-1)?.view;
+    assert.ok(card !== undefined && card.nodes.some((n) => n.kind === 'field' && n.name === 'Paid by'), 'the revision card asks for a sponsor');
+    assert.match(textOf(card ?? { accent: 'ok', nodes: [] }), /Call it \/pong instead\./u, 'and shows the revision, which a Sponsor click redraws from the row');
+    assert.match(h.repo.get(id)?.cardExcerpt ?? '', /Call it \/pong instead\./u);
+  } finally {
+    h.close();
+  }
+});
