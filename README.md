@@ -27,7 +27,7 @@ straight into a per-user GitHub environment and cannot read back. That applies t
 too; there is no owner bypass.
 
 ```bash
-npx guildwright@1.0.0 init my-bot-modules    # or "Use this template" on bool-/guildwright-template
+npx guildwright@latest init my-bot-modules   # or "Use this template" on bool-/guildwright-template
 cd my-bot-modules && npm ci && npm run check  # green before anything is configured
 cp .env.example .env                          # Discord token, GitHub App, APPROVAL_HMAC_KEY
 npx guildwright doctor                        # every configuration problem at once

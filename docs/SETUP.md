@@ -93,7 +93,7 @@ opaque auth failure inside somebody else's build, with no path back to the write
 Either generate it with the CLI:
 
 ```bash
-npx guildwright@1.0.0 init my-bot-modules     # any empty directory; pins the engine to 1.0.0
+npx guildwright@latest init my-bot-modules    # any empty directory; pins the engine to that exact version
 cd my-bot-modules
 git init && git add . && git commit -m "From the Guildwright template"
 ```
@@ -1033,7 +1033,7 @@ old bot running from that repository's `main`.
 2. **Convert the rest with the engine's CLI:**
 
    ```bash
-   npx guildwright@1.0.0 init . --existing
+   npx guildwright@latest init . --existing
    ```
 
    It rewrites `package.json` to the template shape keeping your `name` and pinning the engine,
