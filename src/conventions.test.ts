@@ -181,7 +181,7 @@ test('the first screens carry the sentences RFC-001 requires, in those words', (
 test('docs/SETUP.md walks the App and module-repository setup the RFC describes', () => {
   const setup = read('docs/SETUP.md');
   const needles: readonly (readonly [string, string])[] = [
-    ['npx guildwright@1.0.0 init my-bot-modules', 'install via init (RFC-001 9.1)'],
+    ['npx guildwright@latest init my-bot-modules', 'install via init (RFC-001 9.1)'],
     ['bool-/guildwright-template', 'or "Use this template" on the template repository'],
     ['npx guildwright invite-url', 'the permissions integer comes from the CLI'],
     ['**Uncheck Webhook → Active**', 'App setup 6.3 step 2'],
@@ -192,7 +192,7 @@ test('docs/SETUP.md walks the App and module-repository setup the RFC describes'
     ['node_modules/guildwright/dist/cli.js', 'a module repository runs the installed engine (Docker, systemd)'],
     ['GITHUB_REPOS_JSON=', 'the multi-repository section (PR 2.4)'],
     ['npx guildwright template apply', 'upgrading the engine'],
-    ['npx guildwright@1.0.0 init . --existing', 'moving an existing install (RFC-001 10 step 4)'],
+    ['npx guildwright@latest init . --existing', 'moving an existing install (RFC-001 10 step 4)'],
     ['Secrets: read', 'the PAT cutover needs Secrets: read (RFC-001 10 step 5)'],
     ['0005_repo_key.sql', 'the first engine boot applies a migration, so back up first'],
     ['src/core src/adapters src/testing src/lib scripts docs test', 'the one delete list (RFC-001 10 step 4 points here)'],
