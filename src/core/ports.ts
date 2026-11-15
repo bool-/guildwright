@@ -363,6 +363,21 @@ export type RunStatus =
   | { readonly kind: 'failure'; readonly runUrl: HttpsUrl | null; readonly detail: string };
 
 /**
+ * Where a running build job is, from GitHub's step list. See `BuildsPort.runProgress`.
+ *
+ * `stepName` is the workflow's own step name - text from a gate-verified file, but still a string
+ * off the network, so a renderer maps it to a label or re-scrubs it, never prints it raw.
+ */
+export interface RunProgress {
+  /** 1-based position of the step in progress (or the last finished one), and the step count. */
+  readonly stepNumber: number;
+  readonly totalSteps: number;
+  readonly stepName: string;
+  /** When that step started, epoch ms; null when GitHub did not say. */
+  readonly stepStartedAtMs: number | null;
+}
+
+/**
  * What asking GitHub to cancel a run actually achieved.
  *
  * WHY A UNION AND NOT `void`, AND NOT A BOOLEAN. The endpoint answers **202 Accepted** when it
@@ -662,6 +677,14 @@ export interface BuildsPort {
 
   /** Poll. Called from a durable job, never from an interaction handler. */
   runStatus(runId: number): Promise<Result<RunStatus, AppError>>;
+
+  /**
+   * Which step of the build job is running right now. OPTIONAL, and cosmetic: it is what lets
+   * the "Building" card say "Agent is writing code" instead of nothing for twenty minutes, and a
+   * caller must treat an `Err` or an absent method as "no progress to show", never as a failed
+   * build. Null when GitHub has not started the job yet.
+   */
+  runProgress?(runId: number): Promise<Result<RunProgress | null, AppError>>;
 
   /**
    * Ask GitHub to stop a run.

@@ -6,6 +6,21 @@ inputs, the approval MAC, or any file under `template/` is a **major** version a
 `BREAKING:`. New optional behaviour is a minor version. To upgrade a module repository, see
 `docs/SETUP.md` section 10.
 
+## Unreleased (2.1.0)
+
+### Live progress on the "Building" card
+
+- **The card says which step the build is on**, e.g. "Step 14 of 24: Agent is writing code
+  (started 4 minutes ago)". Step names are mapped to plain labels in
+  `src/modules/builder/progress.ts`; the elapsed time is a Discord timestamp, so the client keeps
+  it current and the card is redrawn **only when the step changes**.
+- **The pull request is linked on the card as soon as the agent opens it**, before the run ends.
+  It is looked for only from the agent's step on. A revision's card says "Building revision k"
+  and links its PR from the start.
+- New optional `BuildsPort.runProgress` (`GET /actions/runs/{id}/jobs`, the same `actions: read`
+  the poll already uses) and `RunProgress`; `mdTimestamp` in `#core/text`. Optional, so no other
+  port implementation breaks. Progress is cosmetic: a failed read or edit never touches the build.
+
 ## 2.0.0
 
 Identical in behaviour to `2.0.0-rc.0`, which ran in production first: a new request and a `/request revise` of it were built end to end, and the revision landed on the same pull request.

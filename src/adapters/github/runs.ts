@@ -50,6 +50,7 @@ import type {
   PrRef,
   RepositoryVariable,
   RunRef,
+  RunProgress,
   RunReport,
   RunStatus,
   GitRef,
@@ -406,6 +407,50 @@ function toEpochMs(iso: string | undefined): number {
   return Number.isFinite(ms) ? ms : 0;
 }
 
+/** `GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs`, only the parts progress needs. */
+const RunJobsPayload = z.object({
+  jobs: z.array(
+    z.object({
+      status: z.string(),
+      steps: z
+        .array(
+          z.object({
+            name: z.string(),
+            status: z.string(),
+            number: z.number().int().positive(),
+            started_at: z.string().nullable().optional(),
+          }),
+        )
+        .optional(),
+    }),
+  ),
+});
+
+/** Longest step name kept; the workflow's are far shorter, and a renderer caps again. */
+const STEP_NAME_MAX = 120;
+
+/**
+ * Where a run is, from its jobs payload: the step in progress, else the last completed one, in
+ * the job that is running (else the first job). Null before GitHub has started any step.
+ * Exported for its test; pure.
+ */
+export function toRunProgress(data: unknown): RunProgress | null {
+  const parsed = RunJobsPayload.safeParse(data);
+  if (!parsed.success) return null;
+  const job = parsed.data.jobs.find((j) => j.status === 'in_progress') ?? parsed.data.jobs[0];
+  const steps = [...(job?.steps ?? [])].sort((a, b) => a.number - b.number);
+  if (steps.length === 0) return null;
+  const current = steps.find((st) => st.status === 'in_progress') ?? [...steps].reverse().find((st) => st.status === 'completed');
+  if (current === undefined) return null;
+  const started = current.started_at === null || current.started_at === undefined ? Number.NaN : Date.parse(current.started_at);
+  return {
+    stepNumber: steps.indexOf(current) + 1,
+    totalSteps: steps.length,
+    stepName: current.name.slice(0, STEP_NAME_MAX),
+    stepStartedAtMs: Number.isFinite(started) ? started : null,
+  };
+}
+
 function toRunSummary(raw: z.infer<typeof RunPayload>): RunSummary {
   return {
     id: raw.id,
@@ -726,6 +771,24 @@ export function createGithubBuilds(input: {
         );
       } catch (cause: unknown) {
         return Err(fail(cause, 'builds.runStatus'));
+      }
+    },
+
+    /**
+     * Which step the run is on. One request per poll while a build runs; a cosmetic read, so the
+     * caller ignores an `Err`. Same `actions: read` the run poll already needs.
+     */
+    async runProgress(runId: number): Promise<Result<RunProgress | null, AppError>> {
+      try {
+        const res = await octokit.request('GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs', {
+          owner,
+          repo,
+          run_id: runId,
+          per_page: 10,
+        });
+        return Ok(toRunProgress(res.data));
+      } catch (cause: unknown) {
+        return Err(fail(cause, 'builds.runProgress'));
       }
     },
 

@@ -52,6 +52,7 @@ const ALLOWED: Readonly<Record<string, string>> = {
   'GET /repos/{owner}/{repo}/pulls': 'Pull requests (read)',
   'GET /repos/{owner}/{repo}/actions/runs': 'Actions (read)',
   'GET /repos/{owner}/{repo}/actions/runs/{run_id}': 'Actions (read)',
+  'GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs': 'Actions (read)',
   'POST /repos/{owner}/{repo}/actions/runs/{run_id}/cancel': 'Actions (write)',
   'GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}': 'Actions (read)',
   'GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs': 'Actions (read)',

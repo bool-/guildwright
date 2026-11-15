@@ -30,6 +30,7 @@ import {
   mdInlineCode,
   mdLink,
   mdMention,
+  mdTimestamp,
   parseHttpsUrl,
   sanitizeStored,
   type HttpsUrl,
@@ -244,13 +245,22 @@ export function buildingCard(input: {
   readonly title: string | null;
   /** Who clicked Approve; `null` when a job re-draws a card enqueued before this was recorded. */
   readonly approverId: string | null;
+  /** Live progress from the run's step list; absent until the poller has some. */
+  readonly progress?: BuildingProgress;
+  /** The pull request, as soon as one exists: from the start for a revision, mid-run for a build. */
+  readonly prUrl?: HttpsUrl | null;
+  /** Set when this build is a `/request revise`. */
+  readonly revision?: number;
 }): View {
+  const prUrl = input.prUrl ?? null;
   return {
     accent: 'pending',
     nodes: [
-      { kind: 'heading', text: 'Building', icon: 'clock' },
+      { kind: 'heading', text: input.revision === undefined ? 'Building' : `Building revision ${String(input.revision)}`, icon: 'clock' },
       ...(input.title === null ? [] : [{ kind: 'field' as const, name: 'Request', md: sanitizeStored(input.title) }]),
       { kind: 'field', name: 'Issue', md: issueRef(input.issueNumber, input.issueUrl) },
+      ...(input.progress === undefined ? [] : [{ kind: 'field' as const, name: 'Progress', md: progressLine(input.progress) }]),
+      ...(prUrl === null ? [] : [{ kind: 'field' as const, name: 'Pull request', md: mdLink(prUrl.replace(/^https:\/\/github\.com\//u, ''), prUrl) }]),
       {
         kind: 'text',
         md:
@@ -258,9 +268,27 @@ export function buildingCard(input: {
             ? md`Approved. This usually takes five to thirty minutes.`
             : md`Approved by ${mdMention('user', input.approverId)}. This usually takes five to thirty minutes.`,
       },
-      { kind: 'buttons', links: [...linkTo('Run log', input.runUrl), ...linkTo('Issue', input.issueUrl)], buttons: [] },
+      {
+        kind: 'buttons',
+        links: [...linkTo('Run log', input.runUrl), ...linkTo('Pull request', prUrl), ...linkTo('Issue', input.issueUrl)],
+        buttons: [],
+      },
     ],
   };
+}
+
+/** What the poller learned about the running step. `label` comes from `stepLabel`. */
+export interface BuildingProgress {
+  readonly stepNumber: number;
+  readonly totalSteps: number;
+  readonly label: string;
+  readonly startedAtMs: number | null;
+}
+
+/** "Step 12 of 22: Agent is writing code (started 4 minutes ago)", the time kept live by Discord. */
+function progressLine(p: BuildingProgress): SafeMarkdown {
+  const step = sanitizeStored(`Step ${String(p.stepNumber)} of ${String(p.totalSteps)}: ${p.label}`);
+  return p.startedAtMs === null ? step : md`${step} (started ${mdTimestamp(p.startedAtMs)})`;
 }
 
 /** The same wait, said honestly the second time round. */
