@@ -220,11 +220,24 @@ test('CHANGELOG.md opens with the version package.json carries, and records the 
   // A release whose changelog does not mention it is a release nobody can upgrade to on purpose.
   // publish.yml runs `npm run check`, so this fails before a version without an entry can ship.
   const changelog = read('CHANGELOG.md');
-  const versions = [...changelog.matchAll(/^## (\d+\.\d+\.\d+)$/gmu)].map((m) => m[1]);
+  // A prerelease (`2.0.0-rc.0`) is a version too, and it gets its own entry.
+  const versions = [...changelog.matchAll(/^## (\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/gmu)].map((m) => m[1]);
   assert.equal(versions[0], pkg.version, 'the newest CHANGELOG.md entry must be the package.json version');
-  const entry = changelog.slice(changelog.indexOf(`## ${pkg.version}`));
-  const breaking = entry.split('\n').filter((line) => line.startsWith('- BREAKING:')).join('\n');
+  const entryOf = (version: string): string => {
+    const start = changelog.indexOf(`## ${version}\n`);
+    assert.ok(start >= 0, `CHANGELOG.md must have a ## ${version} entry`);
+    const next = changelog.indexOf('\n## ', start + 1);
+    return changelog.slice(start, next < 0 ? undefined : next);
+  };
+  const breakingIn = (version: string): string =>
+    entryOf(version).split('\n').filter((line) => line.startsWith('- BREAKING:')).join('\n');
+  // The contract breaks 1.0.0 shipped stay recorded under 1.0.0, whatever comes after it.
   for (const name of ['BuildsPort', 'VersionPort', 'PortRegistry']) {
-    assert.ok(breaking.includes(name), `the ${pkg.version} entry must record the ${name} change under BREAKING:`);
+    assert.ok(breakingIn('1.0.0').includes(name), `the 1.0.0 entry must record the ${name} change under BREAKING:`);
+  }
+  // A new MAJOR version (prereleases included) must say what it breaks.
+  const major = (v: string): number => Number.parseInt(v.split('.')[0] ?? '0', 10);
+  if (major(pkg.version) > 1) {
+    assert.ok(breakingIn(pkg.version).length > 0, `the ${pkg.version} entry is a major version and must list its BREAKING: changes`);
   }
 });

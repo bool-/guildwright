@@ -109,11 +109,23 @@ jobs:
           npm run build
           git diff --exit-code -- template/ || { echo "::error::npm run build changed template/; commit the regenerated files first."; exit 1; }
 
+      # A PRERELEASE (`2.0.0-rc.0`) is published under `next`, so `latest` - what `npm install` and
+      # `guildwright init` pick - never moves to a release candidate. npm also refuses a prerelease
+      # without an explicit tag.
       - name: Publish with provenance
+        id: publish
         if: steps.gate.outputs.enabled == 'true'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --provenance --access public --ignore-scripts
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          case "$VERSION" in
+            *-*) TAG=next; echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
+            *)   TAG=latest; echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+          npm publish --provenance --access public --ignore-scripts --tag "$TAG"
+          echo "published $VERSION under the $TAG tag"
 
       # THE TEMPLATE LOCKFILE (RFC-001 9.1). `init` writes the template tree pinned to the version
       # just published and runs `npm install --package-lock-only --ignore-scripts` against the
@@ -146,7 +158,7 @@ jobs:
       # repository cannot drift from `template/`. The token reaches git through GIT_CONFIG_* in
       # the environment (an Authorization header), never through a URL or a file on disk.
       - name: Push the generated template to the template repository
-        if: steps.gate.outputs.enabled == 'true' && steps.gate.outputs.template == 'true'
+        if: steps.gate.outputs.enabled == 'true' && steps.gate.outputs.template == 'true' && steps.publish.outputs.prerelease != 'true'
         env:
           TEMPLATE_REPO_TOKEN: ${{ secrets.TEMPLATE_REPO_TOKEN }}
           TEMPLATE_REPOSITORY: ${{ vars.TEMPLATE_REPOSITORY || 'bool-/guildwright-template' }}
