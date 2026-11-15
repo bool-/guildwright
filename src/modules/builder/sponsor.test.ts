@@ -290,7 +290,9 @@ test('a requester who clears their credential after filing: Approve redraws the 
 // Nobody's bill grows from an earlier click
 // ---------------------------------------------------------------------------------------
 
-test('a retried sponsored build that the requester can pay for is paid by the REQUESTER, not the old sponsor', async () => {
+test('a retried SPONSORED build is never re-dispatched onto anyone: it goes back for approval and a new sponsor', async () => {
+  // Even when the requester has since stored a credential: they never agreed to pay for this
+  // build, and the old sponsor's click was for the build that failed.
   const h = harness();
   try {
     const id = await fileUnfunded(h);
@@ -300,10 +302,129 @@ test('a retried sponsored build that the requester can pay for is paid by the RE
     h.repo.finish(id, 'failed', NOW);
     fund(h, REQUESTER);
 
+    assert.equal((await commandOf(h, 'request retry').handle(invocation({ args: { id }, actorId: APPROVER }))).kind, 'view');
+    const row = h.repo.get(id);
+    assert.equal(row?.state, 'awaiting_approval', 'not dispatched');
+    assert.equal(row?.sponsorId, null, 'the sponsor of the failed build is not reused');
+    assert.equal(row?.needsSponsor, 1);
+    assert.equal(h.dispatched.length, 0);
+  } finally {
+    h.close();
+  }
+});
+
+test('a retried build the REQUESTER paid for re-dispatches on their credentials, as before', async () => {
+  const h = harness();
+  try {
+    const out = await requestForm(h).handle(submission());
+    assert.equal(out.kind, 'view');
+    const id = h.repo.recentForRequester(GUILD, REQUESTER, 1)[0]?.id;
+    assert.ok(id !== undefined);
+    if (id === undefined) return;
+    assert.equal((await press(h, id, 'approve', APPROVER)).kind, 'handoff');
+    h.repo.finish(id, 'failed', NOW);
     assert.equal((await commandOf(h, 'request retry').handle(invocation({ args: { id } }))).kind, 'view');
-    assert.equal(h.repo.get(id)?.sponsorId, null, 'the sponsor of the failed build is not reused');
+    assert.equal(h.repo.get(id)?.state, 'dispatching');
     await dispatchPass(h, id);
     assert.equal(h.builds.signed.at(-1)?.['environmentName'], buildEnvironmentName(REQUESTER));
+  } finally {
+    h.close();
+  }
+});
+
+test('a requester who stores a credential AFTER filing is not charged by an approval - only by their own Sponsor click', async () => {
+  const h = harness();
+  try {
+    const id = await fileUnfunded(h);
+    fund(h, REQUESTER);
+    assert.match(refusal(await press(h, id, 'approve', APPROVER)), /Nobody has sponsored this build/u);
+    assert.equal(h.repo.get(id)?.state, 'awaiting_approval');
+    const card = viewOf(await press(h, id, 'sponsor', REQUESTER));
+    assert.match(said(card), /\(the person who asked\)/u);
+    assert.equal((await press(h, id, 'approve', APPROVER)).kind, 'handoff', 'now somebody has agreed to pay');
+  } finally {
+    h.close();
+  }
+});
+
+test('a sponsor whose credential vanished is released at Approve, so somebody else can sponsor', async () => {
+  const h = harness();
+  try {
+    const id = await fileUnfunded(h);
+    fund(h, SPONSOR);
+    viewOf(await press(h, id, 'sponsor', SPONSOR));
+    h.builds.environments.delete(buildEnvironmentName(SPONSOR));
+
+    const card = viewOf(await press(h, id, 'approve', APPROVER));
+    assert.match(said(card), /needs a sponsor/u);
+    assert.equal(h.repo.get(id)?.sponsorId, null);
+    assert.equal(h.repo.get(id)?.state, 'awaiting_approval');
+    fund(h, STRANGER);
+    viewOf(await press(h, id, 'sponsor', STRANGER));
+    assert.equal(h.repo.get(id)?.sponsorId, STRANGER);
+  } finally {
+    h.close();
+  }
+});
+
+test('Sponsor and Withdraw do not reset the expiry clock: an unapproved request still expires on time', async () => {
+  const h = harness();
+  try {
+    const id = await fileUnfunded(h);
+    fund(h, SPONSOR);
+    h.setNow(NOW + 47 * HOUR);
+    viewOf(await press(h, id, 'sponsor', SPONSOR));
+    viewOf(await press(h, id, 'sponsor', SPONSOR));
+    h.setNow(NOW + 49 * HOUR);
+    await h.expire.run({}, runtime(1, NOW + 50 * HOUR));
+    assert.equal(h.repo.get(id)?.state, 'expired', 'clicking does not keep a request - and its slot - alive');
+  } finally {
+    h.close();
+  }
+});
+
+test('a REVISION of a sponsored pull request drops the old sponsor', async () => {
+  const h = harness();
+  try {
+    const id = await fileUnfunded(h);
+    fund(h, SPONSOR);
+    viewOf(await press(h, id, 'sponsor', SPONSOR));
+    assert.equal((await press(h, id, 'approve', APPROVER)).kind, 'handoff');
+    assert.equal(h.repo.get(id)?.sponsorId, SPONSOR);
+    h.repo.recordPrUrl(id, 'https://github.com/o/r/pull/7', NOW);
+    h.repo.finish(id, 'pr_open', NOW);
+    h.builds.pr = { number: 7, url: (await import('#modules/builder/harness.test')).url('https://github.com/o/r/pull/7'), branch: 'x', isDraft: false, isOpen: true };
+    fund(h, REQUESTER);
+
+    const out = await commandOf(h, 'request revise').handle(invocation({ args: { id, feedback: 'Rename it.' } }));
+    assert.equal(out.kind, 'view');
+    assert.equal(h.repo.get(id)?.sponsorId, null, 'the revision is a new build: the old sponsor does not pay for it');
+  } finally {
+    h.close();
+  }
+});
+
+test('a dispatch pass whose row changed during its awaits does not spend', async () => {
+  let move: (() => void) | null = null;
+  const h = harness({}, {
+    verifyGates: async () => {
+      move?.();
+      return { ok: true, value: undefined };
+    },
+  });
+  try {
+    const out = await requestForm(h).handle(submission());
+    assert.equal(out.kind, 'view');
+    const id = h.repo.recentForRequester(GUILD, REQUESTER, 1)[0]?.id;
+    assert.ok(id !== undefined);
+    if (id === undefined) return;
+    assert.equal((await press(h, id, 'approve', APPROVER)).kind, 'handoff');
+    // Cancelled while the pass is mid-flight (between its terminal check and the dispatch).
+    move = () => void h.repo.finish(id, 'cancelled', NOW);
+    const pass = await dispatchPass(h, id);
+    assert.equal(pass.kind, 'done');
+    assert.equal(h.dispatched.length, 0, 'nothing was dispatched for a row that left `dispatching`');
+    assert.equal(h.builds.signed.length, 0, 'and nothing was signed');
   } finally {
     h.close();
   }

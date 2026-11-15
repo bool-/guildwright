@@ -104,6 +104,7 @@ import {
   type RunCancelReport,
 } from '#modules/builder/ports';
 import { canPay } from '#modules/builder/payer';
+import { REQUEST_KINDS, type RequestKind } from '#modules/builder/kinds';
 import { deliverOutcome } from '#modules/builder/notify';
 
 /**
@@ -575,9 +576,14 @@ function retryCommand(deps: HistoryDeps): CommandSpec {
       // check-then-act shape that made the cap advisory. The claim now happens INSIDE the
       // guarded UPDATE that re-arms the row (`reopenForDispatch` / `reopenForApproval`), so the
       // count and the write are one statement and a loser is refused rather than admitted.
-      return row.state === 'failed' && requesterCanPay
+      // A FAILED build re-dispatches straight onto the requester's credentials only when the
+      // requester was its payer (`needsSponsor` 0). A build somebody SPONSORED goes back to an
+      // approval card instead: the requester never agreed to pay for it, and the old sponsor's
+      // click was for that build, not this one.
+      const requesterWasPayer = row.needsSponsor === 0;
+      return row.state === 'failed' && requesterCanPay && requesterWasPayer
         ? redispatch(deps, inv, row, issueNumber)
-        : reArmForApproval(deps, inv, row, issueNumber, !requesterCanPay);
+        : reArmForApproval(deps, inv, row, issueNumber, !requesterCanPay || !requesterWasPayer);
     },
     async autocomplete(req): Promise<readonly AutocompleteChoice[]> {
       return suggest(deps, req, (row) => row.state === 'failed' || row.state === 'expired');
@@ -1009,7 +1015,7 @@ async function reArmForApproval(
     // The card's own excerpt, as stored when it was first drawn (migration 0007); a request filed
     // before that has none, and the approver reads the full text on the issue as before.
     excerpt: row.cardExcerpt === null ? null : { md: sanitizeStored(row.cardExcerpt), truncated: row.cardExcerptTruncated !== 0 },
-    kind: null,
+    kind: (REQUEST_KINDS as readonly string[]).includes(row.cardKind ?? '') ? (row.cardKind as RequestKind) : null,
     success: row.cardSuccess === null ? null : sanitizeStored(row.cardSuccess),
     requesterId: row.requesterId,
     issueNumber,

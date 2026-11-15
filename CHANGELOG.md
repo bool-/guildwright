@@ -6,6 +6,26 @@ inputs, the approval MAC, or any file under `template/` is a **major** version a
 `BREAKING:`. New optional behaviour is a minor version. To upgrade a module repository, see
 `docs/SETUP.md` section 10.
 
+## Unreleased (2.2.0)
+
+### Sponsored builds
+
+- **A request is filed even when its requester has no build credentials.** Its approval card says
+  "Paid by: Nobody yet - this needs a sponsor" and carries a **Sponsor** button. Anyone with a
+  stored credential, the requester included once they run `/credentials set`, clicks it to pay for
+  the build from their own environment; the same button withdraws.
+- **Approve is refused while nobody can pay**, and the sponsor cannot approve the build they pay
+  for (unless `allowSelfApproval`). A requester who cleared their credential after filing gets the
+  card redrawn with Sponsor instead of an approval.
+- **At dispatch the payer is the sponsor, else the requester**, and that environment name is what
+  the approval MAC signs. The workflow and `verify_approval.py` are unchanged.
+- **Every re-arm clears the sponsor**: a retry is paid by the requester if they can, and otherwise
+  goes back to an approval card that asks for a new sponsor; a revision and an expired request put
+  back likewise. Nobody's bill grows from a click made for an earlier build.
+- Builder migration `0007_sponsors.sql` (`sponsor_id`, `needs_sponsor`, and the approval card's
+  content so a Sponsor click can redraw it). `/request retry` re-approval cards now show the
+  original excerpt instead of none.
+
 ## 2.1.0
 
 ### Live progress on the "Building" card

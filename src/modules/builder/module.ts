@@ -1135,18 +1135,47 @@ export default defineModule({
             // since filing) and no sponsor: the card is redrawn offering Sponsor, so the request is
             // never stuck with nobody able to pay and no button to fix it.
             if (cfg.requireOwnCredentials) {
+              // A CARD THAT ASKS FOR A SPONSOR IS PAID BY A SPONSOR, OR NOT AT ALL. Even if the
+              // requester has since stored a credential, they have not agreed to pay for THIS
+              // build - the card the approver is looking at says nobody has - so they pay only by
+              // clicking Sponsor themselves.
+              if (row.needsSponsor !== 0 && row.sponsorId === null) {
+                return {
+                  kind: 'fail',
+                  error: errors.conflict(
+                    'needs_sponsor',
+                    'Nobody has sponsored this build yet, so nobody would pay for it.',
+                    'Anyone with build credentials - the person who asked included - can click Sponsor on the card. Approve it after that.',
+                    'needs_sponsor',
+                  ),
+                };
+              }
               const target = githubForRow(ctx.ports, row);
               if (!target.ok) return { kind: 'fail', error: target.error };
               const can = await canPay(target.value.builds, row.sponsorId ?? row.requesterId);
               if (!can.ok) return { kind: 'fail', error: can.error };
               if (!can.value) {
                 if (row.sponsorId !== null) {
+                  // A SPONSOR WHO CAN NO LONGER PAY is released, so the request is not stuck behind
+                  // a sponsorship only they could withdraw: the card is redrawn asking again.
+                  const released = newCardNonce();
+                  if (repo.setSponsor({ id: id.value, expectVersion: row.version, sponsorId: null, nonce: released, at: click.at })) {
+                    ctx.ports.audit.record({
+                      action: 'builder.sponsor.released',
+                      actorId: click.actor.userId,
+                      guildId: click.space.guildId,
+                      detail: { requestId: id.value, issueNumber: row.issueNumber, sponsorId: row.sponsorId, reason: 'credentials_gone' },
+                    });
+                    const redrawn = repo.get(id.value);
+                    const card = redrawn === undefined ? null : approvalCardForRow(redrawn, released);
+                    if (card !== null) return { kind: 'view', view: card };
+                  }
                   return {
                     kind: 'fail',
                     error: errors.conflict(
                       'sponsor_cannot_pay',
                       "The sponsor's build credentials are no longer stored on GitHub.",
-                      'Ask them to run /credentials set, or to withdraw so somebody else can sponsor.',
+                      'Somebody else can sponsor it now.',
                       'sponsor',
                     ),
                   };
@@ -1229,7 +1258,7 @@ export default defineModule({
                 title: row.title,
                 approverId: click.actor.userId,
                 ...(row.revisionCount > 0 ? { revision: row.revisionCount, prUrl: storedUrl(row.prUrl) } : {}),
-                ...(row.sponsorId === null ? {} : { sponsorId: row.sponsorId }),
+                ...(cfg.requireOwnCredentials && row.sponsorId !== null ? { sponsorId: row.sponsorId } : {}),
               }),
               job: {
                 type: 'build',
@@ -1445,7 +1474,7 @@ export default defineModule({
                 ...(progress === undefined ? {} : { progress }),
                 ...(prUrl === undefined ? {} : { prUrl }),
                 ...(row.revisionCount > 0 ? { revision: row.revisionCount } : {}),
-                ...(row.sponsorId === null ? {} : { sponsorId: row.sponsorId }),
+                ...(cfg.requireOwnCredentials && row.sponsorId !== null ? { sponsorId: row.sponsorId } : {}),
               });
             const showRunLink = async (runUrl: HttpsUrl): Promise<void> => {
               const edited = await jctx.ports.discord.edit(surface.value, drawBuilding(runUrl, undefined, row.revisionCount > 0 ? storedUrl(row.prUrl) : undefined));
@@ -1612,6 +1641,13 @@ export default defineModule({
               // `requireOwnCredentials` on (the Sponsor action refuses otherwise), so the shared
               // environment is never reachable through somebody else's click.
               const payerId = cfg.requireOwnCredentials && row.sponsorId !== null ? row.sponsorId : row.requesterId;
+              if (cfg.requireOwnCredentials && row.needsSponsor !== 0 && row.sponsorId === null) {
+                repo.finish(p.value.id, 'failed', jctx.ports.clock.now());
+                return {
+                  kind: 'failed',
+                  error: errors.conflict('needs_sponsor', 'Nobody sponsored this build, so nothing would pay for it.', 'Run /request retry and find a sponsor on the new card.', 'needs_sponsor'),
+                };
+              }
               const payer = await resolveBuildPayer(gh.builds, payerId, cfg.requireOwnCredentials);
               if (!payer.ok) {
                 // A GitHub blip must not burn the request; only a real "no credentials" answer
@@ -1646,6 +1682,16 @@ export default defineModule({
               const bodySha = await gh.issues.bodySha256(p.value.issueNumber);
               if (!bodySha.ok) {
                 return retryAfter(bodySha.error, cfg.pollIntervalMs, 'could not read the issue body digest');
+              }
+              // THE ROW MAY HAVE MOVED during the awaits above (gates, cap, payer, body digest): a
+              // cancel, then a fresh revision with a new approval, all inside one pass. Spending
+              // this pass's snapshot would sign the OLD approval and the OLD payer over a body that
+              // now holds an unapproved revision. So the pass stops unless the row is still the
+              // approval it started with.
+              const fresh = repo.get(p.value.id);
+              if (fresh === undefined || fresh.state !== 'dispatching' || fresh.approvalId !== row.approvalId || fresh.sponsorId !== row.sponsorId) {
+                jctx.logger.info('dispatch pass stopping: the request changed under it', { requestId: p.value.id, state: fresh?.state ?? 'gone' });
+                return { kind: 'done' };
               }
               // SIGNED NOW, NOT AT THE CLICK. The workflow refuses a token issued more than
               // APPROVAL_MAX_AGE_SECONDS before the run was created, and a request can wait

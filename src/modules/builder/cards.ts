@@ -132,7 +132,7 @@ export type Funding =
   /** Nobody can pay yet: the requester has no credentials and nobody has sponsored. */
   | { readonly kind: 'needs-sponsor' }
   /** Somebody clicked Sponsor; their credentials pay. */
-  | { readonly kind: 'sponsored'; readonly sponsorId: string };
+  | { readonly kind: 'sponsored'; readonly sponsorId: string; readonly isRequester?: boolean };
 
 /**
  * A link row entry, or none.
@@ -257,7 +257,7 @@ export function issueRef(issueNumber: number, issueUrl: HttpsUrl | null): SafeMa
 function fundingNodes(funding: Funding | undefined): readonly ViewNode[] {
   if (funding === undefined) return [];
   if (funding.kind === 'sponsored') {
-    return [{ kind: 'field', name: 'Paid by', md: md`${mdMention('user', funding.sponsorId)} (sponsor)` }];
+    return [{ kind: 'field', name: 'Paid by', md: md`${mdMention('user', funding.sponsorId)}${funding.isRequester === true ? md` (the person who asked)` : md` (sponsor)`}` }];
   }
   return [
     { kind: 'field', name: 'Paid by', md: md`Nobody yet - this needs a sponsor` },
@@ -1148,7 +1148,9 @@ export function approvalCardForRow(row: BuildRow, nonce: CardNonce): View | null
 }
 
 /** The card's funding for a row: a sponsor, a request that needs one, or nothing to show. */
-export function fundingOf(row: Pick<BuildRow, 'sponsorId' | 'needsSponsor'>): { readonly funding?: Funding } {
-  if (row.sponsorId !== null) return { funding: { kind: 'sponsored', sponsorId: row.sponsorId } };
+export function fundingOf(row: Pick<BuildRow, 'sponsorId' | 'needsSponsor'> & { readonly requesterId?: string }): { readonly funding?: Funding } {
+  if (row.sponsorId !== null) {
+    return { funding: { kind: 'sponsored', sponsorId: row.sponsorId, isRequester: row.sponsorId === row.requesterId } };
+  }
   return row.needsSponsor !== 0 ? { funding: { kind: 'needs-sponsor' } } : {};
 }

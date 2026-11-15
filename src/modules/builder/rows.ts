@@ -760,14 +760,17 @@ export const buildRepo = (db: Db): BuildRepo => {
         claim,
         null,
       ),
+    // NEITHER WRITE MOVES `updated_at`: it is the clock the expiry sweep reads, and a Sponsor /
+    // Withdraw pair every 47 hours would otherwise keep an unapproved request - and its guild slot -
+    // alive forever. `version` still moves, because these race with Approve.
     setSponsor: (claim) =>
       db.execute(sql`
         UPDATE ${t} SET sponsor_id = ${claim.sponsorId}, nonce = ${claim.nonce},
-                        version = version + 1, updated_at = ${claim.at}
+                        version = version + 1
         WHERE id = ${claim.id} AND version = ${claim.expectVersion} AND state = 'awaiting_approval'`).changes === 1,
     markNeedsSponsor: (claim) =>
       db.execute(sql`
-        UPDATE ${t} SET needs_sponsor = 1, nonce = ${claim.nonce}, version = version + 1, updated_at = ${claim.at}
+        UPDATE ${t} SET needs_sponsor = 1, nonce = ${claim.nonce}, version = version + 1
         WHERE id = ${claim.id} AND version = ${claim.expectVersion} AND state = 'awaiting_approval'
           AND sponsor_id IS NULL`).changes === 1,
     recordCard: (id, card) =>

@@ -317,7 +317,7 @@ export function sponsorCredentialsGoneError(): AppError {
   return errors.conflict(
     'sponsor_credentials_gone',
     "The sponsor's build credentials are no longer stored on GitHub, so nothing would pay for this build.",
-    'Ask the sponsor to run /credentials set, then run /request retry - or find a new sponsor on the retried card.',
+    'Run /request retry: the retried card asks for a sponsor again (or is paid by the person who asked, if they can).',
     'sponsor',
   );
 }
