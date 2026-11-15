@@ -1,5 +1,5 @@
 {
-  "engineVersion": "2.0.0",
+  "engineVersion": "2.1.0",
   "files": {
     ".github/claude/agent-settings.json": "45ee422afd40b6652c42c25acf9d231e74679cad3fa0d8c6be8a73a94e9be1a5",
     ".github/scripts/verify_approval.py": "61c168d6b7438e840364a8156bd2e42d5d3ca03e44a79971a3dbf1d07c6fadf5",

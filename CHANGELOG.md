@@ -6,7 +6,7 @@ inputs, the approval MAC, or any file under `template/` is a **major** version a
 `BREAKING:`. New optional behaviour is a minor version. To upgrade a module repository, see
 `docs/SETUP.md` section 10.
 
-## Unreleased (2.1.0)
+## 2.1.0
 
 ### Live progress on the "Building" card
 
