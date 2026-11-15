@@ -235,9 +235,11 @@ test('CHANGELOG.md opens with the version package.json carries, and records the 
   for (const name of ['BuildsPort', 'VersionPort', 'PortRegistry']) {
     assert.ok(breakingIn('1.0.0').includes(name), `the 1.0.0 entry must record the ${name} change under BREAKING:`);
   }
-  // A new MAJOR version (prereleases included) must say what it breaks.
-  const major = (v: string): number => Number.parseInt(v.split('.')[0] ?? '0', 10);
-  if (major(pkg.version) > 1) {
-    assert.ok(breakingIn(pkg.version).length > 0, `the ${pkg.version} entry is a major version and must list its BREAKING: changes`);
+  // A version that RAISES the major number (prereleases included) must say what it breaks; a
+  // minor or patch release has nothing to list.
+  const major = (v: string | undefined): number => Number.parseInt((v ?? '0').split('.')[0] ?? '0', 10);
+  const previous = versions.find((v) => v !== undefined && v !== pkg.version && !v.startsWith(`${pkg.version}-`));
+  if (major(pkg.version) > major(previous)) {
+    assert.ok(breakingIn(pkg.version).length > 0, `the ${pkg.version} entry raises the major version and must list its BREAKING: changes`);
   }
 });
