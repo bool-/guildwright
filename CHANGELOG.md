@@ -6,9 +6,9 @@ inputs, the approval MAC, or any file under `template/` is a **major** version a
 `BREAKING:`. New optional behaviour is a minor version. To upgrade a module repository, see
 `docs/SETUP.md` section 10.
 
-## 2.0.0-rc.0
+## 2.0.0
 
-Release candidate for 2.0.0, published under the npm `next` tag; `latest` stays on 1.0.0.
+Identical in behaviour to `2.0.0-rc.0`, which ran in production first: a new request and a `/request revise` of it were built end to end, and the revision landed on the same pull request.
 
 ### `/request revise`: iterate on an open pull request from Discord
 
